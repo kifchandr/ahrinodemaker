@@ -1,0 +1,119 @@
+#!/bin/bash
+set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
+# === Пакеты ===
+apt update
+apt install -y fail2ban ufw unattended-upgrades
+dpkg-reconfigure -f noninteractive unattended-upgrades
+# === Fail2Ban ===
+cat > /etc/fail2ban/jail.local << 'EOF'
+[sshd]
+enabled = true
+port = ssh
+filter = sshd
+maxretry = 5
+findtime = 600
+bantime = 12h
+EOF
+systemctl enable --now fail2ban
+# === UFW ===
+ufw --force reset
+ufw default deny incoming
+ufw default allow outgoing
+ufw allow ssh
+ufw limit ssh
+ufw allow 80/tcp
+ufw allow 443/tcp
+ufw allow 8443/tcp
+ufw allow 9999/tcp
+ufw allow from 109.248.168.105 to any port 2222 proto tcp
+ufw deny 2222/tcp
+ufw allow in on lo
+ufw allow out on lo
+ufw logging low
+ufw --force enable
+# === Sysctl: только то, что реально нужно ===
+# Чистим старые параметры из /etc/sysctl.conf (на случай повторного запуска)
+for param in \
+    net.ipv6.conf.all.disable_ipv6 net.ipv6.conf.default.disable_ipv6 net.ipv6.conf.lo.disable_ipv6 \
+    net.ipv4.ip_forward net.core.default_qdisc net.ipv4.tcp_congestion_control \
+    net.ipv4.tcp_mtu_probing net.ipv4.tcp_slow_start_after_idle net.ipv4.tcp_fastopen \
+    net.core.rmem_max net.core.wmem_max net.core.rmem_default net.core.wmem_default \
+    net.ipv4.tcp_rmem net.ipv4.tcp_wmem \
+    net.core.netdev_max_backlog net.core.somaxconn net.ipv4.tcp_max_syn_backlog \
+    net.ipv4.tcp_notsent_lowat \
+    vm.swappiness
+do
+    escaped=$(printf '%s\n' "$param" | sed 's/\./\\./g')
+    sed -i "/^\s*${escaped}\s*=/d" /etc/sysctl.conf
+done
+cat > /etc/sysctl.d/99-vpn-hardening.conf << 'EOF'
+# IPv6 отключён (убрать эти 3 строки, если нужна поддержка IPv6)
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+net.ipv6.conf.lo.disable_ipv6 = 1
+# Форвардинг для Docker (remnanode)
+net.ipv4.ip_forward = 1
+# BBR - главный буст производительности VPN
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+# TCP-оптимизации для туннелей
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_fastopen = 0
+# Буферы сокетов для высоких скоростей и большого RTT
+net.core.rmem_max = 67108864
+net.core.wmem_max = 67108864
+net.core.rmem_default = 1048576
+net.core.wmem_default = 1048576
+net.ipv4.tcp_rmem = 4096 1048576 33554432
+net.ipv4.tcp_wmem = 4096 1048576 33554432
+# Очереди и backlog — больше одновременных соединений
+net.core.netdev_max_backlog = 16384
+net.core.somaxconn = 8192
+net.ipv4.tcp_max_syn_backlog = 8192
+# Меньше буферизация в очереди отправки (важно для xray/BBR)
+net.ipv4.tcp_notsent_lowat = 16384
+# Swap: использовать только при реальной нехватке RAM
+vm.swappiness = 10
+EOF
+sysctl --system
+# === Swap: всегда 2 ГБ ===
+TARGET_SWAP_MB=2048
+echo "Целевой swap: ${TARGET_SWAP_MB} МБ"
+NEED_RECREATE=0
+if [ ! -f /swapfile ]; then
+    NEED_RECREATE=1
+else
+    CURRENT_FILE_MB=$(( $(stat -c '%s' /swapfile) / 1048576 ))
+    if [ "$CURRENT_FILE_MB" -ne "$TARGET_SWAP_MB" ]; then
+        NEED_RECREATE=1
+        echo "Текущий /swapfile = ${CURRENT_FILE_MB} МБ, нужно ${TARGET_SWAP_MB} МБ"
+    fi
+fi
+if [ "$NEED_RECREATE" -eq 1 ]; then
+    if [ -f /swapfile ]; then
+        swapoff /swapfile 2>/dev/null || true
+        rm -f /swapfile
+    fi
+    fallocate -l "${TARGET_SWAP_MB}M" /swapfile
+    chmod 600 /swapfile
+    mkswap /swapfile
+    swapon /swapfile
+else
+    if ! swapon --show | grep -q '^/swapfile'; then
+        swapon /swapfile
+    fi
+fi
+if ! grep -qE '^\s*/swapfile\s' /etc/fstab; then
+    echo '/swapfile none swap sw 0 0' >> /etc/fstab
+fi
+free -h
+# === Timezone и cron ===
+timedatectl set-timezone Europe/Moscow
+# Ежедневно: pull образов и перезапуск контейнеров без ребута системы
+# Раз в неделю (вс 04:00): полный ребут сервера
+(crontab -l 2>/dev/null | grep -v "remnanode\|/sbin/reboot"; \
+ echo "0 3 * * * cd /opt/remnanode && /usr/bin/docker compose pull -q && /usr/bin/docker compose up -d --remove-orphans"; \
+ echo "0 4 * * 0 /sbin/reboot") | crontab -
+echo "Готово"
