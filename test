@@ -158,7 +158,8 @@ CURRENT_CRON=$(crontab -l 2>/dev/null | grep -v "remnanode\|/sbin/reboot" || tru
 {
     [ -n "$CURRENT_CRON" ] && echo "$CURRENT_CRON"
     echo "0 3 * * * cd /opt/remnanode && /usr/bin/docker compose pull -q && /usr/bin/docker compose up -d --remove-orphans"
-    echo "0 4 * * 0 /sbin/reboot"
+    #Ребут раз в неделю: echo "0 4 * * 0 /sbin/reboot"
+    echo "0 4 * * * /sbin/reboot"
 } | crontab -
 
 echo "=== Готово ==="
