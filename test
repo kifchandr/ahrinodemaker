@@ -1,14 +1,25 @@
-#!/bin/bash
+#!/usr/bin/env bash
+#fail2ban + ufw + sysctl + cron
 set -euo pipefail
+
+# === Проверка прав ===
+if [ "$(id -u)" -ne 0 ]; then
+    echo "Скрипт нужно запускать от root (или через sudo)." >&2
+    exit 1
+fi
+
 export DEBIAN_FRONTEND=noninteractive
 
 # === Пакеты ===
-apt update
-apt install -y fail2ban ufw unattended-upgrades
+apt-get update
+apt-get install -y fail2ban ufw unattended-upgrades
 dpkg-reconfigure -f noninteractive unattended-upgrades
 
 # === Fail2Ban ===
 cat > /etc/fail2ban/jail.local << 'EOF'
+[DEFAULT]
+backend = systemd
+
 [sshd]
 enabled = true
 port = ssh
@@ -18,12 +29,12 @@ findtime = 600
 bantime = 12h
 EOF
 systemctl enable --now fail2ban
+systemctl restart fail2ban
 
 # === UFW ===
 ufw --force reset
 ufw default deny incoming
 ufw default allow outgoing
-ufw allow ssh
 ufw limit ssh
 ufw allow 80/tcp
 ufw allow 443/tcp
@@ -35,52 +46,35 @@ ufw allow out on lo
 ufw logging low
 ufw --force enable
 
-# === Загрузка модуля conntrack (нужен для nf_conntrack_* параметров) ===
+# === Загрузка модуля conntrack ===
 modprobe nf_conntrack || true
 echo 'nf_conntrack' > /etc/modules-load.d/nf_conntrack.conf
+echo 'options nf_conntrack hashsize=262144' > /etc/modprobe.d/nf_conntrack.conf
 
 # === Sysctl ===
-for param in \
-    net.ipv6.conf.all.disable_ipv6 net.ipv6.conf.default.disable_ipv6 net.ipv6.conf.lo.disable_ipv6 \
-    net.ipv4.ip_forward net.core.default_qdisc net.ipv4.tcp_congestion_control \
-    net.ipv4.tcp_mtu_probing net.ipv4.tcp_slow_start_after_idle net.ipv4.tcp_fastopen \
-    net.core.rmem_max net.core.wmem_max net.core.rmem_default net.core.wmem_default \
-    net.ipv4.tcp_rmem net.ipv4.tcp_wmem \
-    net.core.netdev_max_backlog net.core.somaxconn net.ipv4.tcp_max_syn_backlog \
-    net.ipv4.tcp_notsent_lowat \
-    net.ipv4.tcp_syncookies net.ipv4.tcp_tw_reuse net.ipv4.tcp_fin_timeout \
-    net.ipv4.ip_local_port_range \
-    net.netfilter.nf_conntrack_max net.netfilter.nf_conntrack_buckets \
-    net.netfilter.nf_conntrack_tcp_timeout_established \
-    net.netfilter.nf_conntrack_tcp_timeout_time_wait \
-    net.netfilter.nf_conntrack_tcp_timeout_close_wait \
-    vm.swappiness
-do
-    escaped=$(printf '%s\n' "$param" | sed 's/\./\\./g')
-    sed -i "/^\s*${escaped}\s*=/d" /etc/sysctl.conf
-done
-
-cat > /etc/sysctl.d/99-vpn-hardening.conf << 'EOF'
+cat > /etc/sysctl.d/99-vpn.conf << 'EOF'
 # --- IPv6 / forwarding ---
-net.ipv6.conf.all.disable_ipv6 = 0
-net.ipv6.conf.default.disable_ipv6 = 0
-net.ipv6.conf.lo.disable_ipv6 = 0
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+net.ipv6.conf.lo.disable_ipv6 = 1
 net.ipv4.ip_forward = 1
 
 # --- TCP congestion control + qdisc ---
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
-net.ipv4.tcp_mtu_probing = 1
-net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.tcp_fastopen = 0
+net.ipv4.tcp_fastopen = 3
 
 # --- Буферы сокетов (большие — для высокой пропускной способности VPN) ---
 net.core.rmem_max = 67108864
 net.core.wmem_max = 67108864
-net.core.rmem_default = 1048576
-net.core.wmem_default = 1048576
 net.ipv4.tcp_rmem = 4096 1048576 33554432
 net.ipv4.tcp_wmem = 4096 1048576 33554432
+
+# --- Keepalive ---
+net.ipv4.tcp_keepalive_time = 300
+net.ipv4.tcp_keepalive_intvl = 15
+net.ipv4.tcp_keepalive_probes = 5
+net.ipv4.tcp_fin_timeout = 15
 
 # --- Очереди / бэклоги ---
 net.core.netdev_max_backlog = 16384
@@ -91,8 +85,6 @@ net.ipv4.tcp_notsent_lowat = 16384
 # --- Защита и переиспользование TCP ---
 net.ipv4.tcp_syncookies = 1
 net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_fin_timeout = 15
-net.ipv4.ip_local_port_range = 10000 65535
 
 # --- Conntrack (требует загруженного модуля nf_conntrack) ---
 net.netfilter.nf_conntrack_max = 1048576
@@ -104,62 +96,18 @@ net.netfilter.nf_conntrack_tcp_timeout_close_wait = 30
 # --- Память ---
 vm.swappiness = 10
 EOF
-
-# nf_conntrack_buckets можно задать только через модульный параметр или write-once,
-# поэтому дополнительно прописываем его и через modprobe.d (на случай ранней загрузки)
-echo 'options nf_conntrack hashsize=262144' > /etc/modprobe.d/nf_conntrack.conf
-
 sysctl --system
-
-# === Swap: всегда 2 ГБ ===
-TARGET_SWAP_MB=2048
-echo "Целевой swap: ${TARGET_SWAP_MB} МБ"
-
-# Убираем дефолтный /swap.img Ubuntu, если есть
-if [ -f /swap.img ]; then
-    swapoff /swap.img 2>/dev/null || true
-    sed -i '/\/swap\.img/d' /etc/fstab
-    rm -f /swap.img
-    echo "Удалён дефолтный /swap.img"
-fi
-
-NEED_RECREATE=0
-if [ ! -f /swapfile ]; then
-    NEED_RECREATE=1
-else
-    CURRENT_FILE_MB=$(( $(stat -c '%s' /swapfile) / 1048576 ))
-    if [ "$CURRENT_FILE_MB" -ne "$TARGET_SWAP_MB" ]; then
-        NEED_RECREATE=1
-        echo "Текущий /swapfile = ${CURRENT_FILE_MB} МБ, нужно ${TARGET_SWAP_MB} МБ"
-    fi
-fi
-
-if [ "$NEED_RECREATE" -eq 1 ]; then
-    if [ -f /swapfile ]; then
-        swapoff /swapfile 2>/dev/null || true
-        rm -f /swapfile
-    fi
-    fallocate -l "${TARGET_SWAP_MB}M" /swapfile
-    chmod 600 /swapfile
-    mkswap /swapfile
-    swapon /swapfile
-else
-    swapon --show | grep -q '^/swapfile' || swapon /swapfile
-fi
-
-grep -qE '^\s*/swapfile\s' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
-free -h
 
 # === Timezone и cron ===
 timedatectl set-timezone Europe/Moscow
 
-# Безопасное обновление crontab (устойчиво к пустому crontab при set -e + pipefail)
-CURRENT_CRON=$(crontab -l 2>/dev/null | grep -v "remnanode\|/sbin/reboot" || true)
+# Безопасное обновление crontab: вычищаем старые записи, добавляем новую.
+CURRENT_CRON="$(crontab -l 2>/dev/null | grep -v -E 'remnanode|/sbin/reboot' || true)"
 {
-    [ -n "$CURRENT_CRON" ] && echo "$CURRENT_CRON"
-    echo "0 3 * * * cd /opt/remnanode && /usr/bin/docker compose pull -q && /usr/bin/docker compose up -d --remove-orphans"
-    #Ребут раз в неделю: echo "0 4 * * 0 /sbin/reboot"
-    echo "0 4 * * * /sbin/reboot"
+    if [ -n "$CURRENT_CRON" ]; then
+        printf '%s\n' "$CURRENT_CRON"
+    fi
+    echo "0 4 * * * cd /opt/remnanode && /usr/bin/docker compose pull -q && /usr/bin/docker compose up -d --remove-orphans && /sbin/reboot"
 } | crontab -
 
 echo "=== Готово ==="
