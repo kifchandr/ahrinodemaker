@@ -1,8 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Команда для запуска
-curl -fsSL https://raw.githubusercontent.com/kifchandr/test/main/test | sudo python3
+server_hardening.py
+Первичная настройка / харденинг VPN-сервера (Debian/Ubuntu):
+    fail2ban + ufw + sysctl + conntrack + cron + unattended-upgrades.
+
+Особенности:
+  * интерактивный выбор блоков для выполнения (галочки);
+  * ввод дополнительных портов для UFW через запятую;
+  * подтверждение перед запуском, цветной вывод (rich).
+
+ВНИМАНИЕ: команды (содержимое конфигов, правила ufw, sysctl) полностью
+повторяют исходный bash-скрипт — поведение не изменено, добавлена только
+обёртка с выбором блоков и доп. портами.
 """
 
 import os
@@ -235,17 +245,26 @@ def block_cron() -> None:
     console.print("[green]✓ crontab обновлён[/green]")
 
 
+# --- Объединённые блоки ---
+def block_network() -> None:
+    block_conntrack()
+    block_sysctl()
+
+
+def block_time_cron() -> None:
+    block_timezone()
+    block_cron()
+
+
 # ================================================================== #
 #  Описание блоков (ключ, подпись, функция)
 # ================================================================== #
 BLOCKS = [
     ("packages",  "Установка пакетов (fail2ban, ufw, unattended-upgrades)", block_packages),
     ("fail2ban",  "Настройка Fail2Ban",                                      block_fail2ban),
-    ("ufw",       "Настройка UFW (firewall) + доп. порты",                   block_ufw),
-    ("conntrack", "Загрузка модуля conntrack",                               block_conntrack),
-    ("sysctl",    "Настройка sysctl (BBR, буферы, conntrack и т.д.)",        block_sysctl),
-    ("timezone",  "Часовой пояс Europe/Moscow",                              block_timezone),
-    ("cron",      "Cron: еженедельная перезагрузка (Пн 03:00)",              block_cron),
+    ("ufw",       "Настройка UFW (firewall)",                                block_ufw),
+    ("network",   "Сеть: conntrack + sysctl (BBR, буферы, очереди)",         block_network),
+    ("time_cron", "Часовой пояс Europe/Moscow + cron (перезагрузка Пн 03:00)", block_time_cron),
 ]
 
 # ------------------------------------------------------------------ #
@@ -280,9 +299,8 @@ def ask_extra_ports() -> list[str]:
         valid, invalid = parse_extra_ports(raw)
         if invalid:
             console.print(f"[red]Некорректные значения:[/red] {', '.join(invalid)}")
-            console.print("[yellow]Допустимо: порт, порт/tcp, порт/udp, диапазон вида 1000:2000/tcp[/yellow]")
-            if not questionary.confirm("Ввести заново?", default=True).ask():
-                return valid
+            console.print("[yellow]Допустимо: порт, порт/tcp, порт/udp, диапазон вида 1000:2000/tcp. "
+                          "Повторите ввод или нажмите Enter, чтобы пропустить.[/yellow]")
             continue
         return valid
 
@@ -324,7 +342,7 @@ def main() -> None:
     if "ufw" in selected:
         extra_ports = ask_extra_ports()
 
-    # 3. Сводка и подтверждение
+    # 3. Сводка и запуск через Enter
     table = Table(title="К выполнению", show_header=False, border_style="cyan")
     for key, label, _ in BLOCKS:
         mark = "[green]✓[/green]" if key in selected else "[dim]–[/dim]"
@@ -333,7 +351,10 @@ def main() -> None:
     if extra_ports:
         console.print(f"[bold]Доп. порты UFW:[/bold] {', '.join(extra_ports)}")
 
-    if not questionary.confirm("Запустить выполнение?", default=False).ask():
+    answer = questionary.text(
+        "Нажмите Enter для запуска (Ctrl+C — отмена)", default="",
+    ).ask()
+    if answer is None:           # Ctrl+C
         console.print("[yellow]Отменено пользователем.[/yellow]")
         return
 
@@ -349,10 +370,7 @@ def main() -> None:
                 func()
         except subprocess.CalledProcessError as exc:
             failures.append((label, exc))
-            console.print(f"[red]✗ Ошибка в блоке «{label}»: {exc}[/red]")
-            if not questionary.confirm("Продолжить со следующими блоками?",
-                                       default=True).ask():
-                break
+            console.print(f"[red]✗ Ошибка в блоке «{label}» — продолжаю дальше: {exc}[/red]")
 
     if failures:
         console.print(Panel.fit(
