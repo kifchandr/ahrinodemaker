@@ -1,24 +1,126 @@
-#!/usr/bin/env bash
-#fail2ban + ufw + sysctl + cron
-set -euo pipefail
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Команда для запуска
+curl -fsSL https://raw.githubusercontent.com/kifchandr/test/main/test | sudo python3
+"""
 
-# === Проверка прав ===
-if [ "$(id -u)" -ne 0 ]; then
-    echo "Скрипт нужно запускать от root (или через sudo)." >&2
-    exit 1
-fi
+import os
+import re
+import sys
+import subprocess
+import importlib
 
-export DEBIAN_FRONTEND=noninteractive
+APP_NAME = "VPN Server Hardening"
 
-# === Пакеты ===
-apt-get update
-apt-get install -y fail2ban ufw unattended-upgrades
-dpkg-reconfigure -f noninteractive unattended-upgrades
+# ------------------------------------------------------------------ #
+#  Заголовок окна терминала
+# ------------------------------------------------------------------ #
+def set_window_title(title: str) -> None:
+    try:
+        sys.stdout.write(f"\33]0;{title}\a")
+        sys.stdout.flush()
+    except Exception:
+        pass
 
-# === Fail2Ban ===
-cat > /etc/fail2ban/jail.local << 'EOF'
-[DEFAULT]
-backend = systemd
+
+set_window_title(APP_NAME)
+
+# ------------------------------------------------------------------ #
+#  Проверка прав root (до установки модулей — она тоже требует root)
+# ------------------------------------------------------------------ #
+if os.geteuid() != 0:
+    print("Скрипт нужно запускать от root (или через sudo).", file=sys.stderr)
+    sys.exit(1)
+
+# ------------------------------------------------------------------ #
+#  Автоустановка нестандартных модулей
+# ------------------------------------------------------------------ #
+def _ensure_pip() -> None:
+    try:
+        import pip  # noqa: F401
+    except ImportError:
+        subprocess.run(["apt-get", "install", "-y", "python3-pip"], check=False)
+
+
+def ensure(pkg: str, module: str | None = None):
+    module = module or pkg
+    try:
+        return importlib.import_module(module)
+    except ImportError:
+        _ensure_pip()
+        # На Debian 12+/Ubuntu 24+ обычная установка падает из-за PEP 668,
+        # поэтому пробуем оба варианта.
+        for extra in ([], ["--break-system-packages"]):
+            cmd = [sys.executable, "-m", "pip", "install", "-q", *extra, pkg]
+            if subprocess.run(cmd).returncode == 0:
+                break
+        return importlib.import_module(module)
+
+
+ensure("rich")
+ensure("questionary")
+
+import questionary
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+
+console = Console()
+
+
+def reattach_tty() -> bool:
+    """При запуске через `curl ... | python3` stdin занят телом скрипта.
+    Переподключаем ввод к управляющему терминалу, иначе галочки не работают."""
+    try:
+        if sys.stdin is not None and sys.stdin.isatty():
+            return True
+    except Exception:
+        pass
+    try:
+        tty = open("/dev/tty")
+        os.dup2(tty.fileno(), 0)
+        sys.stdin = tty
+        return True
+    except OSError:
+        return False
+
+# ------------------------------------------------------------------ #
+#  Хелпер запуска команд
+# ------------------------------------------------------------------ #
+ENV = {**os.environ, "DEBIAN_FRONTEND": "noninteractive"}
+
+
+def run(cmd, *, shell: bool = False, check: bool = True, capture: bool = False,
+        input_text: str | None = None):
+    pretty = cmd if isinstance(cmd, str) else " ".join(cmd)
+    console.print(f"[dim]$ {pretty}[/dim]")
+    return subprocess.run(
+        cmd, shell=shell, check=check, env=ENV, text=True,
+        input=input_text,
+        capture_output=capture,
+    )
+
+
+def step(title: str) -> None:
+    console.rule(f"[bold cyan]{title}")
+
+
+# ================================================================== #
+#  БЛОКИ
+# ================================================================== #
+def block_packages() -> None:
+    step("Установка пакетов")
+    run(["apt-get", "update"])
+    run(["apt-get", "install", "-y", "fail2ban", "ufw", "unattended-upgrades"])
+    run(["dpkg-reconfigure", "-f", "noninteractive", "unattended-upgrades"])
+    console.print("[green]✓ Пакеты установлены[/green]")
+
+
+def block_fail2ban() -> None:
+    step("Настройка Fail2Ban")
+    jail = """[DEFAULT]
+backend = auto
 
 [sshd]
 enabled = true
@@ -27,33 +129,46 @@ filter = sshd
 maxretry = 5
 findtime = 600
 bantime = 12h
-EOF
-systemctl enable --now fail2ban
-systemctl restart fail2ban
+"""
+    with open("/etc/fail2ban/jail.local", "w", encoding="utf-8") as f:
+        f.write(jail)
+    run(["systemctl", "enable", "--now", "fail2ban"])
+    run(["systemctl", "restart", "fail2ban"])
+    console.print("[green]✓ Fail2Ban настроен[/green]")
 
-# === UFW ===
-ufw --force reset
-ufw default deny incoming
-ufw default allow outgoing
-ufw limit ssh
-ufw allow 80/tcp
-ufw allow 443/tcp
-ufw allow 8443/tcp
-ufw allow 9999/tcp
-ufw allow from 109.248.168.105 to any port 2222 proto tcp
-ufw allow in on lo
-ufw allow out on lo
-ufw logging low
-ufw --force enable
 
-# === Загрузка модуля conntrack ===
-modprobe nf_conntrack || true
-echo 'nf_conntrack' > /etc/modules-load.d/nf_conntrack.conf
-echo 'options nf_conntrack hashsize=262144' > /etc/modprobe.d/nf_conntrack.conf
+def block_ufw(extra_ports: list[str]) -> None:
+    step("Настройка UFW (firewall)")
+    run(["ufw", "default", "deny", "incoming"])
+    run(["ufw", "default", "allow", "outgoing"])
+    run(["ufw", "limit", "ssh"])
+    for port in ("80/tcp", "443/tcp", "8443/tcp", "9999/tcp"):
+        run(["ufw", "allow", port])
+    run(["ufw", "allow", "from", "109.248.168.105", "to", "any",
+         "port", "2222", "proto", "tcp"])
+    # Дополнительные порты, введённые пользователем
+    for port in extra_ports:
+        run(["ufw", "allow", port])
+    run(["ufw", "allow", "in", "on", "lo"])
+    run(["ufw", "allow", "out", "on", "lo"])
+    run(["ufw", "logging", "low"])
+    run(["ufw", "--force", "enable"])
+    console.print("[green]✓ UFW настроен[/green]")
 
-# === Sysctl ===
-cat > /etc/sysctl.d/99-vpn.conf << 'EOF'
-# --- IPv6 / forwarding ---
+
+def block_conntrack() -> None:
+    step("Загрузка модуля conntrack")
+    run(["modprobe", "nf_conntrack"], check=False)
+    with open("/etc/modules-load.d/nf_conntrack.conf", "w", encoding="utf-8") as f:
+        f.write("nf_conntrack\n")
+    with open("/etc/modprobe.d/nf_conntrack.conf", "w", encoding="utf-8") as f:
+        f.write("options nf_conntrack hashsize=262144\n")
+    console.print("[green]✓ Модуль conntrack настроен[/green]")
+
+
+def block_sysctl() -> None:
+    step("Настройка sysctl")
+    sysctl_conf = """# --- IPv6 / forwarding ---
 net.ipv6.conf.all.disable_ipv6 = 1
 net.ipv6.conf.default.disable_ipv6 = 1
 net.ipv6.conf.lo.disable_ipv6 = 1
@@ -95,19 +210,163 @@ net.netfilter.nf_conntrack_tcp_timeout_close_wait = 30
 
 # --- Память ---
 vm.swappiness = 10
-EOF
-sysctl --system
+"""
+    with open("/etc/sysctl.d/99-vpn.conf", "w", encoding="utf-8") as f:
+        f.write(sysctl_conf)
+    run(["sysctl", "--system"])
+    console.print("[green]✓ sysctl применён[/green]")
 
-# === Timezone и cron ===
-timedatectl set-timezone Europe/Moscow
 
-# Безопасное обновление crontab: вычищаем старые записи, добавляем новую.
-CURRENT_CRON="$(crontab -l 2>/dev/null | grep -v -E 'remnanode|/sbin/reboot' || true)"
-{
-    if [ -n "$CURRENT_CRON" ]; then
-        printf '%s\n' "$CURRENT_CRON"
-    fi
-    echo "0 4 * * * cd /opt/remnanode && /usr/bin/docker compose pull -q && /usr/bin/docker compose up -d --remove-orphans && /sbin/reboot"
-} | crontab -
+def block_timezone() -> None:
+    step("Часовой пояс")
+    run(["timedatectl", "set-timezone", "Europe/Moscow"])
+    console.print("[green]✓ Часовой пояс: Europe/Moscow[/green]")
 
-echo "=== Готово ==="
+
+def block_cron() -> None:
+    step("Настройка cron (еженедельная перезагрузка)")
+    res = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
+    existing = res.stdout.splitlines() if res.returncode == 0 else []
+    kept = [ln for ln in existing
+            if "remnanode" not in ln and "/sbin/reboot" not in ln]
+    kept.append("0 3 * * 1 /sbin/reboot")
+    new_cron = "\n".join(kept) + "\n"
+    run(["crontab", "-"], input_text=new_cron)
+    console.print("[green]✓ crontab обновлён[/green]")
+
+
+# ================================================================== #
+#  Описание блоков (ключ, подпись, функция)
+# ================================================================== #
+BLOCKS = [
+    ("packages",  "Установка пакетов (fail2ban, ufw, unattended-upgrades)", block_packages),
+    ("fail2ban",  "Настройка Fail2Ban",                                      block_fail2ban),
+    ("ufw",       "Настройка UFW (firewall) + доп. порты",                   block_ufw),
+    ("conntrack", "Загрузка модуля conntrack",                               block_conntrack),
+    ("sysctl",    "Настройка sysctl (BBR, буферы, conntrack и т.д.)",        block_sysctl),
+    ("timezone",  "Часовой пояс Europe/Moscow",                              block_timezone),
+    ("cron",      "Cron: еженедельная перезагрузка (Пн 03:00)",              block_cron),
+]
+
+# ------------------------------------------------------------------ #
+#  Парсинг доп. портов для UFW
+# ------------------------------------------------------------------ #
+PORT_RE = re.compile(r"^\d{1,5}(:\d{1,5})?(/(tcp|udp))?$", re.IGNORECASE)
+
+
+def parse_extra_ports(raw: str) -> tuple[list[str], list[str]]:
+    valid, invalid = [], []
+    for item in (p.strip() for p in raw.split(",")):
+        if not item:
+            continue
+        if PORT_RE.match(item):
+            valid.append(item)
+        else:
+            invalid.append(item)
+    return valid, invalid
+
+
+def ask_extra_ports() -> list[str]:
+    while True:
+        raw = questionary.text(
+            "Доп. порты для UFW через запятую (Enter — пропустить).\n"
+            "  Примеры: 8080, 5000/udp, 10000:10100/tcp",
+            default="",
+        ).ask()
+        if raw is None:          # Ctrl+C
+            return []
+        if not raw.strip():
+            return []
+        valid, invalid = parse_extra_ports(raw)
+        if invalid:
+            console.print(f"[red]Некорректные значения:[/red] {', '.join(invalid)}")
+            console.print("[yellow]Допустимо: порт, порт/tcp, порт/udp, диапазон вида 1000:2000/tcp[/yellow]")
+            if not questionary.confirm("Ввести заново?", default=True).ask():
+                return valid
+            continue
+        return valid
+
+
+# ------------------------------------------------------------------ #
+#  Главная логика
+# ------------------------------------------------------------------ #
+def main() -> None:
+    if not reattach_tty():
+        console.print(
+            "[red]Нет доступа к терминалу для интерактивного выбора.[/red]\n"
+            "Запустите так: [bold]curl -fsSL <URL> | sudo python3[/bold] "
+            "в обычной консоли сервера."
+        )
+        return
+
+    console.print(Panel.fit(
+        "[bold]fail2ban + ufw + sysctl + conntrack + cron[/bold]\n"
+        "Интерактивная настройка сервера",
+        title=APP_NAME, border_style="cyan",
+    ))
+
+    # 1. Выбор блоков галочками (по умолчанию все отмечены)
+    choices = [
+        questionary.Choice(title=label, value=key, checked=True)
+        for key, label, _ in BLOCKS
+    ]
+    selected = questionary.checkbox(
+        "Отметьте блоки для выполнения (Space — выбрать, Enter — подтвердить):",
+        choices=choices,
+    ).ask()
+
+    if not selected:
+        console.print("[yellow]Ничего не выбрано — выход.[/yellow]")
+        return
+
+    # 2. Доп. порты — только если выбран блок UFW
+    extra_ports: list[str] = []
+    if "ufw" in selected:
+        extra_ports = ask_extra_ports()
+
+    # 3. Сводка и подтверждение
+    table = Table(title="К выполнению", show_header=False, border_style="cyan")
+    for key, label, _ in BLOCKS:
+        mark = "[green]✓[/green]" if key in selected else "[dim]–[/dim]"
+        table.add_row(mark, label if key in selected else f"[dim]{label}[/dim]")
+    console.print(table)
+    if extra_ports:
+        console.print(f"[bold]Доп. порты UFW:[/bold] {', '.join(extra_ports)}")
+
+    if not questionary.confirm("Запустить выполнение?", default=False).ask():
+        console.print("[yellow]Отменено пользователем.[/yellow]")
+        return
+
+    # 4. Выполнение в исходном порядке
+    failures = []
+    for key, label, func in BLOCKS:
+        if key not in selected:
+            continue
+        try:
+            if key == "ufw":
+                func(extra_ports)
+            else:
+                func()
+        except subprocess.CalledProcessError as exc:
+            failures.append((label, exc))
+            console.print(f"[red]✗ Ошибка в блоке «{label}»: {exc}[/red]")
+            if not questionary.confirm("Продолжить со следующими блоками?",
+                                       default=True).ask():
+                break
+
+    if failures:
+        console.print(Panel.fit(
+            "\n".join(f"• {name}" for name, _ in failures),
+            title="[red]Завершено с ошибками[/red]", border_style="red",
+        ))
+    else:
+        console.print(Panel.fit("[bold green]=== Готово ===[/bold green]",
+                                border_style="green"))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Прервано пользователем.[/yellow]")
+        sys.exit(130)
