@@ -385,11 +385,15 @@ def block_remnanode_logs(compose_path: str | None) -> None:
 
     # 2. logrotate
     logrotate_conf = """/var/log/remnanode/*.log {
-    size 50M
-    rotate 5
-    compress
+    su root root
+    daily
+    rotate 14
+    maxsize 300M
     missingok
     notifempty
+    compress
+    delaycompress
+    dateext
     copytruncate
 }
 """
