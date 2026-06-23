@@ -59,14 +59,37 @@ def ensure(pkg: str, module: str | None = None):
     try:
         return importlib.import_module(module)
     except ImportError:
-        _ensure_pip()
-        # На Debian 12+/Ubuntu 24+ обычная установка падает из-за PEP 668,
-        # поэтому пробуем оба варианта.
-        for extra in ([], ["--break-system-packages"]):
-            cmd = [sys.executable, "-m", "pip", "install", "-q", *extra, pkg]
-            if subprocess.run(cmd).returncode == 0:
-                break
+        pass
+
+    _ensure_pip()
+    env = {**os.environ, "DEBIAN_FRONTEND": "noninteractive",
+           "PIP_ROOT_USER_ACTION": "ignore"}
+
+    # На Debian 12+/Ubuntu 24+ системный Python «externally managed» (PEP 668),
+    # поэтому ставим сразу с --break-system-packages. Вторая попытка — для
+    # старых систем, где такого флага ещё нет. capture_output гасит шумный
+    # вывод pip; текст ошибки покажем только если установка реально упала.
+    attempts = [
+        [sys.executable, "-m", "pip", "install", "-q", "--break-system-packages", pkg],
+        [sys.executable, "-m", "pip", "install", "-q", pkg],
+    ]
+    last = None
+    for cmd in attempts:
+        last = subprocess.run(cmd, env=env, text=True, capture_output=True)
+        if last.returncode == 0:
+            break
+    else:
+        # Запасной путь — системный пакет через apt (python3-rich и т.п.)
+        apt_pkg = "python3-" + module.split(".")[0].replace("_", "-")
+        subprocess.run(["apt-get", "install", "-y", apt_pkg],
+                       env=env, text=True, capture_output=True)
+
+    try:
         return importlib.import_module(module)
+    except ImportError:
+        err = (last.stderr.strip() if last and last.stderr else "неизвестная ошибка")
+        print(f"Не удалось установить модуль «{pkg}»:\n{err}", file=sys.stderr)
+        sys.exit(1)
 
 
 ensure("rich")
