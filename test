@@ -17,8 +17,13 @@ APP_NAME = "VPN Server Hardening"
 # Volume, который нужно добавить в docker-compose.yml ноды
 REMNANODE_VOLUME = "/var/log/remnanode:/var/log/remnanode"
 
+# Пути для блока блокировки торрентов
+TBLOCKER_DIR = "/opt/tblocker"
+INSTALL_DIR  = "/opt/remnanode"
+
+
 # ------------------------------------------------------------------ #
-#  Заголовок окна терминала
+# Заголовок окна терминала
 # ------------------------------------------------------------------ #
 def set_window_title(title: str) -> None:
     try:
@@ -30,15 +35,17 @@ def set_window_title(title: str) -> None:
 
 set_window_title(APP_NAME)
 
+
 # ------------------------------------------------------------------ #
-#  Проверка прав root (до установки модулей — она тоже требует root)
+# Проверка прав root (до установки модулей — она тоже требует root)
 # ------------------------------------------------------------------ #
 if os.geteuid() != 0:
     print("Скрипт нужно запускать от root (или через sudo).", file=sys.stderr)
     sys.exit(1)
 
+
 # ------------------------------------------------------------------ #
-#  Автоустановка нестандартных модулей
+# Автоустановка нестандартных модулей
 # ------------------------------------------------------------------ #
 def _ensure_pip() -> None:
     try:
@@ -89,8 +96,9 @@ def reattach_tty() -> bool:
     except OSError:
         return False
 
+
 # ------------------------------------------------------------------ #
-#  Хелпер запуска команд
+# Хелпер запуска команд
 # ------------------------------------------------------------------ #
 ENV = {**os.environ, "DEBIAN_FRONTEND": "noninteractive"}
 
@@ -111,7 +119,7 @@ def step(title: str) -> None:
 
 
 # ================================================================== #
-#  БЛОКИ
+# БЛОКИ
 # ================================================================== #
 def block_packages() -> None:
     step("Установка пакетов")
@@ -177,41 +185,34 @@ net.ipv6.conf.all.disable_ipv6 = 1
 net.ipv6.conf.default.disable_ipv6 = 1
 net.ipv6.conf.lo.disable_ipv6 = 1
 net.ipv4.ip_forward = 1
-
 # --- TCP congestion control + qdisc ---
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 net.ipv4.tcp_fastopen = 3
-
 # --- Буферы сокетов (большие — для высокой пропускной способности VPN) ---
 net.core.rmem_max = 67108864
 net.core.wmem_max = 67108864
 net.ipv4.tcp_rmem = 4096 1048576 33554432
 net.ipv4.tcp_wmem = 4096 1048576 33554432
-
 # --- Keepalive ---
 net.ipv4.tcp_keepalive_time = 300
 net.ipv4.tcp_keepalive_intvl = 15
 net.ipv4.tcp_keepalive_probes = 5
 net.ipv4.tcp_fin_timeout = 15
-
 # --- Очереди / бэклоги ---
 net.core.netdev_max_backlog = 16384
 net.core.somaxconn = 65535
 net.ipv4.tcp_max_syn_backlog = 8192
 net.ipv4.tcp_notsent_lowat = 16384
-
 # --- Защита и переиспользование TCP ---
 net.ipv4.tcp_syncookies = 1
 net.ipv4.tcp_tw_reuse = 1
-
 # --- Conntrack (требует загруженного модуля nf_conntrack) ---
 net.netfilter.nf_conntrack_max = 1048576
 net.netfilter.nf_conntrack_buckets = 262144
 net.netfilter.nf_conntrack_tcp_timeout_established = 600
 net.netfilter.nf_conntrack_tcp_timeout_time_wait = 30
 net.netfilter.nf_conntrack_tcp_timeout_close_wait = 30
-
 # --- Память ---
 vm.swappiness = 10
 """
@@ -240,7 +241,7 @@ def block_cron() -> None:
 
 
 # ------------------------------------------------------------------ #
-#  Поиск / правка docker-compose.yml ноды (для блока логов)
+# Поиск / правка docker-compose.yml ноды (для блока логов)
 # ------------------------------------------------------------------ #
 COMPOSE_CANDIDATES = [
     "/opt/remnanode/docker-compose.yml",
@@ -328,7 +329,6 @@ def patch_compose_volume(path: str) -> str:
         return "в файле нет секции services"
 
     services = data["services"]
-
     # Выбираем сервис: точное имя remnanode → единственный сервис → по подстроке
     if "remnanode" in services:
         names = ["remnanode"]
@@ -378,11 +378,9 @@ def recreate_node(compose_path: str) -> None:
 
 def block_remnanode_logs(compose_path: str | None) -> None:
     step("Логи remnanode: каталог + logrotate + docker volume")
-
     # 1. Каталог под логи
     os.makedirs("/var/log/remnanode", exist_ok=True)
     console.print("[green]✓ Каталог /var/log/remnanode готов[/green]")
-
     # 2. logrotate
     logrotate_conf = """/var/log/remnanode/*.log {
     su root root
@@ -400,7 +398,6 @@ def block_remnanode_logs(compose_path: str | None) -> None:
     with open("/etc/logrotate.d/remnanode", "w", encoding="utf-8") as f:
         f.write(logrotate_conf)
     console.print("[green]✓ /etc/logrotate.d/remnanode записан[/green]")
-
     # 3. Volume в docker-compose.yml ноды
     if not compose_path:
         console.print("[yellow]docker-compose.yml ноды не задан — volume не добавлен.[/yellow]")
@@ -415,6 +412,155 @@ def block_remnanode_logs(compose_path: str | None) -> None:
         console.print(f"[yellow]Не удалось обновить {compose_path}: {result}[/yellow]")
 
 
+# ------------------------------------------------------------------ #
+# Блокировка торрентов: tblocker + egress-фильтр (nft) + справка панели
+# ------------------------------------------------------------------ #
+EGRESS_SCRIPT = r'''#!/usr/bin/env bash
+set -euo pipefail
+PORTS=(6881 6882 6883 6884 6885 6886 6887 6888 6889 51413 21413 17417 37305)
+apply() {
+  local f=$1 t=$2 s=$3
+  nft list table "$f" "$t" >/dev/null 2>&1 || return 0
+  local e=()
+  for p in "${PORTS[@]}"; do e+=("tcp . $p" "udp . $p"); done
+  nft add element "$f" "$t" "$s" "{ $(printf '%s, ' "${e[@]}") }" 2>/dev/null || true
+}
+apply ip remnanode egress-filter-port
+apply ip6 remnanode6 egress-filter-port6
+'''
+
+EGRESS_SERVICE = f"""[Unit]
+Description=Apply torrent egress port blocking
+After=network-online.target docker.service
+
+[Service]
+Type=oneshot
+ExecStart={INSTALL_DIR}/apply-torrent-egress-filter.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+EGRESS_TIMER = """[Unit]
+Description=Re-apply torrent egress port blocking
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+"""
+
+TBLOCKER_CONFIG = """LogFile: "/var/log/remnanode/access.log"
+BlockDuration: 1440
+TorrentTag: "TORRENT"
+BlockMode: "nft"
+"""
+
+PANEL_REFERENCE = """{
+  "routingRulesToAdd": [
+    {"type": "field", "port": "6881-6889,51413,21413,17417,37305", "ruleTag": "TORRENT_BY_PORT", "outboundTag": "BLOCK"},
+    {"type": "field", "domain": ["geosite:category-public-tracker"], "ruleTag": "TORRENT_BY_DOMAIN", "outboundTag": "BLOCK"},
+    {"type": "field", "protocol": ["bittorrent"], "outboundTag": "TORRENT"}
+  ],
+  "nodePluginConfig": {
+    "torrentBlocker": {
+      "enabled": true,
+      "ignoreLists": {"ip": [], "userId": []},
+      "blockDuration": 86400,
+      "includeRuleTags": ["TORRENT_BY_PORT", "TORRENT_BY_DOMAIN"]
+    },
+    "egressFilter": {
+      "enabled": true,
+      "blockedPorts": [6881,6882,6883,6884,6885,6886,6887,6888,6889,51413,21413,17417,37305]
+    }
+  }
+}
+"""
+
+
+def _install_tblocker_package() -> None:
+    """Подключает репозиторий remna.dev и ставит пакет tblocker."""
+    run(["apt-get", "install", "-y", "curl", "gnupg", "ca-certificates"])
+    keyring  = "/usr/share/keyrings/openrepo-xray-tools.gpg"
+    listfile = "/etc/apt/sources.list.d/openrepo-xray-tools.list"
+    if not os.path.isfile(listfile):
+        run("curl -fsSL https://repo.remna.dev/xray-tools/public.gpg "
+            f"| gpg --yes --dearmor -o {keyring}", shell=True)
+        with open(listfile, "w", encoding="utf-8") as f:
+            f.write(f"deb [arch=any signed-by={keyring}] "
+                    "https://repo.remna.dev/xray-tools/ stable main\n")
+    run(["apt-get", "update"])
+    run(["apt-get", "install", "-y", "tblocker"])
+
+
+def _setup_egress_filter() -> None:
+    """Скрипт + systemd service/timer для резервной блокировки портов через nft."""
+    os.makedirs(INSTALL_DIR, exist_ok=True)
+    script_path = f"{INSTALL_DIR}/apply-torrent-egress-filter.sh"
+    with open(script_path, "w", encoding="utf-8") as f:
+        f.write(EGRESS_SCRIPT)
+    os.chmod(script_path, 0o755)
+    with open("/etc/systemd/system/torrent-egress-filter.service", "w", encoding="utf-8") as f:
+        f.write(EGRESS_SERVICE)
+    with open("/etc/systemd/system/torrent-egress-filter.timer", "w", encoding="utf-8") as f:
+        f.write(EGRESS_TIMER)
+    run(["systemctl", "daemon-reload"])
+    run(["systemctl", "enable", "--now",
+         "torrent-egress-filter.service", "torrent-egress-filter.timer"], check=False)
+
+
+def block_torrent() -> None:
+    step("Блокировка торрентов (tblocker + egress-фильтр + конфиг панели)")
+
+    # nftables нужен для BlockMode=nft и egress-фильтра
+    if shutil.which("nft") is None:
+        run(["apt-get", "install", "-y", "nftables"])
+
+    # tblocker читает access.log — каталог должен существовать
+    os.makedirs("/var/log/remnanode", exist_ok=True)
+
+    installed = subprocess.run(["dpkg", "-l", "tblocker"],
+                               capture_output=True).returncode == 0
+    if installed:
+        console.print("[green]✓ tblocker уже установлен[/green]")
+    else:
+        _install_tblocker_package()
+        console.print("[green]✓ tblocker установлен[/green]")
+
+    os.makedirs(TBLOCKER_DIR, exist_ok=True)
+    with open(f"{TBLOCKER_DIR}/config.yaml", "w", encoding="utf-8") as f:
+        f.write(TBLOCKER_CONFIG)
+    console.print("[green]✓ /opt/tblocker/config.yaml записан[/green]")
+
+    run(["systemctl", "enable", "tblocker"], check=False)
+    if subprocess.run(["systemctl", "restart", "tblocker"]).returncode == 0:
+        console.print("[green]✓ tblocker запущен[/green]")
+    else:
+        console.print("[yellow]tblocker установлен, но ещё не запущен "
+                      "(норма, пока нода не поднята).[/yellow]")
+
+    _setup_egress_filter()
+    console.print("[green]✓ egress-фильтр + systemd-таймер настроены[/green]")
+
+    panel_ref = f"{INSTALL_DIR}/panel-torrent-block-config.json"
+    if not os.path.isfile(panel_ref):
+        os.makedirs(INSTALL_DIR, exist_ok=True)
+        with open(panel_ref, "w", encoding="utf-8") as f:
+            f.write(PANEL_REFERENCE)
+    console.print(f"[green]✓ Справка для панели: {panel_ref}[/green]")
+
+    console.print(
+        "[bold yellow]Важно:[/bold yellow] серверная часть готова. "
+        "В панели Remnawave включите плагин Torrent Blocker, добавьте правила "
+        "маршрутизации (TORRENT_BY_PORT, TORRENT_BY_DOMAIN), логирование в "
+        "/var/log/remnanode/access.log и sniffing на inbound'ах."
+    )
+
+
 # --- Объединённые блоки ---
 def block_network() -> None:
     block_conntrack()
@@ -427,19 +573,21 @@ def block_time_cron() -> None:
 
 
 # ================================================================== #
-#  Описание блоков (ключ, подпись, функция)
+# Описание блоков (ключ, подпись, функция)
 # ================================================================== #
 BLOCKS = [
-    ("packages",  "Установка пакетов (fail2ban, ufw, unattended-upgrades)", block_packages),
-    ("fail2ban",  "Настройка Fail2Ban",                                      block_fail2ban),
-    ("ufw",       "Настройка UFW (firewall)",                                block_ufw),
-    ("network",   "Сеть: conntrack + sysctl (BBR, буферы, очереди)",         block_network),
+    ("packages", "Установка пакетов (fail2ban, ufw, unattended-upgrades)", block_packages),
+    ("fail2ban", "Настройка Fail2Ban", block_fail2ban),
+    ("ufw", "Настройка UFW (firewall)", block_ufw),
+    ("network", "Сеть: conntrack + sysctl (BBR, буферы, очереди)", block_network),
     ("time_cron", "Часовой пояс Europe/Moscow + cron (перезагрузка Пн 03:00)", block_time_cron),
     ("remnanode_logs", "Логи remnanode: каталог + logrotate + volume в docker-compose", block_remnanode_logs),
+    ("torrent", "Блокировка торрентов (tblocker + egress-фильтр + конфиг панели)", block_torrent),
 ]
 
+
 # ------------------------------------------------------------------ #
-#  Парсинг доп. портов для UFW
+# Парсинг доп. портов для UFW
 # ------------------------------------------------------------------ #
 PORT_RE = re.compile(r"^\d{1,5}(:\d{1,5})?(/(tcp|udp))?$", re.IGNORECASE)
 
@@ -463,7 +611,7 @@ def ask_extra_ports() -> list[str]:
             "  Примеры: 8080, 5000/udp, 10000:10100/tcp",
             default="",
         ).ask()
-        if raw is None:          # Ctrl+C
+        if raw is None:  # Ctrl+C
             return []
         if not raw.strip():
             return []
@@ -477,7 +625,7 @@ def ask_extra_ports() -> list[str]:
 
 
 # ------------------------------------------------------------------ #
-#  Главная логика
+# Главная логика
 # ------------------------------------------------------------------ #
 def main() -> None:
     if not reattach_tty():
@@ -489,7 +637,7 @@ def main() -> None:
         return
 
     console.print(Panel.fit(
-        "[bold]fail2ban + ufw + sysctl + conntrack + cron + логи remnanode[/bold]\n"
+        "[bold]fail2ban + ufw + sysctl + conntrack + cron + логи remnanode + торренты[/bold]\n"
         "Интерактивная настройка сервера",
         title=APP_NAME, border_style="cyan",
     ))
@@ -503,7 +651,6 @@ def main() -> None:
         "Отметьте блоки для выполнения (Space — выбрать, Enter — подтвердить):",
         choices=choices,
     ).ask()
-
     if not selected:
         console.print("[yellow]Ничего не выбрано — выход.[/yellow]")
         return
@@ -535,7 +682,7 @@ def main() -> None:
     answer = questionary.text(
         "Нажмите Enter для запуска (Ctrl+C — отмена)", default="",
     ).ask()
-    if answer is None:           # Ctrl+C
+    if answer is None:  # Ctrl+C
         console.print("[yellow]Отменено пользователем.[/yellow]")
         return
 
