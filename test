@@ -96,11 +96,29 @@ ensure("rich")
 ensure("questionary")
 
 import questionary
+from questionary import Style
+from rich import box
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
 console = Console()
+
+# ------------------------------------------------------------------ #
+# Единый визуальный стиль интерактивных подсказок questionary
+# ------------------------------------------------------------------ #
+CUSTOM_STYLE = Style([
+    ("qmark",       "fg:#5fd7ff bold"),    # символ ? перед вопросом
+    ("question",    "bold"),               # текст вопроса
+    ("answer",      "fg:#5fd7ff bold"),    # выбранный ответ
+    ("pointer",     "fg:#5fd7ff bold"),    # указатель ❯
+    ("highlighted", "fg:#5fd7ff bold"),    # подсвеченный пункт
+    ("selected",    "fg:#87ff87"),         # отмеченные чекбоксы
+    ("separator",   "fg:#6c6c6c"),
+    ("instruction", "fg:#858585 italic"),  # подсказки по управлению
+    ("text",        ""),
+    ("disabled",    "fg:#858585 italic"),
+])
 
 
 def reattach_tty() -> bool:
@@ -251,16 +269,54 @@ def block_timezone() -> None:
     console.print("[green]✓ Часовой пояс: Europe/Moscow[/green]")
 
 
-def block_cron() -> None:
-    step("Настройка cron (еженедельная перезагрузка)")
+def block_cron(schedule: str = "daily") -> None:
+    # Расписание выбирается пользователем в начале. Часовой пояс ставится
+    # в block_timezone() как Europe/Moscow, поэтому 03:00 — именно по МСК.
+    if schedule == "weekly":
+        reboot_line = "0 3 * * 1 /sbin/reboot"
+        human = "по понедельникам в 03:00"
+    else:
+        reboot_line = "0 3 * * * /sbin/reboot"
+        human = "ежедневно в 03:00"
+
+    step(f"Настройка cron (перезагрузка {human} МСК)")
+
+    MARKER = "# VPN Server Hardening: автоматическая перезагрузка"
+
     res = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
     existing = res.stdout.splitlines() if res.returncode == 0 else []
-    kept = [ln for ln in existing
-            if "remnanode" not in ln and "/sbin/reboot" not in ln]
-    kept.append("0 3 * * 1 /sbin/reboot")
-    new_cron = "\n".join(kept) + "\n"
+
+    # Сохраняем ВСЕ посторонние строки (certbot/acme для продления сертификатов,
+    # бэкапы, кастомные задачи). Удаляем только записи, добавленные этим скриптом,
+    # чтобы не плодить дубликаты:
+    #   • строку-маркер нашего блока;
+    #   • строки со старым тегом remnanode;
+    #   • строку перезагрузки самого скрипта — и ежедневную «0 3 * * *»,
+    #     и еженедельную «0 3 * * 1». Регэксп жёстко привязан к нашему
+    #     расписанию + /sbin/reboot, поэтому чужой reboot-крон не заденет.
+    reboot_re = re.compile(r"^\s*0\s+3\s+\*\s+\*\s+[*1]\s+.*?/sbin/reboot\b")
+    kept: list[str] = []
+    for ln in existing:
+        s = ln.strip()
+        if s == MARKER:
+            continue
+        if "remnanode" in s:
+            continue
+        if reboot_re.match(ln):
+            continue
+        kept.append(ln)
+
+    # Убираем хвостовые пустые строки и дописываем наш блок в конец
+    while kept and not kept[-1].strip():
+        kept.pop()
+    if kept:
+        kept.append("")  # пустая строка-разделитель для читабельности
+    kept.append(MARKER)
+    kept.append(reboot_line)
+
+    new_cron = "\n".join(kept).strip("\n") + "\n"
     run(["crontab", "-"], input_text=new_cron)
-    console.print("[green]✓ crontab обновлён[/green]")
+    console.print(f"[green]✓ crontab обновлён — перезагрузка {human}[/green]")
 
 
 # ------------------------------------------------------------------ #
@@ -304,6 +360,7 @@ def _ask_compose_manual() -> str | None:
     raw = questionary.text(
         "Путь к docker-compose.yml ноды (Enter — пропустить добавление volume):",
         default="",
+        style=CUSTOM_STYLE,
     ).ask()
     if not raw or not raw.strip():
         return None
@@ -324,6 +381,7 @@ def ask_compose_path() -> str | None:
         sel = questionary.select(
             "Найдено несколько docker-compose.yml — выберите файл ноды:",
             choices=[*candidates, "Указать вручную", "Пропустить"],
+            style=CUSTOM_STYLE,
         ).ask()
         if sel is None or sel == "Пропустить":
             return None
@@ -589,9 +647,9 @@ def block_network() -> None:
     block_sysctl()
 
 
-def block_time_cron() -> None:
+def block_time_cron(reboot_schedule: str = "daily") -> None:
     block_timezone()
-    block_cron()
+    block_cron(reboot_schedule)
 
 
 # ================================================================== #
@@ -602,10 +660,26 @@ BLOCKS = [
     ("fail2ban", "Настройка Fail2Ban", block_fail2ban),
     ("ufw", "Настройка UFW (firewall)", block_ufw),
     ("network", "Сеть: conntrack + sysctl (BBR, буферы, очереди)", block_network),
-    ("time_cron", "Часовой пояс Europe/Moscow + cron (перезагрузка Пн 03:00)", block_time_cron),
+    ("time_cron", "Часовой пояс Europe/Moscow + cron (перезагрузка по расписанию)", block_time_cron),
     ("remnanode_logs", "Логи remnanode: каталог + logrotate + volume в docker-compose", block_remnanode_logs),
     ("torrent", "Блокировка торрентов (tblocker + egress-фильтр + конфиг панели)", block_torrent),
 ]
+
+
+# ------------------------------------------------------------------ #
+# Выбор расписания перезагрузки
+# ------------------------------------------------------------------ #
+def ask_reboot_schedule() -> str:
+    choice = questionary.select(
+        "Расписание автоматической перезагрузки сервера (03:00 МСК):",
+        choices=[
+            questionary.Choice("Каждый день  —  рекомендуется", value="daily"),
+            questionary.Choice("Раз в неделю  —  по понедельникам", value="weekly"),
+        ],
+        default="daily",
+        style=CUSTOM_STYLE,
+    ).ask()
+    return choice or "daily"
 
 
 # ------------------------------------------------------------------ #
@@ -632,6 +706,7 @@ def ask_extra_ports() -> list[str]:
             "Доп. порты для UFW через запятую (Enter — пропустить).\n"
             "  Примеры: 8080, 5000/udp, 10000:10100/tcp",
             default="",
+            style=CUSTOM_STYLE,
         ).ask()
         if raw is None:  # Ctrl+C
             return []
@@ -658,11 +733,18 @@ def main() -> None:
         )
         return
 
-    console.print(Panel.fit(
-        "[bold]fail2ban + ufw + sysctl + conntrack + cron + логи remnanode + торренты[/bold]\n"
-        "Интерактивная настройка сервера",
-        title=APP_NAME, border_style="cyan",
+    console.print()
+    console.print(Panel(
+        "[bold]Интерактивная настройка и защита VPN-сервера[/bold]\n"
+        "[dim]fail2ban · ufw · sysctl (BBR) · conntrack · cron · "
+        "логи remnanode · блокировка торрентов[/dim]",
+        title=f"[bold cyan]{APP_NAME}[/bold cyan]",
+        subtitle="[dim]требуются права root[/dim]",
+        border_style="cyan",
+        box=box.DOUBLE,
+        padding=(1, 4),
     ))
+    console.print()
 
     # 1. Выбор блоков галочками (по умолчанию все отмечены)
     choices = [
@@ -672,27 +754,44 @@ def main() -> None:
     selected = questionary.checkbox(
         "Отметьте блоки для выполнения (Space — выбрать, Enter — подтвердить):",
         choices=choices,
+        style=CUSTOM_STYLE,
     ).ask()
     if not selected:
         console.print("[yellow]Ничего не выбрано — выход.[/yellow]")
         return
 
-    # 2. Доп. порты — только если выбран блок UFW
+    # 2. Расписание перезагрузки — только если выбран блок cron
+    reboot_schedule = "daily"
+    if "time_cron" in selected:
+        reboot_schedule = ask_reboot_schedule()
+
+    # 3. Доп. порты — только если выбран блок UFW
     extra_ports: list[str] = []
     if "ufw" in selected:
         extra_ports = ask_extra_ports()
 
-    # 3. Путь к docker-compose ноды — только если выбран блок логов remnanode
+    # 4. Путь к docker-compose ноды — только если выбран блок логов remnanode
     compose_path: str | None = None
     if "remnanode_logs" in selected:
         compose_path = ask_compose_path()
 
-    # 4. Сводка и запуск через Enter
-    table = Table(title="К выполнению", show_header=False, border_style="cyan")
+    # 5. Сводка и запуск через Enter
+    schedule_human = ("ежедневно в 03:00" if reboot_schedule == "daily"
+                      else "по понедельникам в 03:00")
+
+    table = Table(title="Будет выполнено", box=box.ROUNDED, border_style="cyan",
+                  show_header=False, title_style="bold cyan", padding=(0, 1))
+    table.add_column(justify="center", width=3)
+    table.add_column()
     for key, label, _ in BLOCKS:
-        mark = "[green]✓[/green]" if key in selected else "[dim]–[/dim]"
-        table.add_row(mark, label if key in selected else f"[dim]{label}[/dim]")
+        if key in selected:
+            table.add_row("[green]✓[/green]", label)
+        else:
+            table.add_row("[dim]–[/dim]", f"[dim]{label}[/dim]")
     console.print(table)
+
+    if "time_cron" in selected:
+        console.print(f"[bold]Перезагрузка:[/bold] {schedule_human} (МСК)")
     if extra_ports:
         console.print(f"[bold]Доп. порты UFW:[/bold] {', '.join(extra_ports)}")
     if "remnanode_logs" in selected:
@@ -703,12 +802,13 @@ def main() -> None:
 
     answer = questionary.text(
         "Нажмите Enter для запуска (Ctrl+C — отмена)", default="",
+        style=CUSTOM_STYLE,
     ).ask()
     if answer is None:  # Ctrl+C
         console.print("[yellow]Отменено пользователем.[/yellow]")
         return
 
-    # 5. Выполнение в исходном порядке
+    # 6. Выполнение в исходном порядке
     failures = []
     for key, label, func in BLOCKS:
         if key not in selected:
@@ -718,6 +818,8 @@ def main() -> None:
                 func(extra_ports)
             elif key == "remnanode_logs":
                 func(compose_path)
+            elif key == "time_cron":
+                func(reboot_schedule)
             else:
                 func()
         except subprocess.CalledProcessError as exc:
