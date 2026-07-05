@@ -691,6 +691,36 @@ def block_time_cron(reboot_schedule: str = "daily") -> None:
     block_cron(reboot_schedule)
 
 
+# ------------------------------------------------------------------ #
+# TrafficGuard-auto (защита от сканеров/ботов, github.com/DonMatteoVPN)
+# ------------------------------------------------------------------ #
+TRAFFICGUARD_INSTALLER = (
+    "https://raw.githubusercontent.com/DonMatteoVPN/TrafficGuard-auto/"
+    "refs/heads/main/install-trafficguard.sh"
+)
+
+
+def block_trafficguard() -> None:
+    step("TrafficGuard-auto: защита от сканеров и ботов")
+    # curl нужен для загрузки установщика (пакеты установщик доставит сам)
+    if shutil.which("curl") is None:
+        run(["apt-get", "install", "-y", "curl"])
+    # Установщик ставит пакеты через apt — дождёмся блокировки dpkg
+    wait_for_apt_lock()
+    # ВАЖНО: оригинальный установщик в самом конце запускает ИНТЕРАКТИВНОЕ меню
+    # (`/opt/trafficguard-manager.sh monitor`, оно же `rknpidor`) и читает ввод
+    # из /dev/tty — это намертво заблокировало бы наш скрипт. Вырезаем ровно эту
+    # строку через sed; вся установка при этом отрабатывает неинтерактивно.
+    run(
+        "set -o pipefail; curl -fsSL "
+        f"{TRAFFICGUARD_INSTALLER} "
+        "| sed '/trafficguard-manager\\.sh monitor/d' | bash",
+        shell=True, check=True,
+    )
+    console.print("[green]✓ TrafficGuard-auto установлен. "
+                  "Меню мониторинга: [bold]rknpidor[/bold][/green]")
+
+
 # ================================================================== #
 # Описание блоков (ключ, подпись, функция)
 # ================================================================== #
@@ -702,7 +732,81 @@ BLOCKS = [
     ("time_cron", "Часовой пояс Europe/Moscow + cron (перезагрузка по расписанию)", block_time_cron),
     ("remnanode_logs", "Логи remnanode: каталог + logrotate + volume в docker-compose", block_remnanode_logs),
     ("torrent", "Блокировка торрентов (tblocker + egress-фильтр + конфиг панели)", block_torrent),
+    ("trafficguard", "TrafficGuard-auto: защита от сканеров и ботов (rknpidor)", block_trafficguard),
 ]
+
+
+# ================================================================== #
+# Детекторы «уже настроено» — снимают галочку с блока по умолчанию,
+# если соответствующая настройка на сервере уже присутствует.
+# ================================================================== #
+def _pkg_installed(pkg: str) -> bool:
+    return subprocess.run(["dpkg", "-s", pkg], capture_output=True).returncode == 0
+
+
+def _detect_packages() -> bool:
+    return all(_pkg_installed(p) for p in ("fail2ban", "ufw", "unattended-upgrades"))
+
+
+def _detect_fail2ban() -> bool:
+    return os.path.isfile("/etc/fail2ban/jail.local")
+
+
+def _detect_ufw() -> bool:
+    res = subprocess.run(["ufw", "status"], capture_output=True, text=True)
+    return res.returncode == 0 and "Status: active" in res.stdout
+
+
+def _detect_network() -> bool:
+    return os.path.isfile("/etc/sysctl.d/99-vpn.conf")
+
+
+def _detect_time_cron() -> bool:
+    tz = subprocess.run(["timedatectl", "show", "-p", "Timezone", "--value"],
+                        capture_output=True, text=True)
+    tz_ok = tz.returncode == 0 and tz.stdout.strip() == "Europe/Moscow"
+    cr = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
+    cron_ok = cr.returncode == 0 and re.search(
+        r"(?m)^\s*0\s+3\s+\*\s+\*\s+[*1]\s+.*?/sbin/reboot\b", cr.stdout) is not None
+    return tz_ok and cron_ok
+
+
+def _detect_remnanode_logs() -> bool:
+    return (os.path.isfile("/etc/logrotate.d/remnanode")
+            and os.path.isdir("/var/log/remnanode"))
+
+
+def _detect_torrent() -> bool:
+    return _pkg_installed("tblocker") and os.path.isfile("/opt/tblocker/config.yaml")
+
+
+def _detect_trafficguard() -> bool:
+    return (os.path.exists("/usr/local/bin/traffic-guard")
+            or os.path.isfile("/opt/trafficguard-manager.sh"))
+
+
+DETECTORS = {
+    "packages":       _detect_packages,
+    "fail2ban":       _detect_fail2ban,
+    "ufw":            _detect_ufw,
+    "network":        _detect_network,
+    "time_cron":      _detect_time_cron,
+    "remnanode_logs": _detect_remnanode_logs,
+    "torrent":        _detect_torrent,
+    "trafficguard":   _detect_trafficguard,
+}
+
+
+def detect_applied() -> dict[str, bool]:
+    """Возвращает {ключ_блока: True|False} — настроен ли блок уже сейчас."""
+    result: dict[str, bool] = {}
+    for key, _, _ in BLOCKS:
+        det = DETECTORS.get(key)
+        try:
+            result[key] = bool(det()) if det else False
+        except Exception:
+            result[key] = False
+    return result
 
 
 # ------------------------------------------------------------------ #
@@ -776,7 +880,7 @@ def main() -> None:
     console.print(Panel(
         "[bold]Интерактивная настройка и защита VPN-сервера[/bold]\n"
         "[dim]fail2ban · ufw · sysctl (BBR) · conntrack · cron · "
-        "логи remnanode · блокировка торрентов[/dim]",
+        "логи remnanode · торренты · TrafficGuard[/dim]",
         title=f"[bold cyan]{APP_NAME}[/bold cyan]",
         subtitle="[dim]требуются права root[/dim]",
         border_style="cyan",
@@ -785,9 +889,23 @@ def main() -> None:
     ))
     console.print()
 
-    # 1. Выбор блоков галочками (по умолчанию все отмечены)
+    # 1. Проверяем, что уже настроено на сервере, — такие блоки по умолчанию
+    #    будут БЕЗ галочки (повторно выполнять не нужно). При желании их можно
+    #    отметить вручную — тогда блок отработает заново.
+    console.print("[dim]Проверяю текущее состояние сервера…[/dim]")
+    applied = detect_applied()
+    if any(applied.values()):
+        done = ", ".join(label for key, label, _ in BLOCKS if applied[key])
+        console.print(f"[green]Уже настроено (галочки сняты):[/green] {done}")
+    console.print()
+
+    # 2. Выбор блоков галочками (уже настроенные — сняты по умолчанию)
     choices = [
-        questionary.Choice(title=label, value=key, checked=True)
+        questionary.Choice(
+            title=label + ("   [уже настроено]" if applied[key] else ""),
+            value=key,
+            checked=not applied[key],
+        )
         for key, label, _ in BLOCKS
     ]
     selected = questionary.checkbox(
