@@ -8,6 +8,7 @@ curl -fsSL https://raw.githubusercontent.com/kifchandr/test/main/test | sudo pyt
 import os
 import re
 import sys
+import time
 import shutil
 import subprocess
 import importlib
@@ -144,8 +145,46 @@ def reattach_tty() -> bool:
 ENV = {**os.environ, "DEBIAN_FRONTEND": "noninteractive"}
 
 
+def wait_for_apt_lock(timeout: int = 300) -> None:
+    """Ждёт освобождения блокировки dpkg/apt — её часто держит
+    unattended-upgrades сразу после загрузки сервера. Опрос идёт через fuser
+    (пакет psmisc); если его нет — молча выходим и полагаемся на
+    DPkg::Lock::Timeout внутри самого apt."""
+    if shutil.which("fuser") is None:
+        return
+    locks = [
+        "/var/lib/dpkg/lock-frontend",
+        "/var/lib/dpkg/lock",
+        "/var/lib/apt/lists/lock",
+        "/var/cache/apt/archives/lock",
+    ]
+    waited, announced = 0, False
+    while waited < timeout:
+        busy = any(
+            os.path.exists(lk) and
+            subprocess.run(["fuser", lk], capture_output=True).returncode == 0
+            for lk in locks
+        )
+        if not busy:
+            return
+        if not announced:
+            console.print("[yellow]Пакетный менеджер занят (вероятно, "
+                          "unattended-upgrades) — жду освобождения блокировки…[/yellow]")
+            announced = True
+        time.sleep(3)
+        waited += 3
+    console.print(f"[yellow]Блокировка apt всё ещё занята после {timeout}с — "
+                  "пробую продолжить.[/yellow]")
+
+
 def run(cmd, *, shell: bool = False, check: bool = True, capture: bool = False,
         input_text: str | None = None):
+    # apt/apt-get падают с "Could not get lock", если блокировку dpkg держит
+    # unattended-upgrades. Дожидаемся её освобождения и дополнительно просим
+    # apt подождать сам (безопасно и на старых версиях — опция просто игнорится).
+    if isinstance(cmd, list) and cmd and cmd[0] in ("apt-get", "apt"):
+        wait_for_apt_lock()
+        cmd = [cmd[0], "-o", "DPkg::Lock::Timeout=300", *cmd[1:]]
     pretty = cmd if isinstance(cmd, str) else " ".join(cmd)
     console.print(f"[dim]$ {pretty}[/dim]")
     return subprocess.run(
