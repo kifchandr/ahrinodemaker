@@ -686,6 +686,13 @@ def block_network() -> None:
     block_sysctl()
 
 
+def block_system_upgrade() -> None:
+    step("Обновление системы (apt update && apt upgrade)")
+    run(["apt-get", "update"])
+    run(["apt-get", "upgrade", "-y"])
+    console.print("[green]✓ Система обновлена[/green]")
+
+
 def block_time_cron(reboot_schedule: str = "daily") -> None:
     block_timezone()
     block_cron(reboot_schedule)
@@ -816,7 +823,7 @@ def ask_reboot_schedule() -> str:
     choice = questionary.select(
         "Расписание автоматической перезагрузки сервера (03:00 МСК):",
         choices=[
-            questionary.Choice("Каждый день  —  рекомендуется", value="daily"),
+            questionary.Choice("Каждый день  —  по умолчанию", value="daily"),
             questionary.Choice("Раз в неделю  —  по понедельникам", value="weekly"),
         ],
         default="daily",
@@ -967,6 +974,15 @@ def main() -> None:
 
     # 6. Выполнение в исходном порядке
     failures = []
+
+    # Сначала — обновление системы (после того как пользователь ответил
+    # на все вопросы и подтвердил запуск).
+    try:
+        block_system_upgrade()
+    except subprocess.CalledProcessError as exc:
+        failures.append(("Обновление системы (apt update && apt upgrade)", exc))
+        console.print(f"[red]✗ Ошибка при обновлении системы — продолжаю дальше: {exc}[/red]")
+
     for key, label, func in BLOCKS:
         if key not in selected:
             continue
