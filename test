@@ -533,6 +533,117 @@ def block_remnanode_logs(compose_path: str | None) -> None:
 
 
 # ------------------------------------------------------------------ #
+# Обновление remnanode (docker compose pull + пересоздание контейнера)
+# ------------------------------------------------------------------ #
+_SHA_RE = re.compile(r"sha256:[0-9a-f]{64}")
+
+
+def _node_image_from_compose(path: str) -> str | None:
+    """Достаёт имя образа сервиса ноды из docker-compose.yml."""
+    try:
+        ensure("ruamel.yaml", "ruamel.yaml")
+        from ruamel.yaml import YAML
+        yaml = YAML(typ="safe")
+        with open(path, encoding="utf-8") as f:
+            data = yaml.load(f)
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    services = data.get("services") or {}
+    svc = None
+    if "remnanode" in services:
+        svc = services["remnanode"]
+    elif len(services) == 1:
+        svc = next(iter(services.values()))
+    else:
+        for name, s in services.items():
+            if "remna" in str(name).lower():
+                svc = s
+                break
+        if svc is None and services:
+            svc = next(iter(services.values()))
+    if isinstance(svc, dict) and svc.get("image"):
+        return str(svc["image"])
+    return None
+
+
+def _local_image_digests(image: str) -> set[str]:
+    """sha256-дайджесты образа, имеющегося локально (пусто — образа нет)."""
+    r = subprocess.run(
+        ["docker", "image", "inspect", "--format",
+         "{{range .RepoDigests}}{{println .}}{{end}}{{.Id}}", image],
+        capture_output=True, text=True)
+    return set(_SHA_RE.findall(r.stdout)) if r.returncode == 0 else set()
+
+
+def _remote_image_digests(image: str) -> set[str]:
+    """sha256-дайджесты образа в реестре. Пробуем buildx и manifest;
+    если оба недоступны — пустое множество (проверить не удалось)."""
+    env = {**os.environ, "DOCKER_CLI_EXPERIMENTAL": "enabled"}
+    digests: set[str] = set()
+    for cmd in (["docker", "buildx", "imagetools", "inspect", image],
+                ["docker", "manifest", "inspect", image]):
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True,
+                               env=env, timeout=25)
+        except (subprocess.TimeoutExpired, OSError):
+            continue
+        if r.returncode == 0:
+            digests |= set(_SHA_RE.findall(r.stdout))
+    return digests
+
+
+def node_update_status() -> tuple[str, str | None, str | None]:
+    """Состояние ноды:
+      'absent'  — ноды на сервере нет (пункт не показываем);
+      'update'  — образ устарел или отсутствует локально (нужно обновление);
+      'latest'  — установлена последняя версия (пункт скрываем);
+      'unknown' — реестр недоступен, версию проверить не удалось.
+    Возвращает (status, compose_path, image)."""
+    try:
+        candidates = find_compose_candidates()
+    except Exception:
+        candidates = []
+    if not candidates:
+        return ("absent", None, None)
+    path = candidates[0]
+    image = _node_image_from_compose(path)
+    if not image:
+        return ("absent", path, None)
+    local = _local_image_digests(image)
+    if not local:
+        return ("update", path, image)      # образа локально нет — точно тянем
+    remote = _remote_image_digests(image)
+    if not remote:
+        return ("unknown", path, image)     # не смогли обратиться к реестру
+    return ("latest" if (local & remote) else "update", path, image)
+
+
+def block_node_update(compose_path: str | None = None) -> None:
+    step("Обновление remnanode (docker compose pull + пересоздание)")
+    if not compose_path:
+        candidates = find_compose_candidates()
+        compose_path = candidates[0] if candidates else None
+    if not compose_path or not os.path.isfile(compose_path):
+        console.print("[yellow]docker-compose ноды не найден — обновление пропущено.[/yellow]")
+        return
+    if subprocess.run(["docker", "compose", "version"],
+                      capture_output=True).returncode == 0:
+        base = ["docker", "compose", "-f", compose_path]
+    elif shutil.which("docker-compose"):
+        base = ["docker-compose", "-f", compose_path]
+    else:
+        console.print("[yellow]docker compose не найден — обновление пропущено.[/yellow]")
+        return
+    run(base + ["pull"])
+    run(base + ["down"])
+    # -d обязателен: без него `up` висит в foreground и блокирует скрипт
+    run(base + ["up", "-d", "--remove-orphans"])
+    console.print("[green]✓ remnanode обновлён и перезапущен[/green]")
+
+
+# ------------------------------------------------------------------ #
 # Блокировка торрентов: tblocker + egress-фильтр (nft) + справка панели
 # ------------------------------------------------------------------ #
 EGRESS_SCRIPT = r'''#!/usr/bin/env bash
@@ -732,15 +843,22 @@ def block_trafficguard() -> None:
 # Описание блоков (ключ, подпись, функция)
 # ================================================================== #
 BLOCKS = [
+    ("time_cron", "Часовой пояс Europe/Moscow + cron (перезагрузка по расписанию)", block_time_cron),
     ("packages", "Установка пакетов (fail2ban, ufw, unattended-upgrades)", block_packages),
     ("fail2ban", "Настройка Fail2Ban", block_fail2ban),
     ("ufw", "Настройка UFW (firewall)", block_ufw),
     ("network", "Сеть: conntrack + sysctl (BBR, буферы, очереди)", block_network),
-    ("time_cron", "Часовой пояс Europe/Moscow + cron (перезагрузка по расписанию)", block_time_cron),
     ("remnanode_logs", "Логи remnanode: каталог + logrotate + volume в docker-compose", block_remnanode_logs),
+    ("node_update", "Обновление remnanode (docker compose pull + пересоздание)", block_node_update),
     ("torrent", "Блокировка торрентов (tblocker + egress-фильтр + конфиг панели)", block_torrent),
     ("trafficguard", "TrafficGuard-auto: защита от сканеров и ботов (rknpidor)", block_trafficguard),
 ]
+
+# Блоки, которые реально устанавливают пакеты через apt. Предварительное
+# обновление системы (apt update && upgrade) имеет смысл только для них —
+# если выбраны лишь «лёгкие» блоки (часовой пояс, sysctl и т.п.), обновление
+# пропускается.
+INSTALLS_PACKAGES = {"packages", "torrent", "trafficguard"}
 
 
 # ================================================================== #
@@ -814,6 +932,38 @@ def detect_applied() -> dict[str, bool]:
         except Exception:
             result[key] = False
     return result
+
+
+# ------------------------------------------------------------------ #
+# Информация о системе для шапки меню
+# ------------------------------------------------------------------ #
+def _human_size(n: int) -> str:
+    gb = n / (1024 ** 3)
+    if gb >= 1:
+        return f"{gb:.1f} ГБ"
+    return f"{n / (1024 ** 2):.0f} МБ"
+
+
+def disk_free_info(path: str = "/") -> str:
+    try:
+        total, _used, free = shutil.disk_usage(path)
+    except OSError:
+        return "не удалось определить"
+    pct = (free / total * 100) if total else 0
+    return f"{_human_size(free)} свободно из {_human_size(total)} ({pct:.0f}%)"
+
+
+def current_reboot_schedule() -> str:
+    """Читает текущее расписание автоперезагрузки из crontab root."""
+    cr = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
+    if cr.returncode != 0:
+        return "не настроено"
+    for line in cr.stdout.splitlines():
+        m = re.match(r"^\s*0\s+3\s+\*\s+\*\s+([*1])\s+.*?/sbin/reboot\b", line)
+        if m:
+            return ("ежедневно в 03:00" if m.group(1) == "*"
+                    else "по понедельникам в 03:00")
+    return "не настроено"
 
 
 # ------------------------------------------------------------------ #
@@ -896,25 +1046,59 @@ def main() -> None:
     ))
     console.print()
 
+    # Краткая сводка о состоянии сервера
+    console.print(f"[bold]Свободно на диске:[/bold] {disk_free_info()}")
+    console.print(f"[bold]Текущее расписание перезагрузки:[/bold] "
+                  f"{current_reboot_schedule()}")
+
+    # Состояние remnanode (проверка версии в реестре может занять пару секунд)
+    console.print("[dim]Проверяю версию remnanode…[/dim]")
+    node_status, node_path, node_image = node_update_status()
+    node_note = {
+        "update":  "[yellow]доступно обновление[/yellow]",
+        "latest":  "[green]установлена последняя версия[/green]",
+        "unknown": "[dim]не удалось проверить версию (реестр недоступен)[/dim]",
+    }.get(node_status)
+    if node_note:
+        console.print(f"[bold]remnanode:[/bold] {node_note}")
+    console.print()
+
     # 1. Проверяем, что уже настроено на сервере, — такие блоки по умолчанию
     #    будут БЕЗ галочки (повторно выполнять не нужно). При желании их можно
     #    отметить вручную — тогда блок отработает заново.
     console.print("[dim]Проверяю текущее состояние сервера…[/dim]")
     applied = detect_applied()
     if any(applied.values()):
-        done = ", ".join(label for key, label, _ in BLOCKS if applied[key])
-        console.print(f"[green]Уже настроено (галочки сняты):[/green] {done}")
+        done = ", ".join(label for key, label, _ in BLOCKS
+                         if key != "node_update" and applied[key])
+        if done:
+            console.print(f"[green]Уже настроено (галочки сняты):[/green] {done}")
     console.print()
 
-    # 2. Выбор блоков галочками (уже настроенные — сняты по умолчанию)
-    choices = [
-        questionary.Choice(
+    # 2. Выбор блоков галочками. Уже настроенные блоки идут без галочки.
+    #    Пункт обновления ноды показываем только если нода установлена и её
+    #    версия не последняя (или версию не удалось проверить).
+    shown_keys: list[str] = []
+    choices = []
+    for key, label, _ in BLOCKS:
+        if key == "node_update":
+            if node_status == "update":
+                choices.append(questionary.Choice(label, value=key, checked=True))
+                shown_keys.append(key)
+            elif node_status == "unknown":
+                choices.append(questionary.Choice(
+                    label + "   [версию проверить не удалось]",
+                    value=key, checked=False))
+                shown_keys.append(key)
+            # 'absent' и 'latest' — пункт не показываем
+            continue
+        choices.append(questionary.Choice(
             title=label + ("   [уже настроено]" if applied[key] else ""),
             value=key,
             checked=not applied[key],
-        )
-        for key, label, _ in BLOCKS
-    ]
+        ))
+        shown_keys.append(key)
+
     selected = questionary.checkbox(
         "Отметьте блоки для выполнения (Space — выбрать, Enter — подтвердить):",
         choices=choices,
@@ -940,6 +1124,7 @@ def main() -> None:
         compose_path = ask_compose_path()
 
     # 5. Сводка и запуск через Enter
+    will_upgrade = bool(set(selected) & INSTALLS_PACKAGES)
     schedule_human = ("ежедневно в 03:00" if reboot_schedule == "daily"
                       else "по понедельникам в 03:00")
 
@@ -948,12 +1133,17 @@ def main() -> None:
     table.add_column(justify="center", width=3)
     table.add_column()
     for key, label, _ in BLOCKS:
+        if key not in shown_keys:
+            continue
         if key in selected:
             table.add_row("[green]✓[/green]", label)
         else:
             table.add_row("[dim]–[/dim]", f"[dim]{label}[/dim]")
     console.print(table)
 
+    console.print("[bold]Обновление пакетов:[/bold] " + (
+        "да (apt update && upgrade)" if will_upgrade
+        else "[dim]не требуется — выбранные блоки не ставят пакеты[/dim]"))
     if "time_cron" in selected:
         console.print(f"[bold]Перезагрузка:[/bold] {schedule_human} (МСК)")
     if extra_ports:
@@ -975,13 +1165,18 @@ def main() -> None:
     # 6. Выполнение в исходном порядке
     failures = []
 
-    # Сначала — обновление системы (после того как пользователь ответил
-    # на все вопросы и подтвердил запуск).
-    try:
-        block_system_upgrade()
-    except subprocess.CalledProcessError as exc:
-        failures.append(("Обновление системы (apt update && apt upgrade)", exc))
-        console.print(f"[red]✗ Ошибка при обновлении системы — продолжаю дальше: {exc}[/red]")
+    # Обновление системы — только если среди выбранных блоков есть те, что
+    # реально устанавливают пакеты. Иначе (например, выбран только часовой
+    # пояс) обновлять пакеты незачем и мы его пропускаем.
+    if will_upgrade:
+        try:
+            block_system_upgrade()
+        except subprocess.CalledProcessError as exc:
+            failures.append(("Обновление системы (apt update && apt upgrade)", exc))
+            console.print(f"[red]✗ Ошибка при обновлении системы — продолжаю дальше: {exc}[/red]")
+    else:
+        console.print("[dim]Обновление пакетов пропущено "
+                      "(выбранные блоки не устанавливают пакеты).[/dim]")
 
     for key, label, func in BLOCKS:
         if key not in selected:
@@ -991,6 +1186,8 @@ def main() -> None:
                 func(extra_ports)
             elif key == "remnanode_logs":
                 func(compose_path)
+            elif key == "node_update":
+                func(node_path)
             elif key == "time_cron":
                 func(reboot_schedule)
             else:
