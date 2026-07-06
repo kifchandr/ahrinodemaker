@@ -13,7 +13,7 @@ import shutil
 import subprocess
 import importlib
 
-APP_NAME = "VPN Server Hardening"
+APP_NAME = "AhriNode tool"
 
 # Volume, который нужно добавить в docker-compose.yml ноды
 REMNANODE_VOLUME = "/var/log/remnanode:/var/log/remnanode"
@@ -99,6 +99,7 @@ ensure("questionary")
 import questionary
 from questionary import Style
 from rich import box
+from rich.align import Align
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
@@ -950,7 +951,9 @@ def disk_free_info(path: str = "/") -> str:
     except OSError:
         return "не удалось определить"
     pct = (free / total * 100) if total else 0
-    return f"{_human_size(free)} свободно из {_human_size(total)} ({pct:.0f}%)"
+    text = f"{_human_size(free)} свободно из {_human_size(total)} ({pct:.0f}%)"
+    # Меньше 20% свободного места — предупреждаем красным
+    return f"[red]{text}[/red]" if pct < 20 else text
 
 
 def current_reboot_schedule() -> str:
@@ -1035,11 +1038,7 @@ def main() -> None:
 
     console.print()
     console.print(Panel(
-        "[bold]Интерактивная настройка и защита VPN-сервера[/bold]\n"
-        "[dim]fail2ban · ufw · sysctl (BBR) · conntrack · cron · "
-        "логи remnanode · торренты · TrafficGuard[/dim]",
-        title=f"[bold cyan]{APP_NAME}[/bold cyan]",
-        subtitle="[dim]требуются права root[/dim]",
+        Align.center(f"[bold cyan]{APP_NAME}[/bold cyan]"),
         border_style="cyan",
         box=box.DOUBLE,
         padding=(1, 4),
@@ -1068,11 +1067,6 @@ def main() -> None:
     #    отметить вручную — тогда блок отработает заново.
     console.print("[dim]Проверяю текущее состояние сервера…[/dim]")
     applied = detect_applied()
-    if any(applied.values()):
-        done = ", ".join(label for key, label, _ in BLOCKS
-                         if key != "node_update" and applied[key])
-        if done:
-            console.print(f"[green]Уже настроено (галочки сняты):[/green] {done}")
     console.print()
 
     # 2. Выбор блоков галочками. Уже настроенные блоки идут без галочки.
@@ -1141,9 +1135,8 @@ def main() -> None:
             table.add_row("[dim]–[/dim]", f"[dim]{label}[/dim]")
     console.print(table)
 
-    console.print("[bold]Обновление пакетов:[/bold] " + (
-        "да (apt update && upgrade)" if will_upgrade
-        else "[dim]не требуется — выбранные блоки не ставят пакеты[/dim]"))
+    if will_upgrade:
+        console.print("[bold]Обновление пакетов:[/bold] да (apt update && upgrade)")
     if "time_cron" in selected:
         console.print(f"[bold]Перезагрузка:[/bold] {schedule_human} (МСК)")
     if extra_ports:
@@ -1174,9 +1167,6 @@ def main() -> None:
         except subprocess.CalledProcessError as exc:
             failures.append(("Обновление системы (apt update && apt upgrade)", exc))
             console.print(f"[red]✗ Ошибка при обновлении системы — продолжаю дальше: {exc}[/red]")
-    else:
-        console.print("[dim]Обновление пакетов пропущено "
-                      "(выбранные блоки не устанавливают пакеты).[/dim]")
 
     for key, label, func in BLOCKS:
         if key not in selected:
