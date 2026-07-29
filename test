@@ -205,8 +205,9 @@ def step(title: str) -> None:
 def block_packages() -> None:
     step("Установка пакетов")
     run(["apt-get", "update"])
-    run(["apt-get", "install", "-y", "fail2ban", "ufw", "unattended-upgrades"])
+    run(["apt-get", "install", "-y", "fail2ban", "ufw", "unattended-upgrades", "cron"])
     run(["dpkg-reconfigure", "-f", "noninteractive", "unattended-upgrades"])
+    run(["systemctl", "enable", "--now", "cron"], check=False)
     console.print("[green]✓ Пакеты установлены[/green]")
 
 
@@ -871,7 +872,7 @@ def _pkg_installed(pkg: str) -> bool:
 
 
 def _detect_packages() -> bool:
-    return all(_pkg_installed(p) for p in ("fail2ban", "ufw", "unattended-upgrades"))
+    return all(_pkg_installed(p) for p in ("fail2ban", "ufw", "unattended-upgrades", "cron"))
 
 
 def _detect_fail2ban() -> bool:
