@@ -2,10 +2,10 @@
 # -*- coding: utf-8 -*-
 """
 Команда запуска
-curl -fsSL https://raw.githubusercontent.com/kifchandr/test/main/ahrinodemaker | sudo python3
+curl -fsSL https://raw.githubusercontent.com/kifchandr/ahrinodemaker/main/ahrinodemaker | sudo python3
 
 Либо установить как команду и запускать потом просто `sudo ahrinodemaker`:
-sudo curl -fsSL https://raw.githubusercontent.com/kifchandr/test/main/ahrinodemaker \
+sudo curl -fsSL https://raw.githubusercontent.com/kifchandr/ahrinodemaker/main/ahrinodemaker \
      -o /usr/local/bin/ahrinodemaker && sudo chmod +x /usr/local/bin/ahrinodemaker
 """
 
