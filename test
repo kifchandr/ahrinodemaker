@@ -5,13 +5,18 @@
 curl -fsSL https://raw.githubusercontent.com/kifchandr/test/main/test | sudo python3
 """
 
+from __future__ import annotations
+
 import os
 import re
 import sys
+import json
 import time
+import shlex
 import shutil
 import subprocess
 import importlib
+import tempfile
 
 APP_NAME = "AhriNode tool"
 
@@ -21,6 +26,9 @@ REMNANODE_VOLUME = "/var/log/remnanode:/var/log/remnanode"
 # Пути для блока блокировки торрентов
 TBLOCKER_DIR = "/opt/tblocker"
 INSTALL_DIR  = "/opt/remnanode"
+
+# Часовой пояс сервера. Расписание перезагрузки (03:00) считается по нему.
+TIMEZONE = "Europe/Moscow"
 
 
 # ------------------------------------------------------------------ #
@@ -52,7 +60,18 @@ def _ensure_pip() -> None:
     try:
         import pip  # noqa: F401
     except ImportError:
+        # На свежей ВМ индексы apt могут быть пустыми — без update установка
+        # python3-pip провалится с "Unable to locate package".
+        subprocess.run(["apt-get", "update"], check=False)
         subprocess.run(["apt-get", "install", "-y", "python3-pip"], check=False)
+
+
+# Имя pip-пакета → имя системного пакета Debian/Ubuntu. Механическое
+# преобразование ("python3-" + первый сегмент модуля) даёт неверный результат
+# для точечных имён вроде ruamel.yaml, поэтому исключения задаём явно.
+APT_PKG_OVERRIDES = {
+    "ruamel.yaml": "python3-ruamel.yaml",
+}
 
 
 def ensure(pkg: str, module: str | None = None):
@@ -81,15 +100,21 @@ def ensure(pkg: str, module: str | None = None):
             break
     else:
         # Запасной путь — системный пакет через apt (python3-rich и т.п.)
-        apt_pkg = "python3-" + module.split(".")[0].replace("_", "-")
+        apt_pkg = APT_PKG_OVERRIDES.get(
+            pkg, "python3-" + module.split(".")[0].replace("_", "-"))
         subprocess.run(["apt-get", "install", "-y", apt_pkg],
                        env=env, text=True, capture_output=True)
 
     try:
         return importlib.import_module(module)
     except ImportError:
-        err = (last.stderr.strip() if last and last.stderr else "неизвестная ошибка")
-        print(f"Не удалось установить модуль «{pkg}»:\n{err}", file=sys.stderr)
+        # pip мог отработать с кодом 0 (пакет «уже установлен»), а импорт всё
+        # равно не удаться — тогда stderr пуст и полезен именно stdout.
+        detail = ""
+        if last is not None:
+            detail = (last.stderr or "").strip() or (last.stdout or "").strip()
+        print(f"Не удалось установить модуль «{pkg}»:\n{detail or 'неизвестная ошибка'}",
+              file=sys.stderr)
         sys.exit(1)
 
 
@@ -133,11 +158,17 @@ def reattach_tty() -> bool:
         pass
     try:
         tty = open("/dev/tty")
-        os.dup2(tty.fileno(), 0)
-        sys.stdin = tty
-        return True
     except OSError:
         return False
+    try:
+        os.dup2(tty.fileno(), 0)
+    except OSError:
+        tty.close()
+        return False
+    # Держим объект в sys.stdin: prompt_toolkit читает fd 0, но ссылка нужна,
+    # чтобы файл не закрылся сборщиком мусора вместе с продублированным fd.
+    sys.stdin = tty
+    return sys.stdin.isatty()
 
 
 # ------------------------------------------------------------------ #
@@ -186,13 +217,52 @@ def run(cmd, *, shell: bool = False, check: bool = True, capture: bool = False,
     if isinstance(cmd, list) and cmd and cmd[0] in ("apt-get", "apt"):
         wait_for_apt_lock()
         cmd = [cmd[0], "-o", "DPkg::Lock::Timeout=300", *cmd[1:]]
-    pretty = cmd if isinstance(cmd, str) else " ".join(cmd)
+    pretty = cmd if isinstance(cmd, str) else shlex.join(cmd)
     console.print(f"[dim]$ {pretty}[/dim]")
     return subprocess.run(
         cmd, shell=shell, check=check, env=ENV, text=True,
         input=input_text,
         capture_output=capture,
     )
+
+
+def probe(cmd: list[str]) -> subprocess.CompletedProcess:
+    """Тихо выполняет диагностическую команду. Отсутствие бинарника — не
+    исключение, а returncode 127: вызывающему достаточно проверить код."""
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True)
+    except OSError:
+        return subprocess.CompletedProcess(cmd, 127, "", "")
+
+
+def write_file(path: str, content: str, *, backup: bool = True, mode: int = 0o644) -> None:
+    """Атомарная запись конфига с резервной копией.
+
+    Прямая перезапись оставляет обрезанный файл, если процесс упадёт на
+    середине; запись во временный файл рядом + os.replace такого не допускает.
+    Копия <файл>.bak-<время> создаётся только при первой перезаписи существующего
+    файла с отличным содержимым — чтобы повторные запуски не плодили бэкапы."""
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+
+    if os.path.isfile(path):
+        with open(path, encoding="utf-8", errors="replace") as f:
+            if f.read() == content:
+                return  # содержимое уже нужное — не трогаем файл и не бэкапим
+        if backup:
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            shutil.copy2(path, f"{path}.bak-{stamp}")
+
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".tmp-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
 
 
 def step(title: str) -> None:
@@ -205,16 +275,30 @@ def step(title: str) -> None:
 def block_packages() -> None:
     step("Установка пакетов")
     run(["apt-get", "update"])
-    run(["apt-get", "install", "-y", "fail2ban", "ufw", "unattended-upgrades", "cron"])
+    # psmisc даёт fuser — без него wait_for_apt_lock() не умеет ждать dpkg
+    run(["apt-get", "install", "-y", "fail2ban", "ufw", "unattended-upgrades",
+         "cron", "psmisc"])
     run(["dpkg-reconfigure", "-f", "noninteractive", "unattended-upgrades"])
     run(["systemctl", "enable", "--now", "cron"], check=False)
     console.print("[green]✓ Пакеты установлены[/green]")
 
 
+def _fail2ban_backend() -> str:
+    """На Debian 12 / Ubuntu 24 rsyslog не ставится по умолчанию и
+    /var/log/auth.log отсутствует — с backend=auto jail sshd не поднимется
+    («Failed to access socket path» / отсутствие лог-файла). Для таких систем
+    единственный рабочий источник — журнал systemd."""
+    if os.path.isfile("/var/log/auth.log") or os.path.isfile("/var/log/secure"):
+        return "auto"
+    return "systemd"
+
+
 def block_fail2ban() -> None:
     step("Настройка Fail2Ban")
-    jail = """[DEFAULT]
-backend = auto
+    backend = _fail2ban_backend()
+    console.print(f"[dim]backend для jail sshd: {backend}[/dim]")
+    jail = f"""[DEFAULT]
+backend = {backend}
 
 [sshd]
 enabled = true
@@ -224,11 +308,17 @@ maxretry = 5
 findtime = 600
 bantime = 12h
 """
-    with open("/etc/fail2ban/jail.local", "w", encoding="utf-8") as f:
-        f.write(jail)
+    write_file("/etc/fail2ban/jail.local", jail)
     run(["systemctl", "enable", "--now", "fail2ban"])
     run(["systemctl", "restart", "fail2ban"])
-    console.print("[green]✓ Fail2Ban настроен[/green]")
+    # Служба может стартовать и тут же упасть из-за неверного backend/фильтра —
+    # проверяем, что jail действительно поднялся, а не просто «команда прошла».
+    status = probe(["fail2ban-client", "status", "sshd"])
+    if status.returncode == 0:
+        console.print("[green]✓ Fail2Ban настроен, jail sshd активен[/green]")
+    else:
+        console.print("[yellow]Fail2Ban настроен, но jail sshd не отвечает. "
+                      "Проверьте: systemctl status fail2ban[/yellow]")
 
 
 def block_ufw(extra_ports: list[str]) -> None:
@@ -253,10 +343,12 @@ def block_ufw(extra_ports: list[str]) -> None:
 def block_conntrack() -> None:
     step("Загрузка модуля conntrack")
     run(["modprobe", "nf_conntrack"], check=False)
-    with open("/etc/modules-load.d/nf_conntrack.conf", "w", encoding="utf-8") as f:
-        f.write("nf_conntrack\n")
-    with open("/etc/modprobe.d/nf_conntrack.conf", "w", encoding="utf-8") as f:
-        f.write("options nf_conntrack hashsize=262144\n")
+    write_file("/etc/modules-load.d/nf_conntrack.conf", "nf_conntrack\n")
+    write_file("/etc/modprobe.d/nf_conntrack.conf",
+               "options nf_conntrack hashsize=262144\n")
+    if not os.path.isdir("/proc/sys/net/netfilter"):
+        console.print("[yellow]Модуль nf_conntrack не загружен (частая ситуация "
+                      "в LXC/OpenVZ) — параметры conntrack будут пропущены.[/yellow]")
     console.print("[green]✓ Модуль conntrack настроен[/green]")
 
 
@@ -298,16 +390,18 @@ net.netfilter.nf_conntrack_tcp_timeout_close_wait = 30
 # --- Память ---
 vm.swappiness = 10
 """
-    with open("/etc/sysctl.d/99-vpn.conf", "w", encoding="utf-8") as f:
-        f.write(sysctl_conf)
-    run(["sysctl", "--system"])
+    write_file("/etc/sysctl.d/99-vpn.conf", sysctl_conf)
+    # -e: не падать на ключах, которых нет в ядре. Параметры net.netfilter.*
+    # существуют только при загруженном nf_conntrack, а в контейнерах его может
+    # не быть — без -e команда вернёт ненулевой код и уронит весь блок.
+    run(["sysctl", "-e", "--system"])
     console.print("[green]✓ sysctl применён[/green]")
 
 
 def block_timezone() -> None:
     step("Часовой пояс")
-    run(["timedatectl", "set-timezone", "Europe/Moscow"])
-    console.print("[green]✓ Часовой пояс: Europe/Moscow[/green]")
+    run(["timedatectl", "set-timezone", TIMEZONE])
+    console.print(f"[green]✓ Часовой пояс: {TIMEZONE}[/green]")
 
 
 def block_cron(schedule: str = "daily") -> None:
@@ -324,7 +418,12 @@ def block_cron(schedule: str = "daily") -> None:
 
     MARKER = "# VPN Server Hardening: автоматическая перезагрузка"
 
-    res = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
+    if shutil.which("crontab") is None:
+        console.print("[yellow]Команда crontab не найдена — установите пакет cron "
+                      "(блок «Установка пакетов»). Расписание пропущено.[/yellow]")
+        return
+
+    res = probe(["crontab", "-l"])
     existing = res.stdout.splitlines() if res.returncode == 0 else []
 
     # Сохраняем ВСЕ посторонние строки (certbot/acme для продления сертификатов,
@@ -371,6 +470,16 @@ COMPOSE_CANDIDATES = [
     "/opt/remnawave/node/docker-compose.yml",
     "/opt/remnawave-node/docker-compose.yml",
 ]
+
+
+def compose_base(compose_path: str) -> list[str] | None:
+    """Базовая команда compose для файла: `docker compose -f …`, `docker-compose -f …`
+    или None, если ни того ни другого нет. Отсутствие docker больше не исключение."""
+    if probe(["docker", "compose", "version"]).returncode == 0:
+        return ["docker", "compose", "-f", compose_path]
+    if shutil.which("docker-compose"):
+        return ["docker-compose", "-f", compose_path]
+    return None
 
 
 def find_compose_candidates() -> list[str]:
@@ -478,24 +587,24 @@ def patch_compose_volume(path: str) -> str:
     if not changed:
         return "exists" if already else "сервис ноды не найден"
 
-    with open(path, "w", encoding="utf-8") as f:
-        yaml.dump(data, f)
+    # Файл чужой: сначала бэкап и рендер в память, и только потом атомарная
+    # замена — иначе сбой в середине dump оставит ноду без compose-файла.
+    import io
+    buf = io.StringIO()
+    yaml.dump(data, buf)
+    write_file(path, buf.getvalue())
     return "added"
 
 
 def recreate_node(compose_path: str) -> None:
     """Пересоздаёт контейнер ноды, чтобы применился новый volume."""
-    if subprocess.run(["docker", "compose", "version"],
-                      capture_output=True).returncode == 0:
-        cmd = ["docker", "compose", "-f", compose_path, "up", "-d", "--remove-orphans"]
-    elif shutil.which("docker-compose"):
-        cmd = ["docker-compose", "-f", compose_path, "up", "-d", "--remove-orphans"]
-    else:
+    base = compose_base(compose_path)
+    if base is None:
         console.print("[yellow]docker compose не найден — пересоздайте ноду вручную "
                       "для применения volume.[/yellow]")
         return
     console.print("[cyan]Пересоздаю контейнер ноды для применения volume…[/cyan]")
-    run(cmd, check=False)
+    run(base + ["up", "-d", "--remove-orphans"], check=False)
 
 
 def block_remnanode_logs(compose_path: str | None) -> None:
@@ -517,8 +626,7 @@ def block_remnanode_logs(compose_path: str | None) -> None:
     copytruncate
 }
 """
-    with open("/etc/logrotate.d/remnanode", "w", encoding="utf-8") as f:
-        f.write(logrotate_conf)
+    write_file("/etc/logrotate.d/remnanode", logrotate_conf)
     console.print("[green]✓ /etc/logrotate.d/remnanode записан[/green]")
     # 3. Volume в docker-compose.yml ноды
     if not compose_path:
@@ -572,10 +680,8 @@ def _node_image_from_compose(path: str) -> str | None:
 
 def _local_image_digests(image: str) -> set[str]:
     """sha256-дайджесты образа, имеющегося локально (пусто — образа нет)."""
-    r = subprocess.run(
-        ["docker", "image", "inspect", "--format",
-         "{{range .RepoDigests}}{{println .}}{{end}}{{.Id}}", image],
-        capture_output=True, text=True)
+    r = probe(["docker", "image", "inspect", "--format",
+               "{{range .RepoDigests}}{{println .}}{{end}}{{.Id}}", image])
     return set(_SHA_RE.findall(r.stdout)) if r.returncode == 0 else set()
 
 
@@ -613,6 +719,10 @@ def node_update_status() -> tuple[str, str | None, str | None]:
     image = _node_image_from_compose(path)
     if not image:
         return ("absent", path, None)
+    # Без docker судить об образе нельзя: раньше пустой список локальных
+    # дайджестов трактовался как «нужно обновление» и предлагал бесполезный пункт.
+    if shutil.which("docker") is None:
+        return ("absent", path, image)
     local = _local_image_digests(image)
     if not local:
         return ("update", path, image)      # образа локально нет — точно тянем
@@ -630,16 +740,13 @@ def block_node_update(compose_path: str | None = None) -> None:
     if not compose_path or not os.path.isfile(compose_path):
         console.print("[yellow]docker-compose ноды не найден — обновление пропущено.[/yellow]")
         return
-    if subprocess.run(["docker", "compose", "version"],
-                      capture_output=True).returncode == 0:
-        base = ["docker", "compose", "-f", compose_path]
-    elif shutil.which("docker-compose"):
-        base = ["docker-compose", "-f", compose_path]
-    else:
+    base = compose_base(compose_path)
+    if base is None:
         console.print("[yellow]docker compose не найден — обновление пропущено.[/yellow]")
         return
     run(base + ["pull"])
-    run(base + ["down"])
+    # Раньше здесь был `down` + `up`, что давало лишний простой ноды: compose
+    # сам пересоздаёт контейнер, если образ изменился.
     # -d обязателен: без него `up` висит в foreground и блокирует скрипт
     run(base + ["up", "-d", "--remove-orphans"])
     console.print("[green]✓ remnanode обновлён и перезапущен[/green]")
@@ -648,19 +755,35 @@ def block_node_update(compose_path: str | None = None) -> None:
 # ------------------------------------------------------------------ #
 # Блокировка торрентов: tblocker + egress-фильтр (nft) + справка панели
 # ------------------------------------------------------------------ #
+# Единый источник правды по портам: раньше список дублировался в bash-скрипте
+# и в справке для панели, и они могли разъехаться.
+TORRENT_PORTS = [6881, 6882, 6883, 6884, 6885, 6886, 6887, 6888, 6889, 51413]
+
 EGRESS_SCRIPT = r'''#!/usr/bin/env bash
 set -euo pipefail
-PORTS=(6881 6882 6883 6884 6885 6886 6887 6888 6889 51413)
+PORTS=(__PORTS__)
 apply() {
   local f=$1 t=$2 s=$3
   nft list table "$f" "$t" >/dev/null 2>&1 || return 0
   local e=()
   for p in "${PORTS[@]}"; do e+=("tcp . $p" "udp . $p"); done
-  nft add element "$f" "$t" "$s" "{ $(printf '%s, ' "${e[@]}") }" 2>/dev/null || true
+  # Элементы склеиваем через ", " БЕЗ хвостовой запятой: `{ …, }` отвергается
+  # разбором nft в старых версиях, и правило молча не применялось.
+  local list
+  printf -v list '%s, ' "${e[@]}"
+  list=${list%, }
+  if ! nft add element "$f" "$t" "$s" "{ $list }"; then
+    # Раньше ошибка гасилась `2>/dev/null || true` — фильтр не работал,
+    # и об этом никто не узнавал.
+    echo "nft: не удалось добавить элементы в $f $t $s" >&2
+    return 1
+  fi
 }
-apply ip remnanode egress-filter-port
-apply ip6 remnanode6 egress-filter-port6
-'''
+rc=0
+apply ip remnanode egress-filter-port || rc=1
+apply ip6 remnanode6 egress-filter-port6 || rc=1
+exit $rc
+'''.replace("__PORTS__", " ".join(str(p) for p in TORRENT_PORTS))
 
 EGRESS_SERVICE = f"""[Unit]
 Description=Apply torrent egress port blocking
@@ -693,25 +816,31 @@ TorrentTag: "TORRENT"
 BlockMode: "nft"
 """
 
-PANEL_REFERENCE = """{
-  "routingRulesToAdd": [
-    {"type": "field", "port": "6881-6889,51413", "ruleTag": "TORRENT_BY_PORT", "outboundTag": "BLOCK"},
-    {"type": "field", "protocol": ["bittorrent"], "outboundTag": "TORRENT"}
-  ],
-  "nodePluginConfig": {
-    "torrentBlocker": {
-      "enabled": true,
-      "ignoreLists": {"ip": [], "userId": []},
-      "blockDuration": 86400,
-      "includeRuleTags": ["TORRENT_BY_PORT"]
-    },
-    "egressFilter": {
-      "enabled": true,
-      "blockedPorts": [6881,6882,6883,6884,6885,6886,6887,6888,6889,51413]
-    }
-  }
-}
-"""
+def _panel_reference() -> str:
+    """Справка для панели. Собирается из TORRENT_PORTS, чтобы список портов
+    гарантированно совпадал с тем, что применяет egress-фильтр."""
+    ports_range = f"{min(TORRENT_PORTS)}-{max(p for p in TORRENT_PORTS if p < 10000)}"
+    tail = sorted(p for p in TORRENT_PORTS if p >= 10000)
+    port_expr = ",".join([ports_range, *(str(p) for p in tail)])
+    return json.dumps({
+        "routingRulesToAdd": [
+            {"type": "field", "port": port_expr,
+             "ruleTag": "TORRENT_BY_PORT", "outboundTag": "BLOCK"},
+            {"type": "field", "protocol": ["bittorrent"], "outboundTag": "TORRENT"},
+        ],
+        "nodePluginConfig": {
+            "torrentBlocker": {
+                "enabled": True,
+                "ignoreLists": {"ip": [], "userId": []},
+                "blockDuration": 86400,
+                "includeRuleTags": ["TORRENT_BY_PORT"],
+            },
+            "egressFilter": {
+                "enabled": True,
+                "blockedPorts": TORRENT_PORTS,
+            },
+        },
+    }, indent=2, ensure_ascii=False) + "\n"
 
 
 def _install_tblocker_package() -> None:
@@ -719,12 +848,25 @@ def _install_tblocker_package() -> None:
     run(["apt-get", "install", "-y", "curl", "gnupg", "ca-certificates"])
     keyring  = "/usr/share/keyrings/openrepo-xray-tools.gpg"
     listfile = "/etc/apt/sources.list.d/openrepo-xray-tools.list"
-    if not os.path.isfile(listfile):
-        run("curl -fsSL https://repo.remna.dev/xray-tools/public.gpg "
-            f"| gpg --yes --dearmor -o {keyring}", shell=True)
-        with open(listfile, "w", encoding="utf-8") as f:
-            f.write(f"deb [arch=any signed-by={keyring}] "
-                    "https://repo.remna.dev/xray-tools/ stable main\n")
+
+    # Ключ переустанавливаем, если его нет или он пустой: раньше сбой curl
+    # приводил к нулевому keyring (gpg на пустом входе возвращал 0), после чего
+    # apt-get update падал навсегда — listfile уже существовал и ветка
+    # пересоздания ключа больше не выполнялась.
+    key_ok = os.path.isfile(keyring) and os.path.getsize(keyring) > 0
+    if not key_ok:
+        # set -o pipefail обязателен: без него код возврата берётся от gpg
+        run("set -o pipefail; curl -fsSL https://repo.remna.dev/xray-tools/public.gpg "
+            f"| gpg --yes --dearmor -o {shlex.quote(keyring)}", shell=True)
+        if not (os.path.isfile(keyring) and os.path.getsize(keyring) > 0):
+            raise RuntimeError("не удалось загрузить GPG-ключ репозитория remna.dev")
+
+    # arch=any не является валидной архитектурой для apt — подставляем реальную
+    arch = probe(["dpkg", "--print-architecture"]).stdout.strip() or "amd64"
+    write_file(listfile,
+               f"deb [arch={arch} signed-by={keyring}] "
+               "https://repo.remna.dev/xray-tools/ stable main\n")
+
     run(["apt-get", "update"])
     run(["apt-get", "install", "-y", "tblocker"])
 
@@ -733,13 +875,9 @@ def _setup_egress_filter() -> None:
     """Скрипт + systemd service/timer для резервной блокировки портов через nft."""
     os.makedirs(INSTALL_DIR, exist_ok=True)
     script_path = f"{INSTALL_DIR}/apply-torrent-egress-filter.sh"
-    with open(script_path, "w", encoding="utf-8") as f:
-        f.write(EGRESS_SCRIPT)
-    os.chmod(script_path, 0o755)
-    with open("/etc/systemd/system/torrent-egress-filter.service", "w", encoding="utf-8") as f:
-        f.write(EGRESS_SERVICE)
-    with open("/etc/systemd/system/torrent-egress-filter.timer", "w", encoding="utf-8") as f:
-        f.write(EGRESS_TIMER)
+    write_file(script_path, EGRESS_SCRIPT, mode=0o755)
+    write_file("/etc/systemd/system/torrent-egress-filter.service", EGRESS_SERVICE)
+    write_file("/etc/systemd/system/torrent-egress-filter.timer", EGRESS_TIMER)
     run(["systemctl", "daemon-reload"])
     run(["systemctl", "enable", "--now",
          "torrent-egress-filter.service", "torrent-egress-filter.timer"], check=False)
@@ -755,21 +893,20 @@ def block_torrent() -> None:
     # tblocker читает access.log — каталог должен существовать
     os.makedirs("/var/log/remnanode", exist_ok=True)
 
-    installed = subprocess.run(["dpkg", "-l", "tblocker"],
-                               capture_output=True).returncode == 0
-    if installed:
+    # dpkg -l возвращает 0 и для удалённого пакета с оставшимися конфигами (rc),
+    # поэтому используем ту же строгую проверку, что и детекторы.
+    if _pkg_installed("tblocker"):
         console.print("[green]✓ tblocker уже установлен[/green]")
     else:
         _install_tblocker_package()
         console.print("[green]✓ tblocker установлен[/green]")
 
     os.makedirs(TBLOCKER_DIR, exist_ok=True)
-    with open(f"{TBLOCKER_DIR}/config.yaml", "w", encoding="utf-8") as f:
-        f.write(TBLOCKER_CONFIG)
+    write_file(f"{TBLOCKER_DIR}/config.yaml", TBLOCKER_CONFIG)
     console.print("[green]✓ /opt/tblocker/config.yaml записан[/green]")
 
     run(["systemctl", "enable", "tblocker"], check=False)
-    if subprocess.run(["systemctl", "restart", "tblocker"]).returncode == 0:
+    if probe(["systemctl", "restart", "tblocker"]).returncode == 0:
         console.print("[green]✓ tblocker запущен[/green]")
     else:
         console.print("[yellow]tblocker установлен, но ещё не запущен "
@@ -779,10 +916,8 @@ def block_torrent() -> None:
     console.print("[green]✓ egress-фильтр + systemd-таймер настроены[/green]")
 
     panel_ref = f"{INSTALL_DIR}/panel-torrent-block-config.json"
-    if not os.path.isfile(panel_ref):
-        os.makedirs(INSTALL_DIR, exist_ok=True)
-        with open(panel_ref, "w", encoding="utf-8") as f:
-            f.write(PANEL_REFERENCE)
+    os.makedirs(INSTALL_DIR, exist_ok=True)
+    write_file(panel_ref, _panel_reference())
     console.print(f"[green]✓ Справка для панели: {panel_ref}[/green]")
 
     console.print(
@@ -820,23 +955,84 @@ TRAFFICGUARD_INSTALLER = (
 )
 
 
+def _trafficguard_preflight() -> str | None:
+    """Проверяет условия, при которых установщик TrafficGuard аварийно
+    останавливается сам. Возвращает текст проблемы или None."""
+    # Установщик (check_firewall_safety) делает exit 1, если ufw присутствует,
+    # выключен И среди правил нет ничего про SSH. Ловим это заранее, чтобы
+    # выдать понятную причину вместо «команда завершилась с кодом 1».
+    if shutil.which("ufw"):
+        status = probe(["ufw", "status"])
+        if status.returncode == 0 and "Status: active" not in status.stdout:
+            rules = probe(["ufw", "show", "added"]).stdout
+            if not any(tok in rules for tok in ("22", "SSH", "OpenSSH")):
+                return ("UFW выключен и не содержит правил для SSH — установщик "
+                        "TrafficGuard откажется работать. Выполните `ufw allow ssh` "
+                        "или включите блок «Настройка UFW».")
+    return None
+
+
 def block_trafficguard() -> None:
     step("TrafficGuard-auto: защита от сканеров и ботов")
     # curl нужен для загрузки установщика (пакеты установщик доставит сам)
     if shutil.which("curl") is None:
         run(["apt-get", "install", "-y", "curl"])
+
+    problem = _trafficguard_preflight()
+    if problem:
+        console.print(f"[yellow]Пропускаю TrafficGuard: {problem}[/yellow]")
+        return
+
     # Установщик ставит пакеты через apt — дождёмся блокировки dpkg
     wait_for_apt_lock()
+
     # ВАЖНО: оригинальный установщик в самом конце запускает ИНТЕРАКТИВНОЕ меню
     # (`/opt/trafficguard-manager.sh monitor`, оно же `rknpidor`) и читает ввод
     # из /dev/tty — это намертво заблокировало бы наш скрипт. Вырезаем ровно эту
-    # строку через sed; вся установка при этом отрабатывает неинтерактивно.
-    run(
-        "set -o pipefail; curl -fsSL "
-        f"{TRAFFICGUARD_INSTALLER} "
-        "| sed '/trafficguard-manager\\.sh monitor/d' | bash",
-        shell=True, check=True,
-    )
+    # строку. Раньше это делалось конвейером `curl | sed | bash`: если апстрим
+    # переименует строку, sed молча ничего не удалит и мы зависнем на меню.
+    # Поэтому качаем в файл, патчим и ПРОВЕРЯЕМ, что патч действительно применён.
+    with tempfile.TemporaryDirectory(prefix="trafficguard-") as tmpdir:
+        raw = os.path.join(tmpdir, "install.sh")
+        run(["curl", "-fsSL", "-o", raw, TRAFFICGUARD_INSTALLER])
+
+        with open(raw, encoding="utf-8", errors="replace") as f:
+            original = f.read()
+
+        launch_re = re.compile(r"(?m)^.*trafficguard-manager\.sh\s+monitor.*$\n?")
+        # В теле установщика есть heredoc с меню, где строка `monitor) show_menu`
+        # не совпадает с шаблоном, — вырезаем только реальные вызовы менеджера.
+        patched, removed = launch_re.subn("", original)
+        if removed == 0:
+            console.print(
+                "[yellow]Пропускаю TrafficGuard: в установщике не найден запуск "
+                "интерактивного меню, который нужно вырезать. Похоже, апстрим "
+                "изменился — обновите скрипт, прежде чем ставить автоматически.[/yellow]")
+            return
+
+        patch_path = os.path.join(tmpdir, "install-patched.sh")
+        with open(patch_path, "w", encoding="utf-8") as f:
+            f.write(patched)
+
+        console.print(f"[dim]Установщик пропатчен (удалено строк с меню: {removed})[/dim]")
+        # stdin из /dev/null: любой невырезанный `read` завершится сразу,
+        # а не подвесит установку в ожидании ввода.
+        with open(os.devnull) as devnull:
+            proc = subprocess.run(["bash", patch_path], env=ENV, text=True,
+                                  stdin=devnull)
+
+    # Установщик возвращает ненулевой код и при безобидных мелочах (например,
+    # `systemctl restart antiscan-aggregate.timer` на ещё не созданном юните),
+    # поэтому решаем по факту: появился ли бинарник traffic-guard.
+    installed = os.path.exists("/usr/local/bin/traffic-guard")
+    if not installed:
+        raise RuntimeError(
+            f"установщик TrafficGuard завершился с кодом {proc.returncode}, "
+            "бинарник /usr/local/bin/traffic-guard не появился")
+    if proc.returncode != 0:
+        console.print(f"[yellow]Установщик вернул код {proc.returncode}, но "
+                      "traffic-guard установлен — проверьте вывод выше.[/yellow]")
+
     console.print("[green]✓ TrafficGuard-auto установлен. "
                   "Меню мониторинга: [bold]rknpidor[/bold][/green]")
 
@@ -844,9 +1040,12 @@ def block_trafficguard() -> None:
 # ================================================================== #
 # Описание блоков (ключ, подпись, функция)
 # ================================================================== #
+# Порядок = порядок выполнения. «Установка пакетов» стоит первой намеренно:
+# блок time_cron вызывает crontab, ufw — команду ufw, и на чистой системе эти
+# бинарники появляются только после установки пакетов.
 BLOCKS = [
-    ("time_cron", "Часовой пояс Europe/Moscow + cron (перезагрузка по расписанию)", block_time_cron),
-    ("packages", "Установка пакетов (fail2ban, ufw, unattended-upgrades)", block_packages),
+    ("packages", "Установка пакетов (fail2ban, ufw, unattended-upgrades, cron)", block_packages),
+    ("time_cron", f"Часовой пояс {TIMEZONE} + cron (перезагрузка по расписанию)", block_time_cron),
     ("fail2ban", "Настройка Fail2Ban", block_fail2ban),
     ("ufw", "Настройка UFW (firewall)", block_ufw),
     ("network", "Сеть: conntrack + sysctl (BBR, буферы, очереди)", block_network),
@@ -868,7 +1067,10 @@ INSTALLS_PACKAGES = {"packages", "torrent", "trafficguard"}
 # если соответствующая настройка на сервере уже присутствует.
 # ================================================================== #
 def _pkg_installed(pkg: str) -> bool:
-    return subprocess.run(["dpkg", "-s", pkg], capture_output=True).returncode == 0
+    # dpkg -s / dpkg -l возвращают 0 и для состояния "rc" (пакет удалён,
+    # конфиги остались), поэтому сверяем именно статус установки.
+    r = probe(["dpkg-query", "-W", "-f=${db:Status-Status}", pkg])
+    return r.returncode == 0 and r.stdout.strip() == "installed"
 
 
 def _detect_packages() -> bool:
@@ -876,11 +1078,14 @@ def _detect_packages() -> bool:
 
 
 def _detect_fail2ban() -> bool:
-    return os.path.isfile("/etc/fail2ban/jail.local")
+    # Наличие файла ещё не значит, что служба работает: при неверном backend
+    # fail2ban стартует и сразу падает, а блок считался бы «уже настроенным».
+    return (os.path.isfile("/etc/fail2ban/jail.local")
+            and probe(["systemctl", "is-active", "--quiet", "fail2ban"]).returncode == 0)
 
 
 def _detect_ufw() -> bool:
-    res = subprocess.run(["ufw", "status"], capture_output=True, text=True)
+    res = probe(["ufw", "status"])
     return res.returncode == 0 and "Status: active" in res.stdout
 
 
@@ -889,10 +1094,9 @@ def _detect_network() -> bool:
 
 
 def _detect_time_cron() -> bool:
-    tz = subprocess.run(["timedatectl", "show", "-p", "Timezone", "--value"],
-                        capture_output=True, text=True)
-    tz_ok = tz.returncode == 0 and tz.stdout.strip() == "Europe/Moscow"
-    cr = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
+    tz = probe(["timedatectl", "show", "-p", "Timezone", "--value"])
+    tz_ok = tz.returncode == 0 and tz.stdout.strip() == TIMEZONE
+    cr = probe(["crontab", "-l"])
     cron_ok = cr.returncode == 0 and re.search(
         r"(?m)^\s*0\s+3\s+\*\s+\*\s+[*1]\s+.*?/sbin/reboot\b", cr.stdout) is not None
     return tz_ok and cron_ok
@@ -959,7 +1163,7 @@ def disk_free_info(path: str = "/") -> str:
 
 def current_reboot_schedule() -> str:
     """Читает текущее расписание автоперезагрузки из crontab root."""
-    cr = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
+    cr = probe(["crontab", "-l"])
     if cr.returncode != 0:
         return "не настроено"
     for line in cr.stdout.splitlines():
@@ -989,18 +1193,27 @@ def ask_reboot_schedule() -> str:
 # ------------------------------------------------------------------ #
 # Парсинг доп. портов для UFW
 # ------------------------------------------------------------------ #
-PORT_RE = re.compile(r"^\d{1,5}(:\d{1,5})?(/(tcp|udp))?$", re.IGNORECASE)
+PORT_RE = re.compile(r"^(\d{1,5})(?::(\d{1,5}))?(?:/(tcp|udp))?$", re.IGNORECASE)
 
 
 def parse_extra_ports(raw: str) -> tuple[list[str], list[str]]:
+    """Разбирает список портов. Одной регулярки мало: \\d{1,5} пропускает 99999,
+    а диапазон вида 2000:1000 синтаксически корректен, но бессмыслен — ufw такое
+    правило отвергнет уже в процессе применения."""
     valid, invalid = [], []
     for item in (p.strip() for p in raw.split(",")):
         if not item:
             continue
-        if PORT_RE.match(item):
-            valid.append(item)
-        else:
+        m = PORT_RE.match(item)
+        if not m:
             invalid.append(item)
+            continue
+        start = int(m.group(1))
+        end = int(m.group(2)) if m.group(2) else start
+        if not (1 <= start <= 65535 and 1 <= end <= 65535) or start > end:
+            invalid.append(item)
+            continue
+        valid.append(item)
     return valid, invalid
 
 
@@ -1053,14 +1266,20 @@ def main() -> None:
 
     # Состояние remnanode (проверка версии в реестре может занять пару секунд)
     console.print("[dim]Проверяю версию remnanode…[/dim]")
-    node_status, node_path, node_image = node_update_status()
+    try:
+        node_status, node_path, node_image = node_update_status()
+    except OSError as exc:
+        # Проверка версии — вспомогательная; её сбой не должен мешать меню.
+        console.print(f"[dim]Не удалось определить состояние ноды: {exc}[/dim]")
+        node_status, node_path, node_image = "absent", None, None
     node_note = {
         "update":  "[yellow]доступно обновление[/yellow]",
         "latest":  "[green]установлена последняя версия[/green]",
         "unknown": "[dim]не удалось проверить версию (реестр недоступен)[/dim]",
     }.get(node_status)
     if node_note:
-        console.print(f"[bold]remnanode:[/bold] {node_note}")
+        suffix = f" [dim]({node_image})[/dim]" if node_image else ""
+        console.print(f"[bold]remnanode:[/bold] {node_note}{suffix}")
     console.print()
 
     # 1. Проверяем, что уже настроено на сервере, — такие блоки по умолчанию
@@ -1087,10 +1306,11 @@ def main() -> None:
                 shown_keys.append(key)
             # 'absent' и 'latest' — пункт не показываем
             continue
+        is_applied = applied.get(key, False)
         choices.append(questionary.Choice(
-            title=label + ("   [уже настроено]" if applied[key] else ""),
+            title=label + ("   [уже настроено]" if is_applied else ""),
             value=key,
-            checked=not applied[key],
+            checked=not is_applied,
         ))
         shown_keys.append(key)
 
@@ -1103,7 +1323,7 @@ def main() -> None:
         console.print("[yellow]Ничего не выбрано — выход.[/yellow]")
         return
 
-    # 2. Расписание перезагрузки — только если выбран блок cron
+    # 3. Расписание перезагрузки — только если выбран блок cron
     reboot_schedule = "daily"
     if "time_cron" in selected:
         reboot_schedule = ask_reboot_schedule()
@@ -1162,10 +1382,16 @@ def main() -> None:
     # Обновление системы — только если среди выбранных блоков есть те, что
     # реально устанавливают пакеты. Иначе (например, выбран только часовой
     # пояс) обновлять пакеты незачем и мы его пропускаем.
+    # Ловим широко: помимо CalledProcessError блок может отвалиться на
+    # FileNotFoundError (нет бинарника), PermissionError/OSError (запись конфига)
+    # или RuntimeError (наши собственные проверки). Раньше любое из них
+    # обрывало весь прогон трейсбеком вместо «продолжаю дальше».
+    BLOCK_ERRORS = (subprocess.CalledProcessError, OSError, RuntimeError, ValueError)
+
     if will_upgrade:
         try:
             block_system_upgrade()
-        except subprocess.CalledProcessError as exc:
+        except BLOCK_ERRORS as exc:
             failures.append(("Обновление системы (apt update && apt upgrade)", exc))
             console.print(f"[red]✗ Ошибка при обновлении системы — продолжаю дальше: {exc}[/red]")
 
@@ -1183,13 +1409,13 @@ def main() -> None:
                 func(reboot_schedule)
             else:
                 func()
-        except subprocess.CalledProcessError as exc:
+        except BLOCK_ERRORS as exc:
             failures.append((label, exc))
             console.print(f"[red]✗ Ошибка в блоке «{label}» — продолжаю дальше: {exc}[/red]")
 
     if failures:
         console.print(Panel.fit(
-            "\n".join(f"• {name}" for name, _ in failures),
+            "\n".join(f"• {name}\n  [dim]{exc}[/dim]" for name, exc in failures),
             title="[red]Завершено с ошибками[/red]", border_style="red",
         ))
     else:
