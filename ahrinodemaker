@@ -1243,26 +1243,9 @@ def ask_extra_ports() -> list[str]:
 
 
 # ------------------------------------------------------------------ #
-# Главная логика
+# Раздел «Remnawave Node» — настройка сервера под ноду
 # ------------------------------------------------------------------ #
-def main() -> None:
-    if not reattach_tty():
-        console.print(
-            "[red]Нет доступа к терминалу для интерактивного выбора.[/red]\n"
-            "Запустите так: [bold]curl -fsSL <URL> | sudo python3[/bold] "
-            "в обычной консоли сервера."
-        )
-        return
-
-    console.print()
-    console.print(Panel(
-        Align.center(f"[bold cyan]{APP_NAME}[/bold cyan]"),
-        border_style="cyan",
-        box=box.DOUBLE,
-        padding=(1, 4),
-    ))
-    console.print()
-
+def menu_remnawave_node() -> None:
     # Краткая сводка о состоянии сервера
     console.print(f"[bold]Свободно на диске:[/bold] {disk_free_info()}")
     console.print(f"[bold]Текущее расписание перезагрузки:[/bold] "
@@ -1324,7 +1307,7 @@ def main() -> None:
         style=CUSTOM_STYLE,
     ).ask()
     if not selected:
-        console.print("[yellow]Ничего не выбрано — выход.[/yellow]")
+        console.print("[yellow]Ничего не выбрано — возврат в главное меню.[/yellow]")
         return
 
     # 3. Расписание перезагрузки — только если выбран блок cron
@@ -1377,7 +1360,7 @@ def main() -> None:
         style=CUSTOM_STYLE,
     ).ask()
     if answer is None:  # Ctrl+C
-        console.print("[yellow]Отменено пользователем.[/yellow]")
+        console.print("[yellow]Отменено — возврат в главное меню.[/yellow]")
         return
 
     # 6. Выполнение в исходном порядке
@@ -1425,6 +1408,471 @@ def main() -> None:
     else:
         console.print(Panel.fit("[bold green]=== Готово ===[/bold green]",
                                 border_style="green"))
+
+
+# ================================================================== #
+# Раздел «Tools» — сторонние утилиты вокруг Remnawave
+# ================================================================== #
+BACKUP_RESTORE_URL = ("https://raw.githubusercontent.com/distillium/"
+                      "remnawave-backup-restore/main/backup-restore.sh")
+BACKUP_RESTORE_DIR = "/opt/rw-backup-restore"
+BACKUP_RESTORE_CMD = "/usr/local/bin/rw-backup"
+GDRIVE_CLEANUP_PATH = f"{BACKUP_RESTORE_DIR}/gdrive-cleanup.sh"
+GDRIVE_CRON_MARKER = "# AhriNode tool: очистка старых бэкапов Google Drive"
+
+
+def tool_backup_restore() -> None:
+    """Ставит и открывает интерактивное меню distillium/remnawave-backup-restore.
+
+    Скрипт сам разворачивает себя в /opt/rw-backup-restore и создаёт команду
+    rw-backup, поэтому от нас нужен только запуск установщика."""
+    step("Remnawave Backup & Restore (distillium)")
+
+    if os.path.isfile(BACKUP_RESTORE_CMD) or os.path.isfile(
+            f"{BACKUP_RESTORE_DIR}/backup-restore.sh"):
+        console.print("[green]✓ Скрипт уже установлен[/green]")
+    for pkg, cmd in (("curl", "curl"), ("jq", "jq")):
+        if shutil.which(cmd) is None:
+            run(["apt-get", "install", "-y", pkg])
+
+    console.print("[cyan]Открываю меню backup-restore. Это интерактивный скрипт: "
+                  "выйдите из него, чтобы вернуться сюда.[/cyan]")
+
+    # Скрипт полностью интерактивный и читает ввод с терминала, поэтому
+    # запускаем его на нашем tty и просто ждём завершения.
+    with tempfile.TemporaryDirectory(prefix="rw-backup-") as tmpdir:
+        local = os.path.join(tmpdir, "backup-restore.sh")
+        run(["curl", "-fsSL", "-o", local, BACKUP_RESTORE_URL])
+        os.chmod(local, 0o755)
+        subprocess.run(["bash", local], env=ENV)
+
+
+# --------------------------------------------------------------- #
+# Удаление старых бэкапов Google Drive
+# --------------------------------------------------------------- #
+GDRIVE_DEFAULT_FOLDER_ID = "1zcpGqw_jAGiqDBIlWDfGbcLjrSjuTBPS"
+GDRIVE_DEFAULT_DAYS = "30"
+
+GDRIVE_CLEANUP_SCRIPT = r'''#!/usr/bin/env bash
+#
+# gdrive-cleanup.sh
+#
+# Удаляет (перемещает в корзину) файлы старше N дней в указанной папке
+# Google Drive. Использует те же OAuth-credentials (GD_CLIENT_ID /
+# GD_CLIENT_SECRET / GD_REFRESH_TOKEN), что и distillium/remnawave-backup-restore,
+# и по умолчанию читает их из его config.env.
+#
+# Требования: bash, curl, jq
+#
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# НАСТРОЙКИ
+# ---------------------------------------------------------------------------
+
+# Файл конфигурации backup-restore.sh, откуда берём GD_CLIENT_ID/SECRET/TOKEN.
+# Если файла нет или переменных в нём нет — задайте их здесь руками.
+CONFIG_FILE="${CONFIG_FILE:-/opt/rw-backup-restore/config.env}"
+
+# ID папки Google Drive, из ссылки
+# https://drive.google.com/drive/folders/<FOLDER_ID>
+FOLDER_ID="${FOLDER_ID:-__FOLDER_ID__}"
+
+# Сколько дней хранить файлы (более старые будут удалены)
+DAYS_OLD="${DAYS_OLD:-__DAYS_OLD__}"
+
+# true  -> ничего не удалять, только показать, что было бы удалено
+# false -> реально перемещать файлы в корзину
+DRY_RUN="${DRY_RUN:-false}"
+
+# Файл лога (можно оставить пустым, тогда лог только в stderr)
+LOG_FILE="${LOG_FILE:-/opt/rw-backup-restore/gdrive-cleanup.log}"
+
+# ---------------------------------------------------------------------------
+
+log() {
+    local msg="[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+    # Пишем в stderr, а не в stdout: get_access_token возвращает токен через
+    # stdout внутри $( ), и любое сообщение отсюда попало бы в значение
+    # переменной вместо экрана — при ошибке авторизации она молча «терялась».
+    echo "$msg" >&2
+    if [[ -n "$LOG_FILE" ]]; then
+        mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
+        echo "$msg" >> "$LOG_FILE"
+    fi
+}
+
+fail() {
+    log "ОШИБКА: $1"
+    exit 1
+}
+
+command -v curl >/dev/null 2>&1 || fail "curl не установлен"
+command -v jq   >/dev/null 2>&1 || fail "jq не установлен"
+
+# Подхватываем credentials из config.env backup-restore.sh, если он есть
+if [[ -f "$CONFIG_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$CONFIG_FILE"
+fi
+
+: "${GD_CLIENT_ID:?GD_CLIENT_ID не задан (нет в $CONFIG_FILE и не передан вручную)}"
+: "${GD_CLIENT_SECRET:?GD_CLIENT_SECRET не задан}"
+: "${GD_REFRESH_TOKEN:?GD_REFRESH_TOKEN не задан}"
+
+get_access_token() {
+    local response
+    response=$(curl -s -X POST https://oauth2.googleapis.com/token \
+        -d client_id="$GD_CLIENT_ID" \
+        -d client_secret="$GD_CLIENT_SECRET" \
+        -d refresh_token="$GD_REFRESH_TOKEN" \
+        -d grant_type="refresh_token")
+
+    local token
+    token=$(echo "$response" | jq -r '.access_token // empty')
+
+    if [[ -z "$token" ]]; then
+        local err
+        err=$(echo "$response" | jq -r '.error_description // .error // "unknown error"')
+        fail "не удалось получить access token: $err"
+    fi
+    echo "$token"
+}
+
+main() {
+    log "Старт очистки папки Google Drive $FOLDER_ID (старше ${DAYS_OLD} дн., DRY_RUN=${DRY_RUN})"
+
+    local access_token
+    access_token=$(get_access_token)
+
+    # cutoff в формате RFC3339 UTC, совместимом с Drive API (modifiedTime < cutoff)
+    local cutoff
+    if date -u -d "-${DAYS_OLD} days" +%Y-%m-%dT%H:%M:%SZ >/dev/null 2>&1; then
+        cutoff=$(date -u -d "-${DAYS_OLD} days" +%Y-%m-%dT%H:%M:%SZ)          # GNU date (Linux)
+    else
+        cutoff=$(date -u -v-"${DAYS_OLD}"d +%Y-%m-%dT%H:%M:%SZ)               # BSD/macOS date
+    fi
+
+    log "Порог: файлы с modifiedTime < $cutoff будут удалены"
+
+    local page_token=""
+    local total_deleted=0
+    local total_found=0
+
+    while true; do
+        local query
+        query="'${FOLDER_ID}' in parents and trashed = false and modifiedTime < '${cutoff}'"
+
+        local url="https://www.googleapis.com/drive/v3/files"
+        local args=(
+            -sG "$url"
+            --data-urlencode "q=${query}"
+            --data-urlencode "fields=nextPageToken,files(id,name,modifiedTime,size)"
+            --data-urlencode "pageSize=1000"
+            --data-urlencode "spaces=drive"
+            -H "Authorization: Bearer ${access_token}"
+        )
+        if [[ -n "$page_token" ]]; then
+            args+=(--data-urlencode "pageToken=${page_token}")
+        fi
+
+        local list_response
+        list_response=$(curl "${args[@]}")
+
+        local list_error
+        list_error=$(echo "$list_response" | jq -r '.error.message // empty')
+        if [[ -n "$list_error" ]]; then
+            fail "ошибка запроса списка файлов: $list_error"
+        fi
+
+        local count
+        count=$(echo "$list_response" | jq '.files | length')
+        total_found=$((total_found + count))
+
+        if [[ "$count" -gt 0 ]]; then
+            while IFS=$'\t' read -r file_id file_name modified_time; do
+                [[ -z "$file_id" ]] && continue
+                if [[ "$DRY_RUN" == "true" ]]; then
+                    log "[DRY_RUN] удалил бы: ${file_name} (изменён ${modified_time}, id=${file_id})"
+                else
+                    local del_response
+                    del_response=$(curl -s -X PATCH \
+                        "https://www.googleapis.com/drive/v3/files/${file_id}?fields=id,trashed" \
+                        -H "Authorization: Bearer ${access_token}" \
+                        -H "Content-Type: application/json" \
+                        -d '{"trashed": true}')
+
+                    local del_error
+                    del_error=$(echo "$del_response" | jq -r '.error.message // empty')
+                    if [[ -n "$del_error" ]]; then
+                        log "НЕ УДАЛОСЬ удалить ${file_name} (id=${file_id}): ${del_error}"
+                    else
+                        log "Удалён (в корзину): ${file_name} (изменён ${modified_time}, id=${file_id})"
+                        total_deleted=$((total_deleted + 1))
+                    fi
+                fi
+            done < <(echo "$list_response" | jq -r '.files[] | [.id, .name, .modifiedTime] | @tsv')
+        fi
+
+        page_token=$(echo "$list_response" | jq -r '.nextPageToken // empty')
+        [[ -z "$page_token" ]] && break
+    done
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log "Готово (DRY_RUN). Найдено файлов старше ${DAYS_OLD} дн.: ${total_found}"
+    else
+        log "Готово. Найдено: ${total_found}, удалено (в корзину): ${total_deleted}"
+    fi
+}
+
+main "$@"
+'''
+
+
+def _gdrive_install(folder_id: str, days: str) -> None:
+    """Кладёт скрипт очистки рядом с backup-restore и ставит зависимости."""
+    for cmd, pkg in (("curl", "curl"), ("jq", "jq")):
+        if shutil.which(cmd) is None:
+            run(["apt-get", "install", "-y", pkg])
+    body = (GDRIVE_CLEANUP_SCRIPT
+            .replace("__FOLDER_ID__", folder_id)
+            .replace("__DAYS_OLD__", days))
+    write_file(GDRIVE_CLEANUP_PATH, body, mode=0o755)
+    console.print(f"[green]✓ Скрипт установлен: {GDRIVE_CLEANUP_PATH}[/green]")
+
+
+def _gdrive_run(folder_id: str, days: str, dry_run: bool) -> None:
+    env = {**ENV, "FOLDER_ID": folder_id, "DAYS_OLD": days,
+           "DRY_RUN": "true" if dry_run else "false"}
+    mode = "пробный прогон" if dry_run else "удаление"
+    console.print(f"[cyan]Запуск ({mode})…[/cyan]")
+    res = subprocess.run(["bash", GDRIVE_CLEANUP_PATH], env=env)
+    if res.returncode == 0:
+        console.print("[green]✓ Выполнено[/green]")
+    else:
+        console.print(f"[yellow]Скрипт завершился с кодом {res.returncode} — "
+                      "см. сообщения выше.[/yellow]")
+
+
+def _crontab_replace_block(marker: str, lines: list[str]) -> None:
+    """Заменяет в crontab root блок, помеченный marker, сохраняя все остальные
+    задачи. lines пустой — блок просто удаляется."""
+    if shutil.which("crontab") is None:
+        raise RuntimeError("команда crontab не найдена (нужен пакет cron)")
+
+    res = probe(["crontab", "-l"])
+    existing = res.stdout.splitlines() if res.returncode == 0 else []
+
+    kept: list[str] = []
+    skip_next = False
+    for ln in existing:
+        if ln.strip() == marker:
+            skip_next = True      # следующая строка — задача этого блока
+            continue
+        if skip_next:
+            skip_next = False
+            continue
+        kept.append(ln)
+
+    while kept and not kept[-1].strip():
+        kept.pop()
+    if lines:
+        if kept:
+            kept.append("")
+        kept.append(marker)
+        kept.extend(lines)
+
+    new_cron = "\n".join(kept).strip("\n")
+    run(["crontab", "-"], input_text=new_cron + "\n" if new_cron else "\n")
+
+
+def _gdrive_schedule(folder_id: str, days: str) -> None:
+    hour = questionary.text(
+        "Час запуска очистки (0–23), по умолчанию 4:", default="4",
+        style=CUSTOM_STYLE).ask()
+    if hour is None:
+        return
+    hour = hour.strip() or "4"
+    if not hour.isdigit() or not 0 <= int(hour) <= 23:
+        console.print("[red]Час должен быть числом от 0 до 23.[/red]")
+        return
+
+    line = (f"0 {int(hour)} * * * FOLDER_ID={folder_id} DAYS_OLD={days} "
+            f"DRY_RUN=false {GDRIVE_CLEANUP_PATH} >/dev/null 2>&1")
+    _crontab_replace_block(GDRIVE_CRON_MARKER, [line])
+    console.print(f"[green]✓ Очистка добавлена в cron: ежедневно в "
+                  f"{int(hour):02d}:00 ({TIMEZONE})[/green]")
+
+
+def _gdrive_current_schedule() -> str | None:
+    res = probe(["crontab", "-l"])
+    if res.returncode != 0:
+        return None
+    for line in res.stdout.splitlines():
+        if GDRIVE_CLEANUP_PATH in line and not line.strip().startswith("#"):
+            m = re.match(r"^\s*(\d+)\s+(\d+)\s", line)
+            if m:
+                return f"ежедневно в {int(m.group(2)):02d}:{int(m.group(1)):02d}"
+            return "задано"
+    return None
+
+
+def menu_gdrive_cleanup() -> None:
+    folder_id = GDRIVE_DEFAULT_FOLDER_ID
+    days = GDRIVE_DEFAULT_DAYS
+
+    while True:
+        console.print()
+        installed = os.path.isfile(GDRIVE_CLEANUP_PATH)
+        schedule = _gdrive_current_schedule()
+        state = ("[green]установлен[/green]" if installed
+                 else "[yellow]не установлен[/yellow]")
+        console.print(f"[bold]Скрипт:[/bold] {state}")
+        console.print(f"[bold]Расписание:[/bold] {schedule or 'не настроено'}")
+        console.print(f"[bold]Папка:[/bold] {folder_id}   "
+                      f"[bold]Хранить дней:[/bold] {days}")
+        if not os.path.isfile(f"{BACKUP_RESTORE_DIR}/config.env"):
+            console.print("[yellow]Внимание: нет "
+                          f"{BACKUP_RESTORE_DIR}/config.env — скрипту неоткуда "
+                          "взять доступы Google Drive. Сначала настройте "
+                          "backup-restore.[/yellow]")
+
+        choice = questionary.select(
+            "Удаление старых бэкапов Google Drive:",
+            choices=[
+                questionary.Choice("Установить / обновить скрипт", value="install"),
+                questionary.Choice("Изменить папку и срок хранения", value="params"),
+                questionary.Choice("Пробный прогон (ничего не удаляет)", value="dry"),
+                questionary.Choice("Запустить удаление", value="run"),
+                questionary.Choice("Настроить ежедневный запуск (cron)", value="cron"),
+                questionary.Choice("Удалить запуск из cron", value="uncron"),
+                questionary.Choice("← Назад", value="back"),
+            ],
+            style=CUSTOM_STYLE,
+        ).ask()
+
+        if choice in (None, "back"):
+            return
+
+        try:
+            if choice == "install":
+                _gdrive_install(folder_id, days)
+            elif choice == "params":
+                new_folder = questionary.text(
+                    "ID папки Google Drive:", default=folder_id,
+                    style=CUSTOM_STYLE).ask()
+                if new_folder and new_folder.strip():
+                    folder_id = new_folder.strip()
+                new_days = questionary.text(
+                    "Хранить файлы (дней):", default=days,
+                    style=CUSTOM_STYLE).ask()
+                if new_days and new_days.strip():
+                    if new_days.strip().isdigit() and int(new_days) > 0:
+                        days = new_days.strip()
+                    else:
+                        console.print("[red]Срок хранения должен быть "
+                                      "положительным числом.[/red]")
+                # Параметры зашиваются в файл как значения по умолчанию
+                if os.path.isfile(GDRIVE_CLEANUP_PATH):
+                    _gdrive_install(folder_id, days)
+            elif choice in ("dry", "run"):
+                if not os.path.isfile(GDRIVE_CLEANUP_PATH):
+                    _gdrive_install(folder_id, days)
+                _gdrive_run(folder_id, days, dry_run=(choice == "dry"))
+            elif choice == "cron":
+                if not os.path.isfile(GDRIVE_CLEANUP_PATH):
+                    _gdrive_install(folder_id, days)
+                _gdrive_schedule(folder_id, days)
+            elif choice == "uncron":
+                _crontab_replace_block(GDRIVE_CRON_MARKER, [])
+                console.print("[green]✓ Запись удалена из cron[/green]")
+        except (subprocess.CalledProcessError, OSError, RuntimeError) as exc:
+            console.print(f"[red]✗ Ошибка: {exc}[/red]")
+
+
+def menu_backup_restore() -> None:
+    while True:
+        console.print()
+        choice = questionary.select(
+            "Remnawave Backup & Restore:",
+            choices=[
+                questionary.Choice("Установить / открыть меню backup-restore",
+                                   value="run"),
+                questionary.Choice("Удаление старых бэкапов Google Drive",
+                                   value="gdrive"),
+                questionary.Choice("← Назад", value="back"),
+            ],
+            style=CUSTOM_STYLE,
+        ).ask()
+        if choice in (None, "back"):
+            return
+        try:
+            if choice == "run":
+                tool_backup_restore()
+            elif choice == "gdrive":
+                menu_gdrive_cleanup()
+        except (subprocess.CalledProcessError, OSError, RuntimeError) as exc:
+            console.print(f"[red]✗ Ошибка: {exc}[/red]")
+
+
+def menu_tools() -> None:
+    while True:
+        console.print()
+        choice = questionary.select(
+            "Tools:",
+            choices=[
+                questionary.Choice("Remnawave Backup & Restore (distillium)",
+                                   value="backup_restore"),
+                questionary.Choice("← Назад", value="back"),
+            ],
+            style=CUSTOM_STYLE,
+        ).ask()
+        if choice in (None, "back"):
+            return
+        if choice == "backup_restore":
+            menu_backup_restore()
+
+
+# ================================================================== #
+# Точка входа: главное меню
+# ================================================================== #
+def main() -> None:
+    if not reattach_tty():
+        console.print(
+            "[red]Нет доступа к терминалу для интерактивного выбора.[/red]\n"
+            "Запустите так: [bold]curl -fsSL <URL> | sudo python3[/bold] "
+            "в обычной консоли сервера."
+        )
+        return
+
+    console.print()
+    console.print(Panel(
+        Align.center(f"[bold cyan]{APP_NAME}[/bold cyan]"),
+        border_style="cyan",
+        box=box.DOUBLE,
+        padding=(1, 4),
+    ))
+
+    while True:
+        console.print()
+        choice = questionary.select(
+            "Главное меню:",
+            choices=[
+                questionary.Choice("Remnawave Node — настройка сервера под ноду",
+                                   value="node"),
+                questionary.Choice("Tools — вспомогательные утилиты", value="tools"),
+                questionary.Choice("Выход", value="exit"),
+            ],
+            style=CUSTOM_STYLE,
+        ).ask()
+
+        if choice in (None, "exit"):
+            console.print("[dim]Выход.[/dim]")
+            return
+        if choice == "node":
+            menu_remnawave_node()
+        elif choice == "tools":
+            menu_tools()
 
 
 if __name__ == "__main__":
