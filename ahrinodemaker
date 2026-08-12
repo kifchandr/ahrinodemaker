@@ -375,6 +375,26 @@ def vendor_upstream_state(key: str) -> tuple[str, str | None]:
 # ================================================================== #
 # БЛОКИ
 # ================================================================== #
+def ensure_packages(*pkgs: str) -> None:
+    """Доустанавливает недостающие пакеты.
+
+    Блоки не должны полагаться на то, что пользователь отметил «Установку
+    пакетов»: любой блок можно выбрать отдельно, и тогда его зависимости
+    отсутствуют. Раньше это давало «systemctl enable --now fail2ban returned
+    non-zero exit status 1» — юнита просто не существовало."""
+    missing = [p for p in pkgs if not _pkg_installed(p)]
+    if not missing:
+        return
+    console.print(f"[dim]Доустанавливаю недостающие пакеты: "
+                  f"{', '.join(missing)}[/dim]")
+    try:
+        run(["apt-get", "install", "-y", *missing])
+    except subprocess.CalledProcessError:
+        # Обычно причина — устаревшие индексы apt на свежей ВМ
+        run(["apt-get", "update"])
+        run(["apt-get", "install", "-y", *missing])
+
+
 def block_packages() -> None:
     step("Установка пакетов")
     run(["apt-get", "update"])
@@ -426,6 +446,10 @@ def _fail2ban_backend() -> str:
 def _fail2ban_try(backend: str) -> tuple[bool, str]:
     """Пишет конфиг с указанным backend, проверяет его и пробует запустить.
     Возвращает (успех, текст проблемы)."""
+    if shutil.which("fail2ban-client") is None:
+        return False, ("пакет fail2ban не установлен и не смог установиться — "
+                       "проверьте `apt-get install fail2ban` вручную")
+
     write_file("/etc/fail2ban/jail.local", _fail2ban_jail(backend))
 
     # fail2ban-client -t разбирает конфиг, не трогая службу: ошибку фильтра или
@@ -444,6 +468,7 @@ def _fail2ban_try(backend: str) -> tuple[bool, str]:
 
 def block_fail2ban() -> None:
     step("Настройка Fail2Ban")
+    ensure_packages("fail2ban")
     backend = _fail2ban_backend()
     console.print(f"[dim]backend для jail sshd: {backend}[/dim]")
 
@@ -492,6 +517,7 @@ def block_fail2ban() -> None:
 
 def block_ufw(extra_ports: list[str]) -> None:
     step("Настройка UFW (firewall)")
+    ensure_packages("ufw")
     run(["ufw", "default", "deny", "incoming"])
     run(["ufw", "default", "allow", "outgoing"])
     run(["ufw", "limit", "ssh"])
@@ -587,9 +613,10 @@ def block_cron(schedule: str = "daily") -> None:
 
     MARKER = "# VPN Server Hardening: автоматическая перезагрузка"
 
+    ensure_packages("cron")
     if shutil.which("crontab") is None:
-        console.print("[yellow]Команда crontab не найдена — установите пакет cron "
-                      "(блок «Установка пакетов»). Расписание пропущено.[/yellow]")
+        console.print("[yellow]Команда crontab не найдена даже после установки "
+                      "пакета cron — расписание пропущено.[/yellow]")
         return
 
     res = probe(["crontab", "-l"])
@@ -1844,6 +1871,7 @@ def _gdrive_run(folder_id: str, days: str, dry_run: bool) -> None:
 def _crontab_replace_block(marker: str, lines: list[str]) -> None:
     """Заменяет в crontab root блок, помеченный marker, сохраняя все остальные
     задачи. lines пустой — блок просто удаляется."""
+    ensure_packages("cron")
     if shutil.which("crontab") is None:
         raise RuntimeError("команда crontab не найдена (нужен пакет cron)")
 
