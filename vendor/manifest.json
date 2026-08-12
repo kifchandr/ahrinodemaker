@@ -1,0 +1,31 @@
+{
+  "_comment": [
+    "Копии сторонних скриптов, зафиксированные в этом репозитории.",
+    "ahrinodemaker ставит их отсюда, а не из репозитория автора, и сверяет",
+    "sha256 с эталоном, зашитым в самом ahrinodemaker.",
+    "",
+    "Обновление: скачать свежий файл по upstream_url, положить сюда, обновить",
+    "sha256 и vendored_at здесь И одновременно в словаре VENDOR в ahrinodemaker.",
+    "Если хеши разойдутся, установка прервётся с ошибкой — это ожидаемо."
+  ],
+  "vendored": [
+    {
+      "name": "install-trafficguard.sh",
+      "project": "DonMatteoVPN/TrafficGuard-auto",
+      "upstream_url": "https://raw.githubusercontent.com/DonMatteoVPN/TrafficGuard-auto/refs/heads/main/install-trafficguard.sh",
+      "sha256": "c2569405a7bd02e546c468ffc0a7b1e1eacda7f7f0e55076184917c8f6212606",
+      "size_bytes": 12678,
+      "vendored_at": "2026-08-12",
+      "note": "Обёртка. При установке сама тянет dotX12/traffic-guard и списки shadow-netlab/traffic-guard-lists — эти загрузки остаются внешними."
+    },
+    {
+      "name": "backup-restore.sh",
+      "project": "distillium/remnawave-backup-restore",
+      "upstream_url": "https://raw.githubusercontent.com/distillium/remnawave-backup-restore/main/backup-restore.sh",
+      "sha256": "91470909131ef66f5e6a022069dd419eb1f2fc8437bc7ec5655ba2df50e5f8ca",
+      "size_bytes": 150762,
+      "vendored_at": "2026-08-12",
+      "note": "Умеет обновлять сам себя из апстрима — после самообновления на сервере окажется версия автора, а не зафиксированная здесь."
+    }
+  ]
+}

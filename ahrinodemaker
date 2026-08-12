@@ -17,6 +17,7 @@ import sys
 import json
 import time
 import shlex
+import hashlib
 import shutil
 import subprocess
 import importlib
@@ -33,6 +34,35 @@ INSTALL_DIR  = "/opt/remnanode"
 
 # Часовой пояс сервера. Расписание перезагрузки (03:00) считается по нему.
 TIMEZONE = "Europe/Moscow"
+
+# ------------------------------------------------------------------ #
+# Сторонние скрипты: зафиксированные копии (vendoring)
+# ------------------------------------------------------------------ #
+# Раньше чужие установщики скачивались прямо из репозиториев авторов с ветки
+# main — что именно исполнится от root, зависело от состояния чужого репозитория
+# в момент запуска. Теперь копии лежат в каталоге vendor/ этого репозитория,
+# а sha256 эталона зашит здесь: подменённый или повреждённый файл не запустится.
+#
+# Обновление копии: положить новый файл в vendor/, обновить sha256 здесь и в
+# vendor/manifest.json. Пункт «Проверить обновления» сам скажет, когда пора.
+REPO_RAW_BASE = "https://raw.githubusercontent.com/kifchandr/ahrinodemaker/main"
+
+VENDOR = {
+    "trafficguard": {
+        "file":     "install-trafficguard.sh",
+        "title":    "TrafficGuard-auto (DonMatteoVPN)",
+        "sha256":   "c2569405a7bd02e546c468ffc0a7b1e1eacda7f7f0e55076184917c8f6212606",
+        "upstream": ("https://raw.githubusercontent.com/DonMatteoVPN/"
+                     "TrafficGuard-auto/refs/heads/main/install-trafficguard.sh"),
+    },
+    "backup_restore": {
+        "file":     "backup-restore.sh",
+        "title":    "Remnawave Backup & Restore (distillium)",
+        "sha256":   "91470909131ef66f5e6a022069dd419eb1f2fc8437bc7ec5655ba2df50e5f8ca",
+        "upstream": ("https://raw.githubusercontent.com/distillium/"
+                     "remnawave-backup-restore/main/backup-restore.sh"),
+    },
+}
 
 
 # ------------------------------------------------------------------ #
@@ -285,6 +315,61 @@ def write_file(path: str, content: str, *, backup: bool = True, mode: int = 0o64
 
 def step(title: str) -> None:
     console.rule(f"[bold cyan]{title}")
+
+
+# ------------------------------------------------------------------ #
+# Работа с зафиксированными копиями сторонних скриптов
+# ------------------------------------------------------------------ #
+def _sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _download(url: str, dest: str, *, timeout: int = 60) -> None:
+    """Скачивает файл через curl (он уже есть в системе и умеет в прокси)."""
+    r = subprocess.run(["curl", "-fsSL", "--max-time", str(timeout), "-o", dest, url],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"не удалось скачать {url}: "
+                           f"{(r.stderr or '').strip() or f'код {r.returncode}'}")
+
+
+def fetch_vendored(key: str, dest_dir: str) -> str:
+    """Кладёт зафиксированную копию стороннего скрипта в dest_dir и проверяет
+    её sha256. Несовпадение — отказ: лучше не запустить ничего, чем запустить
+    от root файл, который мы не опознали."""
+    spec = VENDOR[key]
+    dest = os.path.join(dest_dir, spec["file"])
+    _download(f"{REPO_RAW_BASE}/vendor/{spec['file']}", dest)
+
+    with open(dest, "rb") as f:
+        actual = _sha256_bytes(f.read())
+    if actual != spec["sha256"]:
+        raise RuntimeError(
+            f"контрольная сумма {spec['file']} не совпала.\n"
+            f"  ожидалось: {spec['sha256']}\n"
+            f"  получено:  {actual}\n"
+            "Файл в vendor/ изменён без обновления sha256 в скрипте — "
+            "установка прервана.")
+    console.print(f"[dim]✓ {spec['file']}: sha256 совпал[/dim]")
+    return dest
+
+
+def vendor_upstream_state(key: str) -> tuple[str, str | None]:
+    """Сравнивает нашу копию с текущим содержимым у автора.
+
+    Возвращает ('same' | 'outdated' | 'unknown', sha256 апстрима).
+    GitHub API через прокси недоступен, поэтому сверяем не коммиты, а sha256
+    самого файла — это точнее: важно, изменился ли исполняемый код."""
+    spec = VENDOR[key]
+    with tempfile.TemporaryDirectory(prefix="vendor-check-") as tmp:
+        dest = os.path.join(tmp, "upstream")
+        try:
+            _download(spec["upstream"], dest, timeout=30)
+        except RuntimeError:
+            return ("unknown", None)
+        with open(dest, "rb") as f:
+            up = _sha256_bytes(f.read())
+    return ("same" if up == spec["sha256"] else "outdated", up)
 
 
 # ================================================================== #
@@ -995,11 +1080,8 @@ def block_time_cron(reboot_schedule: str = "daily") -> None:
 
 # ------------------------------------------------------------------ #
 # TrafficGuard-auto (защита от сканеров/ботов, github.com/DonMatteoVPN)
+# Устанавливается из зафиксированной копии vendor/ — см. словарь VENDOR.
 # ------------------------------------------------------------------ #
-TRAFFICGUARD_INSTALLER = (
-    "https://raw.githubusercontent.com/DonMatteoVPN/TrafficGuard-auto/"
-    "refs/heads/main/install-trafficguard.sh"
-)
 
 
 def _trafficguard_preflight() -> str | None:
@@ -1038,10 +1120,9 @@ def block_trafficguard() -> None:
     # из /dev/tty — это намертво заблокировало бы наш скрипт. Вырезаем ровно эту
     # строку. Раньше это делалось конвейером `curl | sed | bash`: если апстрим
     # переименует строку, sed молча ничего не удалит и мы зависнем на меню.
-    # Поэтому качаем в файл, патчим и ПРОВЕРЯЕМ, что патч действительно применён.
+    # Поэтому берём проверенную копию, патчим и ПРОВЕРЯЕМ, что патч применён.
     with tempfile.TemporaryDirectory(prefix="trafficguard-") as tmpdir:
-        raw = os.path.join(tmpdir, "install.sh")
-        run(["curl", "-fsSL", "-o", raw, TRAFFICGUARD_INSTALLER])
+        raw = fetch_vendored("trafficguard", tmpdir)
 
         with open(raw, encoding="utf-8", errors="replace") as f:
             original = f.read()
@@ -1456,8 +1537,6 @@ def menu_remnawave_node() -> None:
 # ================================================================== #
 # Раздел «Tools» — сторонние утилиты вокруг Remnawave
 # ================================================================== #
-BACKUP_RESTORE_URL = ("https://raw.githubusercontent.com/distillium/"
-                      "remnawave-backup-restore/main/backup-restore.sh")
 BACKUP_RESTORE_DIR = "/opt/rw-backup-restore"
 BACKUP_RESTORE_CMD = "/usr/local/bin/rw-backup"
 GDRIVE_CLEANUP_PATH = f"{BACKUP_RESTORE_DIR}/gdrive-cleanup.sh"
@@ -1484,8 +1563,7 @@ def tool_backup_restore() -> None:
     # Скрипт полностью интерактивный и читает ввод с терминала, поэтому
     # запускаем его на нашем tty и просто ждём завершения.
     with tempfile.TemporaryDirectory(prefix="rw-backup-") as tmpdir:
-        local = os.path.join(tmpdir, "backup-restore.sh")
-        run(["curl", "-fsSL", "-o", local, BACKUP_RESTORE_URL])
+        local = fetch_vendored("backup_restore", tmpdir)
         os.chmod(local, 0o755)
         subprocess.run(["bash", local], env=ENV)
 
@@ -1858,6 +1936,45 @@ def menu_backup_restore() -> None:
             console.print(f"[red]✗ Ошибка: {exc}[/red]")
 
 
+def menu_vendor_updates() -> None:
+    """Сверяет зафиксированные копии сторонних скриптов с апстримом."""
+    step("Проверка версий сторонних скриптов")
+    console.print("[dim]Сравниваю копии из vendor/ с текущими версиями "
+                  "у авторов…[/dim]\n")
+
+    table = Table(box=box.ROUNDED, border_style="cyan", padding=(0, 1))
+    table.add_column("Скрипт")
+    table.add_column("Состояние")
+    outdated: list[str] = []
+
+    for key, spec in VENDOR.items():
+        state, up_sha = vendor_upstream_state(key)
+        if state == "same":
+            cell = "[green]совпадает с апстримом[/green]"
+        elif state == "outdated":
+            cell = ("[yellow]у автора вышла новая версия[/yellow]\n"
+                    f"[dim]наша:    {spec['sha256'][:16]}…\n"
+                    f"апстрим: {up_sha[:16]}…[/dim]")
+            outdated.append(spec["file"])
+        else:
+            cell = "[dim]проверить не удалось (сеть недоступна)[/dim]"
+        table.add_row(spec["title"], cell)
+
+    console.print(table)
+
+    if outdated:
+        console.print(
+            "\n[bold]Как обновить:[/bold] это делается осознанно, чтобы чужой "
+            "код не менялся на сервере сам по себе.\n"
+            "  1. Скачать новую версию по upstream_url из vendor/manifest.json\n"
+            "  2. Положить её в vendor/ вашего репозитория\n"
+            "  3. Обновить sha256 в vendor/manifest.json и в словаре VENDOR "
+            "внутри скрипта\n"
+            f"  Затронуты: {', '.join(outdated)}")
+    else:
+        console.print("\n[green]Всё актуально — обновлять нечего.[/green]")
+
+
 def menu_tools() -> None:
     while True:
         console.print()
@@ -1866,6 +1983,8 @@ def menu_tools() -> None:
             choices=[
                 questionary.Choice("Remnawave Backup & Restore (distillium)",
                                    value="backup_restore"),
+                questionary.Choice("Проверить обновления сторонних скриптов",
+                                   value="vendor_updates"),
                 questionary.Choice("← Назад", value="back"),
             ],
             style=CUSTOM_STYLE,
@@ -1874,6 +1993,11 @@ def menu_tools() -> None:
             return
         if choice == "backup_restore":
             menu_backup_restore()
+        elif choice == "vendor_updates":
+            try:
+                menu_vendor_updates()
+            except (subprocess.CalledProcessError, OSError, RuntimeError) as exc:
+                console.print(f"[red]✗ Ошибка проверки: {exc}[/red]")
 
 
 # ================================================================== #
