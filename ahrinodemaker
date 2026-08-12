@@ -386,21 +386,21 @@ def block_packages() -> None:
     console.print("[green]✓ Пакеты установлены[/green]")
 
 
-def _fail2ban_backend() -> str:
-    """На Debian 12 / Ubuntu 24 rsyslog не ставится по умолчанию и
-    /var/log/auth.log отсутствует — с backend=auto jail sshd не поднимется
-    («Failed to access socket path» / отсутствие лог-файла). Для таких систем
-    единственный рабочий источник — журнал systemd."""
-    if os.path.isfile("/var/log/auth.log") or os.path.isfile("/var/log/secure"):
-        return "auto"
-    return "systemd"
+def service_diagnostics(unit: str, lines: int = 25) -> str:
+    """Причина отказа службы из журнала. Голый «returned non-zero exit status 1»
+    ничего не говорит, а разбираться приходится уже вручную по ssh."""
+    out: list[str] = []
+    status = probe(["systemctl", "status", unit, "--no-pager", "-l", "-n", "0"])
+    if status.stdout.strip():
+        out.append(status.stdout.strip())
+    jrnl = probe(["journalctl", "-u", unit, "-n", str(lines), "--no-pager"])
+    if jrnl.returncode == 0 and jrnl.stdout.strip():
+        out.append(jrnl.stdout.strip())
+    return "\n".join(out).strip()
 
 
-def block_fail2ban() -> None:
-    step("Настройка Fail2Ban")
-    backend = _fail2ban_backend()
-    console.print(f"[dim]backend для jail sshd: {backend}[/dim]")
-    jail = f"""[DEFAULT]
+def _fail2ban_jail(backend: str) -> str:
+    return f"""[DEFAULT]
 backend = {backend}
 
 [sshd]
@@ -411,17 +411,83 @@ maxretry = 5
 findtime = 600
 bantime = 12h
 """
-    write_file("/etc/fail2ban/jail.local", jail)
-    run(["systemctl", "enable", "--now", "fail2ban"])
-    run(["systemctl", "restart", "fail2ban"])
-    # Служба может стартовать и тут же упасть из-за неверного backend/фильтра —
+
+
+def _fail2ban_backend() -> str:
+    """На Debian 12 / Ubuntu 24 rsyslog не ставится по умолчанию и
+    /var/log/auth.log отсутствует — с backend=auto jail sshd не поднимется
+    («Failed to access socket path» / отсутствие лог-файла). Для таких систем
+    единственный рабочий источник — журнал systemd."""
+    if os.path.isfile("/var/log/auth.log") or os.path.isfile("/var/log/secure"):
+        return "auto"
+    return "systemd"
+
+
+def _fail2ban_try(backend: str) -> tuple[bool, str]:
+    """Пишет конфиг с указанным backend, проверяет его и пробует запустить.
+    Возвращает (успех, текст проблемы)."""
+    write_file("/etc/fail2ban/jail.local", _fail2ban_jail(backend))
+
+    # fail2ban-client -t разбирает конфиг, не трогая службу: ошибку фильтра или
+    # недоступный backend видно до попытки запуска.
+    test = probe(["fail2ban-client", "-t"])
+    if test.returncode != 0:
+        return False, (test.stderr or test.stdout or "").strip()
+
+    enable = probe(["systemctl", "enable", "--now", "fail2ban"])
+    restart = probe(["systemctl", "restart", "fail2ban"])
+    if enable.returncode == 0 and restart.returncode == 0:
+        return True, ""
+    reason = (enable.stderr or restart.stderr or "").strip()
+    return False, (service_diagnostics("fail2ban") or reason)
+
+
+def block_fail2ban() -> None:
+    step("Настройка Fail2Ban")
+    backend = _fail2ban_backend()
+    console.print(f"[dim]backend для jail sshd: {backend}[/dim]")
+
+    # Для backend=systemd fail2ban читает журнал через python3-systemd. Пакет
+    # идёт лишь в Recommends, и при установке с --no-install-recommends (или на
+    # урезанном образе) служба падает при старте с ImportError.
+    if backend == "systemd" and not _pkg_installed("python3-systemd"):
+        console.print("[dim]Доустанавливаю python3-systemd (нужен для "
+                      "backend=systemd)…[/dim]")
+        run(["apt-get", "install", "-y", "python3-systemd"], check=False)
+
+    ok, problem = _fail2ban_try(backend)
+
+    # Запасной путь: если systemd-backend всё же не поднялся, пробуем добыть
+    # /var/log/auth.log через rsyslog и переключиться на auto. Обратный порядок
+    # тоже возможен — auto не работает без файла журнала.
+    if not ok and backend == "systemd":
+        console.print(f"[yellow]backend=systemd не заработал:[/yellow]\n{problem}")
+        console.print("[cyan]Пробую через rsyslog и backend=auto…[/cyan]")
+        run(["apt-get", "install", "-y", "rsyslog"], check=False)
+        run(["systemctl", "enable", "--now", "rsyslog"], check=False)
+        time.sleep(2)   # rsyslog должен успеть создать /var/log/auth.log
+        ok, problem = _fail2ban_try("auto")
+    elif not ok and backend == "auto":
+        console.print(f"[yellow]backend=auto не заработал:[/yellow]\n{problem}")
+        console.print("[cyan]Пробую backend=systemd…[/cyan]")
+        if not _pkg_installed("python3-systemd"):
+            run(["apt-get", "install", "-y", "python3-systemd"], check=False)
+        ok, problem = _fail2ban_try("systemd")
+
+    if not ok:
+        raise RuntimeError("не удалось запустить fail2ban.\n" + problem)
+
+    # Служба может стартовать и тут же упасть из-за неверного фильтра —
     # проверяем, что jail действительно поднялся, а не просто «команда прошла».
-    status = probe(["fail2ban-client", "status", "sshd"])
-    if status.returncode == 0:
-        console.print("[green]✓ Fail2Ban настроен, jail sshd активен[/green]")
-    else:
-        console.print("[yellow]Fail2Ban настроен, но jail sshd не отвечает. "
-                      "Проверьте: systemctl status fail2ban[/yellow]")
+    # fail2ban-client отвечает не мгновенно после restart, поэтому даём время.
+    for _ in range(5):
+        status = probe(["fail2ban-client", "status", "sshd"])
+        if status.returncode == 0:
+            console.print("[green]✓ Fail2Ban настроен, jail sshd активен[/green]")
+            return
+        time.sleep(1)
+    console.print("[yellow]Fail2Ban запущен, но jail sshd не отвечает:[/yellow]\n"
+                  + (service_diagnostics("fail2ban", 15) or "нет данных в журнале"))
 
 
 def block_ufw(extra_ports: list[str]) -> None:
