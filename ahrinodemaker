@@ -60,14 +60,23 @@ if os.geteuid() != 0:
 # ------------------------------------------------------------------ #
 # Автоустановка нестандартных модулей
 # ------------------------------------------------------------------ #
+def _apt_quiet(args: list[str]) -> subprocess.CompletedProcess:
+    """apt без простыни Get:/Hit: на экране — вывод забираем в буфер."""
+    env = {**os.environ, "DEBIAN_FRONTEND": "noninteractive"}
+    return subprocess.run(["apt-get", "-qq", "-o", "DPkg::Lock::Timeout=300", *args],
+                          env=env, text=True, capture_output=True)
+
+
 def _ensure_pip() -> None:
     try:
         import pip  # noqa: F401
     except ImportError:
-        # На свежей ВМ индексы apt могут быть пустыми — без update установка
-        # python3-pip провалится с "Unable to locate package".
-        subprocess.run(["apt-get", "update"], check=False)
-        subprocess.run(["apt-get", "install", "-y", "python3-pip"], check=False)
+        # apt-get update стоит десятки секунд и заливает экран, поэтому сначала
+        # пробуем поставить с текущими индексами и обновляем их только если
+        # пакет не нашёлся (свежая ВМ с пустым кэшем).
+        if _apt_quiet(["install", "-y", "python3-pip"]).returncode != 0:
+            _apt_quiet(["update"])
+            _apt_quiet(["install", "-y", "python3-pip"])
 
 
 # Имя pip-пакета → имя системного пакета Debian/Ubuntu. Механическое
@@ -78,13 +87,16 @@ APT_PKG_OVERRIDES = {
 }
 
 
-def ensure(pkg: str, module: str | None = None):
+def ensure(pkg: str, module: str | None = None, *, purpose: str = ""):
     module = module or pkg
     try:
         return importlib.import_module(module)
     except ImportError:
         pass
 
+    # Сообщаем, ЧТО именно ставится: иначе установка выглядит как «скрипт начал
+    # ставить пакеты под ноду, ничего не спросив».
+    print(f"→ Ставлю Python-модуль «{pkg}»{purpose}…", file=sys.stderr)
     _ensure_pip()
     env = {**os.environ, "DEBIAN_FRONTEND": "noninteractive",
            "PIP_ROOT_USER_ACTION": "ignore"}
@@ -106,8 +118,7 @@ def ensure(pkg: str, module: str | None = None):
         # Запасной путь — системный пакет через apt (python3-rich и т.п.)
         apt_pkg = APT_PKG_OVERRIDES.get(
             pkg, "python3-" + module.split(".")[0].replace("_", "-"))
-        subprocess.run(["apt-get", "install", "-y", apt_pkg],
-                       env=env, text=True, capture_output=True)
+        _apt_quiet(["install", "-y", apt_pkg])
 
     try:
         return importlib.import_module(module)
@@ -122,8 +133,11 @@ def ensure(pkg: str, module: str | None = None):
         sys.exit(1)
 
 
-ensure("rich")
-ensure("questionary")
+# Эти два модуля нужны самому меню, поэтому ставятся до его показа. Никакие
+# пакеты для ноды здесь не трогаются — они ставятся только внутри блоков
+# раздела «Remnawave Node», после явного выбора пользователя.
+ensure("rich", purpose=" — библиотека вывода, нужна для меню")
+ensure("questionary", purpose=" — интерактивное меню")
 
 import questionary
 from questionary import Style
@@ -652,14 +666,43 @@ def block_remnanode_logs(compose_path: str | None) -> None:
 _SHA_RE = re.compile(r"sha256:[0-9a-f]{64}")
 
 
+def _image_from_compose_text(path: str) -> str | None:
+    """Запасной разбор image: без YAML-парсера.
+
+    Нужен, чтобы простая проверка версии ноды не тянула установку ruamel.yaml:
+    раньше вход в раздел «Remnawave Node» ставил модуль ещё до того, как
+    пользователь выбрал хоть один блок."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return None
+    images: list[tuple[str, str]] = []   # (имя сервиса, образ)
+    service = ""
+    for ln in lines:
+        if re.match(r"^\s{2}\S.*:\s*$", ln) and not ln.startswith("    "):
+            service = ln.strip().rstrip(":")
+        m = re.match(r"^\s+image:\s*['\"]?([^'\"#\s]+)", ln)
+        if m:
+            images.append((service, m.group(1)))
+    if not images:
+        return None
+    for name, image in images:
+        if "remna" in name.lower():
+            return image
+    return images[0][1]
+
+
 def _node_image_from_compose(path: str) -> str | None:
     """Достаёт имя образа сервиса ноды из docker-compose.yml."""
     try:
-        ensure("ruamel.yaml", "ruamel.yaml")
+        # Только если модуль уже есть — ставить его ради чтения не будем.
         from ruamel.yaml import YAML
         yaml = YAML(typ="safe")
         with open(path, encoding="utf-8") as f:
             data = yaml.load(f)
+    except ImportError:
+        return _image_from_compose_text(path)
     except Exception:
         return None
     if not isinstance(data, dict):
