@@ -1188,6 +1188,58 @@ HYSTERIA_CRON_MARKER = "# AhriNode tool: сертификаты Hysteria2"
 LETSENCRYPT_LIVE = "/etc/letsencrypt/live"
 
 
+def _cert_paths(domain: str) -> tuple[str, str]:
+    base = os.path.join(LETSENCRYPT_LIVE, domain)
+    return os.path.join(base, "fullchain.pem"), os.path.join(base, "privkey.pem")
+
+
+def _host_addresses() -> set[str]:
+    """Публичные адреса этого сервера — чтобы заранее поймать неверный A-запись."""
+    out = probe(["ip", "-4", "-o", "addr", "show", "scope", "global"]).stdout
+    return set(re.findall(r"inet\s+(\d{1,3}(?:\.\d{1,3}){3})", out))
+
+
+def issue_certificate(domain: str) -> None:
+    """Выпускает сертификат Let's Encrypt через certbot в режиме standalone.
+
+    standalone поднимает временный веб-сервер на 80 порту: у ноды его никто не
+    занимает (Xray слушает 443), а webroot требовал бы уже работающего
+    веб-сервера. Проверка домена — HTTP-01, поэтому A-запись должна указывать
+    на этот сервер."""
+    step(f"Выпуск сертификата Let's Encrypt для {domain}")
+    ensure_packages("certbot")
+
+    # Предупреждаем до обращения к Let's Encrypt: у них жёсткие лимиты на
+    # неудачные попытки (5 в час на домен), и упереться в них легко.
+    resolved = probe(["getent", "ahostsv4", domain]).stdout
+    resolved_ips = set(re.findall(r"^(\d{1,3}(?:\.\d{1,3}){3})", resolved, re.M))
+    local_ips = _host_addresses()
+    if resolved_ips and local_ips and not (resolved_ips & local_ips):
+        console.print(
+            f"[yellow]Внимание: {domain} указывает на "
+            f"{', '.join(sorted(resolved_ips))}, а адреса этого сервера — "
+            f"{', '.join(sorted(local_ips))}. Проверка Let's Encrypt, скорее "
+            "всего, не пройдёт.[/yellow]")
+    elif not resolved_ips:
+        console.print(f"[yellow]Внимание: {domain} не резолвится — проверьте "
+                      "A-запись.[/yellow]")
+
+    # Порт 80 нужен для проверки HTTP-01
+    if shutil.which("ufw") and "Status: active" in probe(["ufw", "status"]).stdout:
+        run(["ufw", "allow", "80/tcp"], check=False)
+
+    run(["certbot", "certonly", "--standalone", "--non-interactive",
+         "--agree-tos", "--register-unsafely-without-email",
+         "--http-01-port", "80", "-d", domain])
+
+    cert, key = _cert_paths(domain)
+    if not (os.path.isfile(cert) and os.path.isfile(key)):
+        raise RuntimeError(f"certbot отработал, но {cert} не появился")
+    console.print(f"[green]✓ Сертификат выпущен: {cert}[/green]")
+    console.print("[dim]Продление берёт на себя таймер certbot; наш cron "
+                  "ежедневно копирует свежие файлы в /dev/shm.[/dim]")
+
+
 def letsencrypt_domains() -> list[str]:
     """Домены, для которых есть полный комплект файлов сертификата."""
     try:
@@ -1314,13 +1366,18 @@ def block_hysteria(domain: str | None = None) -> None:
         raise RuntimeError(f"контейнер remnanode не запущен "
                            f"(статус: {state.stdout.strip() or 'неизвестно'})")
 
-    # 2. Сертификаты. Их выпускает reverse-proxy панели, сам скрипт этого не делает
+    # 2. Сертификаты. Если их нет — выпускаем сами, домен спрошен заранее
     domains = letsencrypt_domains()
+    if domain and domain not in domains:
+        issue_certificate(domain)
+        domains = letsencrypt_domains()
     if not domains:
         raise RuntimeError(
-            f"в {LETSENCRYPT_LIVE} нет сертификатов Let's Encrypt.\n"
-            "  Hysteria2 требует TLS-сертификат домена. Сначала выпустите его — "
-            "обычно это делает reverse-proxy, через который ставится нода.")
+            f"в {LETSENCRYPT_LIVE} нет сертификатов Let's Encrypt и домен для "
+            "выпуска не задан.\n"
+            "  Hysteria2 требует TLS-сертификат домена: либо укажите домен, "
+            "чтобы скрипт выпустил сертификат сам, либо выпустите его заранее "
+            "(это делает и reverse-proxy, если нода ставится через него).")
     if domain not in domains:
         domain = domains[0]
     console.print(f"[bold]Домен:[/bold] {domain}")
@@ -1382,19 +1439,69 @@ def block_hysteria(domain: str | None = None) -> None:
         "создайте Host и внесите inbound в Squad.")
 
 
-def ask_hysteria_domain() -> str | None:
-    """Домен спрашиваем заранее, только если их несколько."""
-    domains = letsencrypt_domains()
-    if not domains:
-        console.print(f"[yellow]В {LETSENCRYPT_LIVE} не найдено сертификатов — "
-                      "блок Hysteria2 сообщит об этом при выполнении.[/yellow]")
+# Последняя метка обязана начинаться с буквы: это отсекает IP-адреса, но
+# пропускает punycode-домены верхнего уровня вроде xn--p1ai (.рф).
+DOMAIN_RE = re.compile(
+    r"^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+"
+    r"[a-z][a-z0-9-]{0,61}[a-z0-9]$",
+    re.IGNORECASE)
+
+
+def normalize_domain(raw: str) -> str | None:
+    """Приводит ввод к виду, понятному certbot, или возвращает None.
+
+    Кириллические домены переводятся в punycode: пользователь пишет «мой.рф»,
+    а Let's Encrypt и Xray работают с xn--… ."""
+    domain = raw.strip().lower().rstrip(".")
+    if not domain:
         return None
+    try:
+        domain = domain.encode("idna").decode("ascii")
+    except (UnicodeError, ValueError):
+        return None
+    return domain if DOMAIN_RE.match(domain) else None
+
+
+def ask_hysteria_domain() -> str | None:
+    """Домен спрашиваем заранее: либо выбор из уже выпущенных сертификатов,
+    либо новый домен, для которого сертификат будет выпущен."""
+    domains = letsencrypt_domains()
+
+    if not domains:
+        console.print(f"[dim]В {LETSENCRYPT_LIVE} сертификатов нет — "
+                      "могу выпустить через certbot.[/dim]")
+        raw = questionary.text(
+            "Домен для Hysteria2 (A-запись должна указывать на этот сервер).\n"
+            "  Enter — пропустить, тогда блок Hysteria2 будет пропущен.\n"
+            "  Домен:",
+            default="", style=CUSTOM_STYLE).ask()
+        if not raw:
+            return None
+        domain = normalize_domain(raw)
+        if domain is None:
+            console.print(f"[red]«{raw.strip()}» не похож на доменное имя.[/red]")
+            return None
+        return domain
+
+    choices = [*domains, "Выпустить сертификат для другого домена"]
     if len(domains) == 1:
-        return domains[0]
+        choices = [f"{domains[0]}   [сертификат уже есть]",
+                   "Выпустить сертификат для другого домена"]
     choice = questionary.select(
         "Домен, чьим сертификатом будет пользоваться Hysteria2:",
-        choices=domains, style=CUSTOM_STYLE).ask()
-    return choice
+        choices=choices, style=CUSTOM_STYLE).ask()
+    if choice is None:
+        return None
+    if choice.startswith("Выпустить"):
+        raw = questionary.text("Новый домен:", default="", style=CUSTOM_STYLE).ask()
+        if not raw:
+            return None
+        domain = normalize_domain(raw)
+        if domain is None:
+            console.print(f"[red]«{raw.strip()}» не похож на доменное имя.[/red]")
+            return None
+        return domain
+    return choice.split()[0]
 
 
 # ------------------------------------------------------------------ #
