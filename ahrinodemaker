@@ -1331,9 +1331,33 @@ def _install_repo_key(url: str, keyring: str) -> None:
     console.print(f"[green]✓ GPG-ключ репозитория записан: {keyring}[/green]")
 
 
+REPO_BASE = "https://repo.remna.dev/xray-tools"
+
+
+def _repo_architectures(base_url: str, suite: str) -> list[str]:
+    """Архитектуры, объявленные репозиторием в dists/<suite>/Release.
+
+    Гадать здесь нельзя: `arch=` в источнике должен совпадать с тем, какие
+    индексы репозиторий реально публикует. Repo на OpenRepo выкладывает
+    binary-any/, обычные Debian-репозитории — binary-amd64/ и т.п.; при
+    несовпадении apt молча не видит ни одного пакета и выдаёт лишь
+    «Unable to locate package»."""
+    with tempfile.TemporaryDirectory(prefix="release-") as tmpdir:
+        dest = os.path.join(tmpdir, "Release")
+        try:
+            _download(f"{base_url}/dists/{suite}/Release", dest, timeout=30)
+        except RuntimeError:
+            return []
+        with open(dest, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if line.startswith("Architectures:"):
+                    return line.split(":", 1)[1].split()
+    return []
+
+
 def _install_tblocker_package() -> None:
     """Подключает репозиторий remna.dev и ставит пакет tblocker."""
-    run(["apt-get", "install", "-y", "curl", "gnupg", "ca-certificates"])
+    ensure_packages("curl", "gnupg", "ca-certificates")
     keyring  = "/usr/share/keyrings/openrepo-xray-tools.gpg"
     listfile = "/etc/apt/sources.list.d/openrepo-xray-tools.list"
 
@@ -1342,17 +1366,45 @@ def _install_tblocker_package() -> None:
     # listfile уже существовал и ветка пересоздания ключа не выполнялась.
     key_ok = os.path.isfile(keyring) and os.path.getsize(keyring) > 0
     if not key_ok:
-        _install_repo_key("https://repo.remna.dev/xray-tools/public.gpg", keyring)
+        _install_repo_key(f"{REPO_BASE}/public.gpg", keyring)
 
-    # arch=any не является валидной архитектурой для apt — подставляем реальную
-    arch = probe(["dpkg", "--print-architecture"]).stdout.strip() or "amd64"
+    # Архитектуру берём из Release самого репозитория. Ни «any» вслепую, ни
+    # dpkg --print-architecture вслепую не годятся: первое ломается на обычных
+    # репозиториях, второе — на OpenRepo, который публикует binary-any/.
+    host_arch = probe(["dpkg", "--print-architecture"]).stdout.strip() or "amd64"
+    declared = _repo_architectures(REPO_BASE, "stable")
+    if host_arch in declared:
+        arch = host_arch
+    elif "any" in declared:
+        arch = "any"
+    elif declared:
+        arch = ",".join(a for a in declared if a != "all") or host_arch
+    else:
+        # Release недоступен — перечисляем оба варианта. Индекс, которого у
+        # репозитория нет, apt пропустит, а не сочтёт ошибкой.
+        arch = f"{host_arch},any"
+    console.print(f"[dim]Архитектура репозитория: {arch}"
+                  f"{' (объявлено: ' + ' '.join(declared) + ')' if declared else ''}[/dim]")
+
     write_file(listfile,
                f"deb [arch={arch} signed-by={keyring}] "
-               "https://repo.remna.dev/xray-tools/ stable main\n")
+               f"{REPO_BASE}/ stable main\n")
 
     # force: только что добавили новый список источников
     apt_update(force=True)
-    run(["apt-get", "install", "-y", "tblocker"])
+
+    try:
+        run(["apt-get", "install", "-y", "tblocker"])
+    except subprocess.CalledProcessError:
+        # «Unable to locate package» не объясняет, что пошло не так: репозиторий
+        # мог не подключиться, отдать индекс другой архитектуры или другой suite.
+        policy = probe(["apt-cache", "policy", "tblocker"]).stdout.strip()
+        raise RuntimeError(
+            "пакет tblocker не найден в репозитории.\n"
+            f"  источник: {REPO_BASE}/ stable main (arch={arch})\n"
+            f"  архитектуры по Release: {' '.join(declared) or 'не удалось прочитать'}\n"
+            f"  apt-cache policy tblocker:\n{policy or '  (пусто)'}\n"
+            "  Проверьте вручную: apt-get update 2>&1 | grep -i remna")
 
 
 def _setup_egress_filter() -> None:
