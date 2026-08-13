@@ -1266,6 +1266,10 @@ def hysteria_inbound_reference(domain: str, port: int = 443) -> str:
             "version": 2,
             "clients": [],
         },
+        # sniffing нужен, даже если конвертеры его опускают: правило
+        # BLOCK_BITTORRENT срабатывает по protocol=bittorrent, а определить
+        # протокол без sniffing нельзя. Заодно без него в access.log не попадают
+        # домены — и tblocker не увидит торрент-трафик этого inbound'а.
         "sniffing": {
             "enabled": True,
             "destOverride": ["http", "tls", "quic"],
@@ -1273,8 +1277,15 @@ def hysteria_inbound_reference(domain: str, port: int = 443) -> str:
         "streamSettings": {
             "network": "hysteria",
             "security": "tls",
+            # congestion принимает reno | bbr | brutal | force-brutal
+            # (infra/conf/transport_internet.go). bbr — разумный выбор для QUIC.
+            "finalmask": {
+                "quicParams": {
+                    "debug": False,
+                    "congestion": "bbr",
+                },
+            },
             "tlsSettings": {
-                "serverName": domain,
                 "alpn": ["h3"],
                 "certificates": [
                     {
@@ -1282,6 +1293,9 @@ def hysteria_inbound_reference(domain: str, port: int = 443) -> str:
                         "keyFile": HYSTERIA_KEY,
                     }
                 ],
+            },
+            "hysteriaSettings": {
+                "version": 2,
             },
         },
     }, indent=2, ensure_ascii=False) + "\n"
