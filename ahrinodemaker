@@ -740,7 +740,10 @@ def find_compose_candidates() -> list[str]:
 
 def _ask_compose_manual() -> str | None:
     raw = questionary.text(
-        "Путь к docker-compose.yml ноды (Enter — пропустить добавление volume):",
+        "Путь к docker-compose.yml ноды.\n"
+        "  Enter — пропустить. Без volume логи ноды останутся внутри контейнера:\n"
+        "  logrotate их не увидит, а блокировка торрентов работать не будет.\n"
+        "  Путь:",
         default="",
         style=CUSTOM_STYLE,
     ).ask()
@@ -1426,10 +1429,11 @@ def block_trafficguard() -> None:
 # блок time_cron вызывает crontab, ufw — команду ufw, и на чистой системе эти
 # бинарники появляются только после установки пакетов.
 BLOCKS = [
-    ("packages", "Установка пакетов (fail2ban, ufw, unattended-upgrades, cron)", block_packages),
-    # Стоит до remnanode_logs и node_update: они работают с docker-compose.yml,
-    # который появляется только после установки.
+    # Установка ноды идёт первой: это основная задача сервера, а остальные
+    # блоки её обвязка. Плюс remnanode_logs и node_update работают с
+    # docker-compose.yml, который появляется только после установки.
     ("node_install", "Установка Remnawave Node (docker + compose + запуск)", block_node_install),
+    ("packages", "Установка пакетов (fail2ban, ufw, unattended-upgrades, cron)", block_packages),
     ("time_cron", f"Часовой пояс {TIMEZONE} + cron (перезагрузка по расписанию)", block_time_cron),
     ("fail2ban", "Настройка Fail2Ban", block_fail2ban),
     ("ufw", "Настройка UFW (firewall)", block_ufw),
@@ -1762,6 +1766,12 @@ def menu_remnawave_node() -> None:
                           "[dim](будет создан установкой ноды)[/dim]")
         else:
             console.print("[bold]docker-compose ноды:[/bold] [dim]не задан (volume будет пропущен)[/dim]")
+            if "torrent" in selected:
+                # tblocker следит за /var/log/remnanode/access.log на хосте;
+                # без volume этот файл не появится и блокировка не заработает.
+                console.print("[yellow]  Внимание: выбран блок блокировки "
+                              "торрентов, но без volume tblocker не увидит "
+                              "access.log и работать не будет.[/yellow]")
 
     answer = questionary.text(
         "Нажмите Enter для запуска (Ctrl+C — отмена)", default="",
