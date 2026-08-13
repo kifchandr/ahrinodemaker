@@ -1199,14 +1199,85 @@ def _host_addresses() -> set[str]:
     return set(re.findall(r"inet\s+(\d{1,3}(?:\.\d{1,3}){3})", out))
 
 
-def issue_certificate(domain: str) -> None:
-    """Выпускает сертификат Let's Encrypt через certbot в режиме standalone.
+# Удостоверяющие центры с бесплатным ACME. Привязка к одному УЦ — лишний риск:
+# у любого бывают перебои, лимиты и собственные ограничения по доменным зонам.
+#
+# eab (External Account Binding) — предварительная регистрация в УЦ: kid и
+# hmac-ключ берутся в личном кабинете. Без них ZeroSSL и Google по ACME не
+# выдают. email обязателен там, где УЦ не принимает анонимную регистрацию.
+ACME_PROVIDERS = {
+    "letsencrypt": {
+        "title": "Let's Encrypt — по умолчанию",
+        "server": None,          # адрес по умолчанию в самом certbot
+        "eab": False, "email_required": False,
+    },
+    "buypass": {
+        "title": "Buypass Go SSL — норвежский УЦ, без регистрации",
+        "server": "https://api.buypass.com/acme/directory",
+        "eab": False, "email_required": True,
+    },
+    "zerossl": {
+        "title": "ZeroSSL — нужны EAB-ключи из личного кабинета",
+        "server": "https://acme.zerossl.com/v2/DV90",
+        "eab": True, "email_required": True,
+    },
+    "google": {
+        "title": "Google Trust Services — нужны EAB-ключи",
+        "server": "https://dv.acme-v02.api.pki.goog/directory",
+        "eab": True, "email_required": True,
+    },
+}
+
+
+def ask_acme_provider() -> dict | None:
+    """Спрашивает УЦ и его реквизиты до начала выпуска."""
+    choice = questionary.select(
+        "Каким удостоверяющим центром выпустить сертификат?",
+        choices=[questionary.Choice(spec["title"], value=key)
+                 for key, spec in ACME_PROVIDERS.items()],
+        style=CUSTOM_STYLE).ask()
+    if choice is None:
+        return None
+
+    spec = ACME_PROVIDERS[choice]
+    acme = {"provider": choice, "server": spec["server"],
+            "email": "", "eab_kid": "", "eab_key": ""}
+
+    prompt = ("E-mail для уведомлений об истечении"
+              + (":" if spec["email_required"] else " (Enter — без него):"))
+    email = questionary.text(prompt, default="", style=CUSTOM_STYLE).ask()
+    if email is None:
+        return None
+    acme["email"] = email.strip()
+    if spec["email_required"] and not acme["email"]:
+        console.print(f"[red]{spec['title']} требует e-mail.[/red]")
+        return None
+
+    if spec["eab"]:
+        kid = questionary.text("EAB Key ID (kid):", default="",
+                               style=CUSTOM_STYLE).ask()
+        key = questionary.text("EAB HMAC Key:", default="",
+                               style=CUSTOM_STYLE).ask()
+        if not kid or not key or not kid.strip() or not key.strip():
+            console.print("[red]Без EAB-ключей этот УЦ сертификат не выдаст.[/red]")
+            return None
+        acme["eab_kid"] = kid.strip()
+        acme["eab_key"] = key.strip()
+
+    return acme
+
+
+def issue_certificate(domain: str, acme: dict | None = None) -> None:
+    """Выпускает сертификат через certbot в режиме standalone.
 
     standalone поднимает временный веб-сервер на 80 порту: у ноды его никто не
     занимает (Xray слушает 443), а webroot требовал бы уже работающего
     веб-сервера. Проверка домена — HTTP-01, поэтому A-запись должна указывать
     на этот сервер."""
-    step(f"Выпуск сертификата Let's Encrypt для {domain}")
+    acme = acme or {"provider": "letsencrypt", "server": None,
+                    "email": "", "eab_kid": "", "eab_key": ""}
+    title = ACME_PROVIDERS.get(acme["provider"], {}).get("title", acme["provider"])
+    step(f"Выпуск сертификата для {domain} ({title})")
     ensure_packages("certbot")
 
     # Предупреждаем до обращения к Let's Encrypt: у них жёсткие лимиты на
@@ -1228,9 +1299,29 @@ def issue_certificate(domain: str) -> None:
     if shutil.which("ufw") and "Status: active" in probe(["ufw", "status"]).stdout:
         run(["ufw", "allow", "80/tcp"], check=False)
 
-    run(["certbot", "certonly", "--standalone", "--non-interactive",
-         "--agree-tos", "--register-unsafely-without-email",
-         "--http-01-port", "80", "-d", domain])
+    cmd = ["certbot", "certonly", "--standalone", "--non-interactive",
+           "--agree-tos", "--http-01-port", "80", "-d", domain]
+    if acme.get("server"):
+        cmd += ["--server", acme["server"]]
+    if acme.get("email"):
+        cmd += ["--email", acme["email"]]
+    else:
+        cmd += ["--register-unsafely-without-email"]
+    if acme.get("eab_kid"):
+        cmd += ["--eab-kid", acme["eab_kid"], "--eab-hmac-key", acme["eab_key"]]
+
+    try:
+        run(cmd)
+    except subprocess.CalledProcessError as exc:
+        # Частая причина — отказ конкретного УЦ (лимиты, доменная зона,
+        # недоступность). Подсказываем, что выход есть.
+        raise RuntimeError(
+            f"{title} не выдал сертификат (код {exc.returncode}).\n"
+            "  Подробности — в /var/log/letsencrypt/letsencrypt.log.\n"
+            "  Если дело в самом УЦ, запустите блок заново и выберите другой: "
+            + ", ".join(s["title"].split(" —")[0]
+                        for k, s in ACME_PROVIDERS.items()
+                        if k != acme["provider"]))
 
     cert, key = _cert_paths(domain)
     if not (os.path.isfile(cert) and os.path.isfile(key)):
@@ -1353,8 +1444,9 @@ def hysteria_inbound_reference(domain: str, port: int = 443) -> str:
     }, indent=2, ensure_ascii=False) + "\n"
 
 
-def block_hysteria(domain: str | None = None) -> None:
+def block_hysteria(params: tuple[str, dict | None] | None = None) -> None:
     step("Hysteria2 (QUIC): сертификаты, порт 443/udp, автообновление")
+    domain, acme = params if params else (None, None)
 
     # 1. Нода должна существовать и работать: настраивать транспорт не для чего
     if shutil.which("docker") is None:
@@ -1369,7 +1461,7 @@ def block_hysteria(domain: str | None = None) -> None:
     # 2. Сертификаты. Если их нет — выпускаем сами, домен спрошен заранее
     domains = letsencrypt_domains()
     if domain and domain not in domains:
-        issue_certificate(domain)
+        issue_certificate(domain, acme)
         domains = letsencrypt_domains()
     if not domains:
         raise RuntimeError(
@@ -1462,9 +1554,9 @@ def normalize_domain(raw: str) -> str | None:
     return domain if DOMAIN_RE.match(domain) else None
 
 
-def ask_hysteria_domain() -> str | None:
-    """Домен спрашиваем заранее: либо выбор из уже выпущенных сертификатов,
-    либо новый домен, для которого сертификат будет выпущен."""
+def ask_hysteria_params() -> tuple[str, dict | None] | None:
+    """Домен и, если сертификат надо выпускать, удостоверяющий центр.
+    Всё спрашивается заранее, чтобы выполнение шло без вопросов."""
     domains = letsencrypt_domains()
 
     if not domains:
@@ -1481,7 +1573,8 @@ def ask_hysteria_domain() -> str | None:
         if domain is None:
             console.print(f"[red]«{raw.strip()}» не похож на доменное имя.[/red]")
             return None
-        return domain
+        acme = ask_acme_provider()
+        return None if acme is None else (domain, acme)
 
     choices = [*domains, "Выпустить сертификат для другого домена"]
     if len(domains) == 1:
@@ -1500,8 +1593,10 @@ def ask_hysteria_domain() -> str | None:
         if domain is None:
             console.print(f"[red]«{raw.strip()}» не похож на доменное имя.[/red]")
             return None
-        return domain
-    return choice.split()[0]
+        acme = ask_acme_provider()
+        return None if acme is None else (domain, acme)
+    # Сертификат уже есть — выпускать ничего не нужно
+    return (choice.split()[0], None)
 
 
 # ------------------------------------------------------------------ #
@@ -2198,9 +2293,9 @@ def menu_remnawave_node() -> None:
             selected = [k for k in selected if k != "node_install"]
 
     # 4. Домен для Hysteria2 — только если выбран этот блок
-    hysteria_domain: str | None = None
+    hysteria_params: tuple[str, dict | None] | None = None
     if "hysteria" in selected:
-        hysteria_domain = ask_hysteria_domain()
+        hysteria_params = ask_hysteria_params()
 
     # 5. Расписание перезагрузки — только если выбран блок cron
     reboot_schedule = "daily"
@@ -2296,7 +2391,7 @@ def menu_remnawave_node() -> None:
             elif key == "node_install":
                 func(node_params)
             elif key == "hysteria":
-                func(hysteria_domain)
+                func(hysteria_params)
             elif key == "remnanode_logs":
                 func(compose_path)
             elif key == "node_update":
