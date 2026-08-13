@@ -1247,6 +1247,46 @@ def _hysteria_cron(domain: str) -> None:
                   "(при загрузке и ежедневно в 04:00)[/green]")
 
 
+HYSTERIA_INBOUND_TAG = "HYSTERIA2"
+
+
+def hysteria_inbound_reference(domain: str, port: int = 443) -> str:
+    """Готовый inbound для вставки в конфиг ноды через панель.
+
+    Схема сверена с исходниками Xray-core: протокол называется «hysteria»,
+    settings.version обязан быть 2 (иначе ядро откажет с «version != 2»),
+    пользователи описываются полем auth. clients — синоним users; пустой
+    список заполняет панель."""
+    return json.dumps({
+        "tag": HYSTERIA_INBOUND_TAG,
+        "port": port,
+        "listen": "0.0.0.0",
+        "protocol": "hysteria",
+        "settings": {
+            "version": 2,
+            "clients": [],
+        },
+        "sniffing": {
+            "enabled": True,
+            "destOverride": ["http", "tls", "quic"],
+        },
+        "streamSettings": {
+            "network": "hysteria",
+            "security": "tls",
+            "tlsSettings": {
+                "serverName": domain,
+                "alpn": ["h3"],
+                "certificates": [
+                    {
+                        "certificateFile": HYSTERIA_CERT,
+                        "keyFile": HYSTERIA_KEY,
+                    }
+                ],
+            },
+        },
+    }, indent=2, ensure_ascii=False) + "\n"
+
+
 def block_hysteria(domain: str | None = None) -> None:
     step("Hysteria2 (QUIC): сертификаты, порт 443/udp, автообновление")
 
@@ -1315,11 +1355,17 @@ def block_hysteria(domain: str | None = None) -> None:
     else:
         console.print("[green]✓ Перезапуск не требуется[/green]")
 
+    # 7. Готовый inbound для вставки в конфиг ноды через панель
+    ref_path = f"{INSTALL_DIR}/panel-hysteria-inbound.json"
+    write_file(ref_path, hysteria_inbound_reference(domain))
+    console.print(f"[green]✓ Заготовка inbound: {ref_path}[/green]")
+
     console.print(
         "[bold yellow]Важно:[/bold yellow] серверная часть готова, но сам "
-        "inbound Hysteria2 включается в панели Remnawave — добавьте его в "
-        "конфиг ноды, создайте Host и внесите inbound в Squad. Пути к "
-        f"сертификатам внутри контейнера: {HYSTERIA_CERT}, {HYSTERIA_KEY}.")
+        "inbound Hysteria2 включается в панели Remnawave: добавьте содержимое "
+        f"{ref_path} в массив inbounds конфига ноды, впишите тег "
+        f"«{HYSTERIA_INBOUND_TAG}» в правило маршрутизации на ваш outbound, "
+        "создайте Host и внесите inbound в Squad.")
 
 
 def ask_hysteria_domain() -> str | None:

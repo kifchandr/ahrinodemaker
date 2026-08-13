@@ -55,7 +55,7 @@ sudo curl -fsSL https://raw.githubusercontent.com/kifchandr/ahrinodemaker/main/a
 | Сеть | `nf_conntrack` + `sysctl`: BBR + fq, увеличенные буферы и очереди, keepalive, отключение IPv6, `swappiness=10` |
 | Логи remnanode | каталог `/var/log/remnanode`, ротация через logrotate, добавление volume в `docker-compose.yml` ноды. Пункт для нод, установленных **не этим скриптом**: при установке ноды отсюда всё это уже сделано, и пункт скрывается |
 | Обновление remnanode | `docker compose pull` + пересоздание контейнера. Пункт появляется, только если образ устарел или версию не удалось проверить |
-| Hysteria2 (QUIC) | монтирует `/dev/shm` в контейнер, кладёт туда сертификаты Let's Encrypt, открывает `443/udp` и заводит cron на их обновление. **По умолчанию выключен** |
+| Hysteria2 (QUIC) | монтирует `/dev/shm` в контейнер, кладёт туда сертификаты Let's Encrypt, открывает `443/udp`, заводит cron на их обновление и генерирует заготовку inbound'а для панели. **По умолчанию выключен** |
 | Блокировка торрентов | `tblocker` + резервный egress-фильтр на nftables (порты 6881–6889, 51413) + справка по настройке панели |
 | TrafficGuard-auto | установка [TrafficGuard-auto](https://github.com/DonMatteoVPN/TrafficGuard-auto) — защита от сканеров и ботов, меню `rknpidor` |
 
@@ -83,6 +83,8 @@ sudo curl -fsSL https://raw.githubusercontent.com/kifchandr/ahrinodemaker/main/a
 - `/etc/logrotate.d/remnanode`
 - `/etc/systemd/system/torrent-egress-filter.{service,timer}`
 - `/opt/remnanode/apply-torrent-egress-filter.sh`, `/opt/remnanode/panel-torrent-block-config.json`
+- `/opt/remnanode/panel-hysteria-inbound.json` — заготовка inbound'а Hysteria2
+  с подставленным доменом, для вставки в конфиг ноды через панель
 - `/opt/tblocker/config.yaml`
 - `/opt/remnanode/docker-compose.yml` — только при установке ноды. Содержит
   `SECRET_KEY`, поэтому создаётся с правами `0600`
