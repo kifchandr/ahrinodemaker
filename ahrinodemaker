@@ -1267,6 +1267,53 @@ def _panel_reference() -> str:
     }, indent=2, ensure_ascii=False) + "\n"
 
 
+def _install_repo_key(url: str, keyring: str) -> None:
+    """Кладёт GPG-ключ репозитория в keyring.
+
+    Раньше это был конвейер `curl … | gpg --dearmor -o …`, и он не различал
+    причины отказа: gpg возвращает 2 и когда вход пустой (curl не скачал), и
+    когда содержимое не является ключом (например, страница с ошибкой). Здесь
+    шаги разделены, поэтому в сообщение попадает настоящая причина."""
+    with tempfile.TemporaryDirectory(prefix="repokey-") as tmpdir:
+        raw = os.path.join(tmpdir, "key")
+        _download(url, raw, timeout=30)   # ошибка curl всплывёт как есть
+
+        size = os.path.getsize(raw)
+        if size == 0:
+            raise RuntimeError(f"GPG-ключ по адресу {url} пустой")
+
+        with open(raw, "rb") as f:
+            head = f.read(64)
+
+        out = os.path.join(tmpdir, "keyring.gpg")
+        if head.startswith(b"-----BEGIN PGP"):
+            # ASCII-armored — приводим к бинарному виду
+            r = subprocess.run(["gpg", "--yes", "--dearmor", "-o", out, raw],
+                               capture_output=True, text=True)
+            if r.returncode != 0:
+                raise RuntimeError(
+                    f"gpg не смог разобрать ключ {url}: "
+                    f"{(r.stderr or '').strip() or f'код {r.returncode}'}")
+        else:
+            # Уже бинарный keyring — проверяем, что это действительно ключ
+            check = subprocess.run(["gpg", "--show-keys", raw],
+                                   capture_output=True, text=True)
+            if check.returncode != 0:
+                preview = head.decode("utf-8", "replace").replace("\n", " ")[:80]
+                raise RuntimeError(
+                    f"по адресу {url} лежит не GPG-ключ ({size} байт, "
+                    f"начало: «{preview}»): {(check.stderr or '').strip()}")
+            shutil.copyfile(raw, out)
+
+        os.makedirs(os.path.dirname(keyring), exist_ok=True)
+        shutil.copyfile(out, keyring)
+        os.chmod(keyring, 0o644)
+
+    if not (os.path.isfile(keyring) and os.path.getsize(keyring) > 0):
+        raise RuntimeError(f"keyring {keyring} не создан")
+    console.print(f"[green]✓ GPG-ключ репозитория записан: {keyring}[/green]")
+
+
 def _install_tblocker_package() -> None:
     """Подключает репозиторий remna.dev и ставит пакет tblocker."""
     run(["apt-get", "install", "-y", "curl", "gnupg", "ca-certificates"])
@@ -1274,16 +1321,11 @@ def _install_tblocker_package() -> None:
     listfile = "/etc/apt/sources.list.d/openrepo-xray-tools.list"
 
     # Ключ переустанавливаем, если его нет или он пустой: раньше сбой curl
-    # приводил к нулевому keyring (gpg на пустом входе возвращал 0), после чего
-    # apt-get update падал навсегда — listfile уже существовал и ветка
-    # пересоздания ключа больше не выполнялась.
+    # приводил к нулевому keyring, после чего apt-get update падал навсегда —
+    # listfile уже существовал и ветка пересоздания ключа не выполнялась.
     key_ok = os.path.isfile(keyring) and os.path.getsize(keyring) > 0
     if not key_ok:
-        # set -o pipefail обязателен: без него код возврата берётся от gpg
-        run("set -o pipefail; curl -fsSL https://repo.remna.dev/xray-tools/public.gpg "
-            f"| gpg --yes --dearmor -o {shlex.quote(keyring)}", shell=True)
-        if not (os.path.isfile(keyring) and os.path.getsize(keyring) > 0):
-            raise RuntimeError("не удалось загрузить GPG-ключ репозитория remna.dev")
+        _install_repo_key("https://repo.remna.dev/xray-tools/public.gpg", keyring)
 
     # arch=any не является валидной архитектурой для apt — подставляем реальную
     arch = probe(["dpkg", "--print-architecture"]).stdout.strip() or "amd64"
@@ -1765,7 +1807,15 @@ def menu_remnawave_node() -> None:
     # 4. Путь к docker-compose ноды — только если выбран блок логов remnanode
     compose_path: str | None = None
     if "remnanode_logs" in selected:
-        compose_path = ask_compose_path()
+        if "node_install" in selected:
+            # Путь известен заранее: блок установки сам создаёт compose,
+            # причём сразу с volume. Спрашивать было бы бессмысленно — файла
+            # ещё нет, и любой ответ, кроме этого пути, был бы неверным.
+            compose_path = NODE_COMPOSE_PATH
+            console.print(f"[dim]docker-compose ноды будет создан установкой: "
+                          f"{NODE_COMPOSE_PATH}[/dim]")
+        else:
+            compose_path = ask_compose_path()
 
     # 5. Сводка и запуск через Enter
     will_upgrade = bool(set(selected) & INSTALLS_PACKAGES)
