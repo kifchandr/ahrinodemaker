@@ -375,6 +375,28 @@ def vendor_upstream_state(key: str) -> tuple[str, str | None]:
 # ================================================================== #
 # БЛОКИ
 # ================================================================== #
+# None — «ни разу не обновляли». Ноль тут не годится: на свежезагруженном
+# сервере time.monotonic() сам по себе меньше max_age, и первое же обновление
+# было бы принято за недавнее и пропущено.
+_apt_updated_at: float | None = None
+
+
+def apt_update(*, force: bool = False, max_age: int = 600) -> None:
+    """apt-get update с защитой от повторов.
+
+    За один прогон индексы обновляли до трёх раз подряд: обновление системы,
+    затем блок пакетов, затем доустановка зависимостей. Каждый вызов — это
+    десятки секунд на ровном месте, а свежесть индексов за пару минут не
+    меняется."""
+    global _apt_updated_at
+    if (not force and _apt_updated_at is not None
+            and (time.monotonic() - _apt_updated_at) < max_age):
+        console.print("[dim]Индексы apt уже обновлены — пропускаю update[/dim]")
+        return
+    run(["apt-get", "update"])
+    _apt_updated_at = time.monotonic()
+
+
 def ensure_packages(*pkgs: str) -> None:
     """Доустанавливает недостающие пакеты.
 
@@ -390,14 +412,15 @@ def ensure_packages(*pkgs: str) -> None:
     try:
         run(["apt-get", "install", "-y", *missing])
     except subprocess.CalledProcessError:
-        # Обычно причина — устаревшие индексы apt на свежей ВМ
-        run(["apt-get", "update"])
+        # Обычно причина — устаревшие индексы apt на свежей ВМ. Здесь force:
+        # раз установка уже не прошла, кеш свежести доверия не заслуживает.
+        apt_update(force=True)
         run(["apt-get", "install", "-y", *missing])
 
 
 def block_packages() -> None:
     step("Установка пакетов")
-    run(["apt-get", "update"])
+    apt_update()
     # psmisc даёт fuser — без него wait_for_apt_lock() не умеет ждать dpkg
     run(["apt-get", "install", "-y", "fail2ban", "ufw", "unattended-upgrades",
          "cron", "psmisc"])
@@ -1229,7 +1252,8 @@ def _install_tblocker_package() -> None:
                f"deb [arch={arch} signed-by={keyring}] "
                "https://repo.remna.dev/xray-tools/ stable main\n")
 
-    run(["apt-get", "update"])
+    # force: только что добавили новый список источников
+    apt_update(force=True)
     run(["apt-get", "install", "-y", "tblocker"])
 
 
@@ -1298,7 +1322,7 @@ def block_network() -> None:
 
 def block_system_upgrade() -> None:
     step("Обновление системы (apt update && apt upgrade)")
-    run(["apt-get", "update"])
+    apt_update()
     run(["apt-get", "upgrade", "-y"])
     console.print("[green]✓ Система обновлена[/green]")
 
@@ -1418,9 +1442,15 @@ BLOCKS = [
 
 # Блоки, которые реально устанавливают пакеты через apt. Предварительное
 # обновление системы (apt update && upgrade) имеет смысл только для них —
-# если выбраны лишь «лёгкие» блоки (часовой пояс, sysctl и т.п.), обновление
+# если выбраны лишь «лёгкие» блоки (sysctl, логи и т.п.), обновление
 # пропускается.
-INSTALLS_PACKAGES = {"packages", "torrent", "trafficguard"}
+#
+# Список нужно держать в синхронности с блоками: fail2ban, ufw и time_cron
+# доустанавливают свои зависимости через ensure_packages(), а node_install
+# ставит Docker, — раньше их здесь не было, и при выборе только этих блоков
+# система не обновлялась, хотя пакеты ставились.
+INSTALLS_PACKAGES = {"packages", "node_install", "fail2ban", "ufw",
+                     "time_cron", "torrent", "trafficguard"}
 
 
 # ================================================================== #
