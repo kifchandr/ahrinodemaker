@@ -847,12 +847,11 @@ def recreate_node(compose_path: str) -> None:
     run(base + ["up", "-d", "--remove-orphans"], check=False)
 
 
-def block_remnanode_logs(compose_path: str | None) -> None:
-    step("Логи remnanode: каталог + logrotate + docker volume")
-    # 1. Каталог и файлы логов (та же подготовка, что и при установке ноды)
-    prepare_node_logs()
-    # 2. logrotate
-    logrotate_conf = """/var/log/remnanode/*.log {
+# Ротация логов ноды. copytruncate обязателен: xray внутри контейнера держит
+# файл открытым, и обычное переименование оставило бы его писать в уже
+# отротированный inode — новые записи уходили бы «в никуда».
+NODE_LOGROTATE_PATH = "/etc/logrotate.d/remnanode"
+NODE_LOGROTATE_CONF = """/var/log/remnanode/*.log {
     su root root
     daily
     rotate 14
@@ -865,8 +864,25 @@ def block_remnanode_logs(compose_path: str | None) -> None:
     copytruncate
 }
 """
-    write_file("/etc/logrotate.d/remnanode", logrotate_conf)
-    console.print("[green]✓ /etc/logrotate.d/remnanode записан[/green]")
+
+
+def write_logrotate_config() -> None:
+    """Настраивает ротацию логов ноды.
+
+    Вызывается и при установке ноды: установка создаёт файлы логов и volume,
+    то есть гарантированно порождает растущие логи. Оставлять их без уборки
+    в другом блоке значило бы отдавать сервер с миной замедленного действия —
+    на заметном трафике access.log забивает диск."""
+    write_file(NODE_LOGROTATE_PATH, NODE_LOGROTATE_CONF)
+    console.print(f"[green]✓ Ротация логов настроена: {NODE_LOGROTATE_PATH}[/green]")
+
+
+def block_remnanode_logs(compose_path: str | None) -> None:
+    step("Логи remnanode: каталог + logrotate + docker volume")
+    # 1. Каталог и файлы логов (та же подготовка, что и при установке ноды)
+    prepare_node_logs()
+    # 2. logrotate
+    write_logrotate_config()
     # 3. Volume в docker-compose.yml ноды
     if not compose_path:
         # Путь спрашивается до выполнения блоков, а нода могла быть установлена
@@ -985,6 +1001,7 @@ def block_node_install(params: tuple[str, str] | None = None) -> None:
     # Каталог и файлы логов готовим ДО старта контейнера: если примонтировать
     # несуществующий путь, Docker создаст на хосте каталог вместо файла.
     prepare_node_logs()
+    write_logrotate_config()
 
     compose = (NODE_COMPOSE_TEMPLATE
                .replace("__PORT__", node_port)
@@ -1749,15 +1766,21 @@ def menu_remnawave_node() -> None:
     # 2. Выбор блоков галочками. Уже настроенные блоки идут без галочки.
     #    Пункт обновления ноды показываем только если нода установлена и её
     #    версия не последняя (или версию не удалось проверить).
+    # Ноды на сервере нет: 'absent' означает, что docker-compose не найден либо
+    # в нём нет образа. В этом случае показываем пункт установки, а блок логов
+    # прячем — установка сама создаёт каталог, файлы, volume и ротацию, а
+    # патчить ему всё равно нечего: compose ещё не существует.
+    node_missing = node_status == "absent" and not find_compose_candidates()
+
     shown_keys: list[str] = []
     choices = []
     for key, label, _ in BLOCKS:
         if key == "node_install":
-            # Пункт нужен только когда ноды на сервере нет: 'absent' означает,
-            # что docker-compose ноды не найден либо в нём нет образа.
-            if node_status == "absent" and not find_compose_candidates():
+            if node_missing:
                 choices.append(questionary.Choice(label, value=key, checked=True))
                 shown_keys.append(key)
+            continue
+        if key == "remnanode_logs" and node_missing:
             continue
         if key == "node_update":
             if node_status == "update":
@@ -1807,15 +1830,10 @@ def menu_remnawave_node() -> None:
     # 4. Путь к docker-compose ноды — только если выбран блок логов remnanode
     compose_path: str | None = None
     if "remnanode_logs" in selected:
-        if "node_install" in selected:
-            # Путь известен заранее: блок установки сам создаёт compose,
-            # причём сразу с volume. Спрашивать было бы бессмысленно — файла
-            # ещё нет, и любой ответ, кроме этого пути, был бы неверным.
-            compose_path = NODE_COMPOSE_PATH
-            console.print(f"[dim]docker-compose ноды будет создан установкой: "
-                          f"{NODE_COMPOSE_PATH}[/dim]")
-        else:
-            compose_path = ask_compose_path()
+        # Блок показывается только когда нода на сервере уже есть, поэтому
+        # compose существует и в большинстве случаев находится автоматически —
+        # вопрос всплывает лишь при неоднозначности.
+        compose_path = ask_compose_path()
 
     # 5. Сводка и запуск через Enter
     will_upgrade = bool(set(selected) & INSTALLS_PACKAGES)
@@ -1848,9 +1866,6 @@ def menu_remnawave_node() -> None:
     if "remnanode_logs" in selected:
         if compose_path:
             console.print(f"[bold]docker-compose ноды:[/bold] {compose_path}")
-        elif "node_install" in selected:
-            console.print(f"[bold]docker-compose ноды:[/bold] {NODE_COMPOSE_PATH} "
-                          "[dim](будет создан установкой ноды)[/dim]")
         else:
             console.print("[bold]docker-compose ноды:[/bold] [dim]не задан (volume будет пропущен)[/dim]")
             if "torrent" in selected:
