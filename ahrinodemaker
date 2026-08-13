@@ -640,6 +640,9 @@ def block_timezone() -> None:
     console.print(f"[green]✓ Часовой пояс: {TIMEZONE}[/green]")
 
 
+REBOOT_CRON_MARKER = "# VPN Server Hardening: автоматическая перезагрузка"
+
+
 def block_cron(schedule: str = "daily") -> None:
     # Расписание выбирается пользователем в начале. Часовой пояс ставится
     # в block_timezone() как Europe/Moscow, поэтому 03:00 — именно по МСК.
@@ -652,47 +655,24 @@ def block_cron(schedule: str = "daily") -> None:
 
     step(f"Настройка cron (перезагрузка {human} МСК)")
 
-    MARKER = "# VPN Server Hardening: автоматическая перезагрузка"
-
-    ensure_packages("cron")
+    if shutil.which("crontab") is None:
+        ensure_packages("cron")
     if shutil.which("crontab") is None:
         console.print("[yellow]Команда crontab не найдена даже после установки "
                       "пакета cron — расписание пропущено.[/yellow]")
         return
 
-    res = probe(["crontab", "-l"])
-    existing = res.stdout.splitlines() if res.returncode == 0 else []
-
-    # Сохраняем ВСЕ посторонние строки (certbot/acme для продления сертификатов,
-    # бэкапы, кастомные задачи). Удаляем только записи, добавленные этим скриптом,
-    # чтобы не плодить дубликаты:
-    #   • строку-маркер нашего блока;
-    #   • строки со старым тегом remnanode;
-    #   • строку перезагрузки самого скрипта — и ежедневную «0 3 * * *»,
-    #     и еженедельную «0 3 * * 1». Регэксп жёстко привязан к нашему
-    #     расписанию + /sbin/reboot, поэтому чужой reboot-крон не заденет.
+    # Сохраняем ВСЕ посторонние строки (certbot/acme, бэкапы, чужие задачи) —
+    # удаляется только наш блок и строка перезагрузки в прежнем формате: и
+    # ежедневная «0 3 * * *», и еженедельная «0 3 * * 1». Регэксп привязан к
+    # нашему расписанию + /sbin/reboot, поэтому чужой reboot-крон не заденет.
+    #
+    # Прежняя версия удаляла ещё и любую строку со словом «remnanode» — чистка
+    # старого тега. Это правило снято: задачи Hysteria2 содержат
+    # `docker restart remnanode` и стирались бы при каждом прогоне этого блока.
     reboot_re = re.compile(r"^\s*0\s+3\s+\*\s+\*\s+[*1]\s+.*?/sbin/reboot\b")
-    kept: list[str] = []
-    for ln in existing:
-        s = ln.strip()
-        if s == MARKER:
-            continue
-        if "remnanode" in s:
-            continue
-        if reboot_re.match(ln):
-            continue
-        kept.append(ln)
-
-    # Убираем хвостовые пустые строки и дописываем наш блок в конец
-    while kept and not kept[-1].strip():
-        kept.pop()
-    if kept:
-        kept.append("")  # пустая строка-разделитель для читабельности
-    kept.append(MARKER)
-    kept.append(reboot_line)
-
-    new_cron = "\n".join(kept).strip("\n") + "\n"
-    run(["crontab", "-"], input_text=new_cron)
+    _crontab_replace_block(REBOOT_CRON_MARKER, [reboot_line],
+                           drop=lambda ln: reboot_re.match(ln) is not None)
     console.print(f"[green]✓ crontab обновлён — перезагрузка {human}[/green]")
 
 
@@ -781,7 +761,7 @@ def ask_compose_path() -> str | None:
     return _ask_compose_manual()
 
 
-def patch_compose_volume(path: str) -> str:
+def patch_compose_volume(path: str, volume: str = REMNANODE_VOLUME) -> str:
     """Добавляет volume в нужный сервис, сохраняя форматирование и комментарии.
     Возвращает: 'added' | 'exists' | текст ошибки."""
     ensure("ruamel.yaml", "ruamel.yaml")
@@ -818,10 +798,10 @@ def patch_compose_volume(path: str) -> str:
         if vols is None:
             vols = CommentedSeq()
             svc["volumes"] = vols
-        if any(str(v).strip().strip('"').strip("'") == REMNANODE_VOLUME for v in vols):
+        if any(str(v).strip().strip('"').strip("'") == volume for v in vols):
             already = True
             continue
-        vols.append(DoubleQuotedScalarString(REMNANODE_VOLUME))
+        vols.append(DoubleQuotedScalarString(volume))
         changed = True
 
     if not changed:
@@ -1191,6 +1171,170 @@ def block_node_update(compose_path: str | None = None) -> None:
     # -d обязателен: без него `up` висит в foreground и блокирует скрипт
     run(base + ["up", "-d", "--remove-orphans"])
     console.print("[green]✓ remnanode обновлён и перезапущен[/green]")
+
+
+# ------------------------------------------------------------------ #
+# Hysteria2 (QUIC) поверх уже работающей ноды
+# ------------------------------------------------------------------ #
+# Hysteria2 в Remnawave требует TLS-сертификата в виде файлов, доступных
+# контейнеру. Сертификаты Let's Encrypt лежат на хосте, поэтому их кладут в
+# /dev/shm (tmpfs) и монтируют внутрь: файлы не попадают на диск и обновляются
+# по расписанию вместе с продлением сертификата.
+SHM_VOLUME = "/dev/shm:/dev/shm"
+HYSTERIA_CERT = "/dev/shm/hysteria_cert.pem"
+HYSTERIA_KEY = "/dev/shm/hysteria_key.pem"
+HYSTERIA_PORT = "443/udp"
+HYSTERIA_CRON_MARKER = "# AhriNode tool: сертификаты Hysteria2"
+LETSENCRYPT_LIVE = "/etc/letsencrypt/live"
+
+
+def letsencrypt_domains() -> list[str]:
+    """Домены, для которых есть полный комплект файлов сертификата."""
+    try:
+        entries = sorted(os.listdir(LETSENCRYPT_LIVE))
+    except OSError:
+        return []
+    found = []
+    for name in entries:
+        base = os.path.join(LETSENCRYPT_LIVE, name)
+        if (os.path.isdir(base)
+                and os.path.isfile(os.path.join(base, "fullchain.pem"))
+                and os.path.isfile(os.path.join(base, "privkey.pem"))):
+            found.append(name)
+    return found
+
+
+def _sync_hysteria_certs(domain: str) -> bool:
+    """Копирует сертификаты в /dev/shm. True — файлы изменились."""
+    src_cert = os.path.join(LETSENCRYPT_LIVE, domain, "fullchain.pem")
+    src_key = os.path.join(LETSENCRYPT_LIVE, domain, "privkey.pem")
+
+    def same(a: str, b: str) -> bool:
+        try:
+            with open(a, "rb") as f1, open(b, "rb") as f2:
+                return f1.read() == f2.read()
+        except OSError:
+            return False
+
+    if same(src_cert, HYSTERIA_CERT) and same(src_key, HYSTERIA_KEY):
+        console.print("[green]✓ Сертификаты в /dev/shm актуальны[/green]")
+        return False
+
+    shutil.copyfile(src_cert, HYSTERIA_CERT)
+    shutil.copyfile(src_key, HYSTERIA_KEY)
+    # 644: файлы читает процесс внутри контейнера. /dev/shm — tmpfs в памяти,
+    # на диск приватный ключ при этом не попадает.
+    os.chmod(HYSTERIA_CERT, 0o644)
+    os.chmod(HYSTERIA_KEY, 0o644)
+    console.print("[green]✓ Сертификаты скопированы в /dev/shm[/green]")
+    return True
+
+
+def _hysteria_cron(domain: str) -> None:
+    """Сертификаты живут в tmpfs: после перезагрузки /dev/shm пуст, а после
+    продления Let's Encrypt копии устаревают. Обе ситуации закрывает cron."""
+    src_cert = os.path.join(LETSENCRYPT_LIVE, domain, "fullchain.pem")
+    src_key = os.path.join(LETSENCRYPT_LIVE, domain, "privkey.pem")
+    copy = (f"cp {src_cert} {HYSTERIA_CERT} && cp {src_key} {HYSTERIA_KEY} "
+            f"&& chmod 644 {HYSTERIA_CERT} {HYSTERIA_KEY}")
+    lines = [
+        # sleep 15 — дать докеру подняться после старта системы
+        f"@reboot {copy} && sleep 15 && docker restart remnanode",
+        f"0 4 * * * {copy} && docker restart remnanode",
+    ]
+    _crontab_replace_block(HYSTERIA_CRON_MARKER, lines)
+    console.print("[green]✓ Обновление сертификатов добавлено в cron "
+                  "(при загрузке и ежедневно в 04:00)[/green]")
+
+
+def block_hysteria(domain: str | None = None) -> None:
+    step("Hysteria2 (QUIC): сертификаты, порт 443/udp, автообновление")
+
+    # 1. Нода должна существовать и работать: настраивать транспорт не для чего
+    if shutil.which("docker") is None:
+        raise RuntimeError("Docker не установлен — сначала установите ноду")
+    state = probe(["docker", "inspect", "-f", "{{.State.Status}}", "remnanode"])
+    if state.returncode != 0:
+        raise RuntimeError("контейнер remnanode не найден — сначала установите ноду")
+    if state.stdout.strip() != "running":
+        raise RuntimeError(f"контейнер remnanode не запущен "
+                           f"(статус: {state.stdout.strip() or 'неизвестно'})")
+
+    # 2. Сертификаты. Их выпускает reverse-proxy панели, сам скрипт этого не делает
+    domains = letsencrypt_domains()
+    if not domains:
+        raise RuntimeError(
+            f"в {LETSENCRYPT_LIVE} нет сертификатов Let's Encrypt.\n"
+            "  Hysteria2 требует TLS-сертификат домена. Сначала выпустите его — "
+            "обычно это делает reverse-proxy, через который ставится нода.")
+    if domain not in domains:
+        domain = domains[0]
+    console.print(f"[bold]Домен:[/bold] {domain}")
+
+    # 3. /dev/shm внутрь контейнера — иначе он не увидит сертификаты
+    compose_path = None
+    candidates = find_compose_candidates()
+    if candidates:
+        compose_path = candidates[0]
+    mounts = probe(["docker", "inspect", "-f", "{{json .Mounts}}", "remnanode"]).stdout
+    shm_mounted = "/dev/shm" in mounts
+    compose_changed = False
+    if not shm_mounted:
+        if not compose_path:
+            raise RuntimeError(
+                "/dev/shm не примонтирован в контейнер, а docker-compose ноды "
+                "не найден — добавьте в него вручную: - /dev/shm:/dev/shm")
+        result = patch_compose_volume(compose_path, SHM_VOLUME)
+        if result == "added":
+            console.print(f"[green]✓ /dev/shm добавлен в {compose_path}[/green]")
+            compose_changed = True
+        elif result != "exists":
+            raise RuntimeError(f"не удалось добавить /dev/shm в {compose_path}: "
+                               f"{result}")
+    else:
+        console.print("[green]✓ /dev/shm уже примонтирован в контейнер[/green]")
+
+    # 4. Порт QUIC
+    if shutil.which("ufw") and probe(["ufw", "status"]).stdout.count("Status: active"):
+        run(["ufw", "allow", HYSTERIA_PORT], check=False)
+        console.print(f"[green]✓ Открыт порт {HYSTERIA_PORT}[/green]")
+    else:
+        console.print(f"[yellow]UFW неактивен — откройте {HYSTERIA_PORT} "
+                      "самостоятельно.[/yellow]")
+
+    # 5. Сертификаты в tmpfs + расписание обновления
+    certs_changed = _sync_hysteria_certs(domain)
+    _hysteria_cron(domain)
+
+    # 6. Перезапуск нужен, только если что-то поменялось
+    if compose_changed:
+        recreate_node(compose_path)
+    elif certs_changed:
+        console.print("[cyan]Перезапускаю контейнер (сертификаты обновлены)…[/cyan]")
+        run(["docker", "restart", "remnanode"], check=False)
+    else:
+        console.print("[green]✓ Перезапуск не требуется[/green]")
+
+    console.print(
+        "[bold yellow]Важно:[/bold yellow] серверная часть готова, но сам "
+        "inbound Hysteria2 включается в панели Remnawave — добавьте его в "
+        "конфиг ноды, создайте Host и внесите inbound в Squad. Пути к "
+        f"сертификатам внутри контейнера: {HYSTERIA_CERT}, {HYSTERIA_KEY}.")
+
+
+def ask_hysteria_domain() -> str | None:
+    """Домен спрашиваем заранее, только если их несколько."""
+    domains = letsencrypt_domains()
+    if not domains:
+        console.print(f"[yellow]В {LETSENCRYPT_LIVE} не найдено сертификатов — "
+                      "блок Hysteria2 сообщит об этом при выполнении.[/yellow]")
+        return None
+    if len(domains) == 1:
+        return domains[0]
+    choice = questionary.select(
+        "Домен, чьим сертификатом будет пользоваться Hysteria2:",
+        choices=domains, style=CUSTOM_STYLE).ask()
+    return choice
 
 
 # ------------------------------------------------------------------ #
@@ -1588,6 +1732,7 @@ BLOCKS = [
     ("network", "Сеть: conntrack + sysctl (BBR, буферы, очереди)", block_network),
     ("remnanode_logs", "Логи remnanode: каталог + logrotate + volume в docker-compose", block_remnanode_logs),
     ("node_update", "Обновление remnanode (docker compose pull + пересоздание)", block_node_update),
+    ("hysteria", "Hysteria2 (QUIC): сертификаты в /dev/shm + 443/udp + автообновление", block_hysteria),
     ("torrent", "Блокировка торрентов (tblocker + egress-фильтр + конфиг панели)", block_torrent),
     ("trafficguard", "TrafficGuard-auto: защита от сканеров и ботов (rknpidor)", block_trafficguard),
 ]
@@ -1603,6 +1748,11 @@ BLOCKS = [
 # система не обновлялась, хотя пакеты ставились.
 INSTALLS_PACKAGES = {"packages", "node_install", "fail2ban", "ufw",
                      "time_cron", "torrent", "trafficguard"}
+
+# Блоки, которые по умолчанию идут БЕЗ галочки, даже если ещё не настроены.
+# Hysteria2 — дополнительный транспорт: он нужен не всем, требует сертификата
+# и ручной настройки inbound'а в панели, поэтому включается осознанно.
+DEFAULT_OFF = {"hysteria"}
 
 
 # ================================================================== #
@@ -1650,6 +1800,13 @@ def _detect_remnanode_logs() -> bool:
             and os.path.isdir("/var/log/remnanode"))
 
 
+def _detect_hysteria() -> bool:
+    if not (os.path.isfile(HYSTERIA_CERT) and os.path.isfile(HYSTERIA_KEY)):
+        return False
+    cr = probe(["crontab", "-l"])
+    return cr.returncode == 0 and HYSTERIA_CERT in cr.stdout
+
+
 def _detect_torrent() -> bool:
     return _pkg_installed("tblocker") and os.path.isfile("/opt/tblocker/config.yaml")
 
@@ -1666,6 +1823,7 @@ DETECTORS = {
     "network":        _detect_network,
     "time_cron":      _detect_time_cron,
     "remnanode_logs": _detect_remnanode_logs,
+    "hysteria":       _detect_hysteria,
     "torrent":        _detect_torrent,
     "trafficguard":   _detect_trafficguard,
 }
@@ -1846,10 +2004,13 @@ def menu_remnawave_node() -> None:
             # 'absent' и 'latest' — пункт не показываем
             continue
         is_applied = applied.get(key, False)
+        suffix = "   [уже настроено]" if is_applied else ""
+        if key in DEFAULT_OFF and not is_applied:
+            suffix = "   [по умолчанию выкл]"
         choices.append(questionary.Choice(
-            title=label + ("   [уже настроено]" if is_applied else ""),
+            title=label + suffix,
             value=key,
-            checked=not is_applied,
+            checked=not is_applied and key not in DEFAULT_OFF,
         ))
         shown_keys.append(key)
 
@@ -1869,7 +2030,12 @@ def menu_remnawave_node() -> None:
         if node_params is None:
             selected = [k for k in selected if k != "node_install"]
 
-    # 4. Расписание перезагрузки — только если выбран блок cron
+    # 4. Домен для Hysteria2 — только если выбран этот блок
+    hysteria_domain: str | None = None
+    if "hysteria" in selected:
+        hysteria_domain = ask_hysteria_domain()
+
+    # 5. Расписание перезагрузки — только если выбран блок cron
     reboot_schedule = "daily"
     if "time_cron" in selected:
         reboot_schedule = ask_reboot_schedule()
@@ -1962,6 +2128,8 @@ def menu_remnawave_node() -> None:
                 func(extra_ports)
             elif key == "node_install":
                 func(node_params)
+            elif key == "hysteria":
+                func(hysteria_domain)
             elif key == "remnanode_logs":
                 func(compose_path)
             elif key == "node_update":
@@ -2225,9 +2393,16 @@ def _gdrive_run(folder_id: str, days: str, dry_run: bool) -> None:
                       "см. сообщения выше.[/yellow]")
 
 
-def _crontab_replace_block(marker: str, lines: list[str]) -> None:
+def _crontab_replace_block(marker: str, lines: list[str], *, drop=None) -> None:
     """Заменяет в crontab root блок, помеченный marker, сохраняя все остальные
-    задачи. lines пустой — блок просто удаляется."""
+    задачи. lines пустой — блок просто удаляется.
+
+    drop — необязательный предикат для удаления старых записей вне блока
+    (миграция с прежних форматов).
+
+    Блоком считается строка-маркер и всё до пустой строки или следующего
+    комментария: раньше удалялась ровно одна строка после маркера, и блок из
+    двух задач (сертификаты Hysteria2) чистился наполовину."""
     ensure_packages("cron")
     if shutil.which("crontab") is None:
         raise RuntimeError("команда crontab не найдена (нужен пакет cron)")
@@ -2236,15 +2411,29 @@ def _crontab_replace_block(marker: str, lines: list[str]) -> None:
     existing = res.stdout.splitlines() if res.returncode == 0 else []
 
     kept: list[str] = []
-    skip_next = False
+    in_block = False
     for ln in existing:
-        if ln.strip() == marker:
-            skip_next = True      # следующая строка — задача этого блока
+        s = ln.strip()
+        if s == marker:
+            in_block = True
             continue
-        if skip_next:
-            skip_next = False
+        if in_block:
+            if not s or s.startswith("#"):
+                in_block = False      # блок кончился, строку обрабатываем ниже
+            else:
+                continue
+        if drop is not None and drop(ln):
             continue
         kept.append(ln)
+
+    # Схлопываем подряд идущие пустые строки: снятие блока оставляло за собой
+    # пустую строку-разделитель, и при нескольких правках их копилось всё больше
+    collapsed: list[str] = []
+    for ln in kept:
+        if not ln.strip() and collapsed and not collapsed[-1].strip():
+            continue
+        collapsed.append(ln)
+    kept = collapsed
 
     while kept and not kept[-1].strip():
         kept.pop()
