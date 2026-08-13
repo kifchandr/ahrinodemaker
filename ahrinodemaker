@@ -28,6 +28,11 @@ APP_NAME = "AhriNode tool"
 # Volume, который нужно добавить в docker-compose.yml ноды
 REMNANODE_VOLUME = "/var/log/remnanode:/var/log/remnanode"
 
+# Каталог логов ноды на хосте и файлы, которые в него пишет xray.
+# access.log читает tblocker, оба ротирует logrotate.
+NODE_LOG_DIR = "/var/log/remnanode"
+NODE_LOG_FILES = ("access.log", "error.log")
+
 # Пути для блока блокировки торрентов
 TBLOCKER_DIR = "/opt/tblocker"
 INSTALL_DIR  = "/opt/remnanode"
@@ -844,9 +849,8 @@ def recreate_node(compose_path: str) -> None:
 
 def block_remnanode_logs(compose_path: str | None) -> None:
     step("Логи remnanode: каталог + logrotate + docker volume")
-    # 1. Каталог под логи
-    os.makedirs("/var/log/remnanode", exist_ok=True)
-    console.print("[green]✓ Каталог /var/log/remnanode готов[/green]")
+    # 1. Каталог и файлы логов (та же подготовка, что и при установке ноды)
+    prepare_node_logs()
     # 2. logrotate
     logrotate_conf = """/var/log/remnanode/*.log {
     su root root
@@ -906,7 +910,34 @@ NODE_COMPOSE_TEMPLATE = """services:
     environment:
       - NODE_PORT=__PORT__
       - SECRET_KEY=__SECRET__
+    volumes:
+      - "__LOG_VOLUME__"
 """
+
+
+def prepare_node_logs() -> None:
+    """Создаёт каталог и файлы логов ноды на хосте.
+
+    Без существующих файлов tblocker не за чем следить, а logrotate нечего
+    ротировать: xray создаёт их сам только когда в панели включено логирование,
+    и до первого запроса каталог остаётся пустым."""
+    os.makedirs(NODE_LOG_DIR, exist_ok=True)
+    created = []
+    for name in NODE_LOG_FILES:
+        path = os.path.join(NODE_LOG_DIR, name)
+        if os.path.exists(path):
+            continue
+        # Режим "a", а не "w": существующий лог не должен обнуляться, даже
+        # если проверка выше когда-нибудь окажется гонкой.
+        with open(path, "a", encoding="utf-8"):
+            pass
+        os.chmod(path, 0o644)
+        created.append(name)
+    if created:
+        console.print(f"[green]✓ Созданы файлы логов: "
+                      f"{', '.join(created)} в {NODE_LOG_DIR}[/green]")
+    else:
+        console.print(f"[green]✓ Файлы логов уже есть в {NODE_LOG_DIR}[/green]")
 
 
 def _ensure_docker() -> None:
@@ -951,9 +982,14 @@ def block_node_install(params: tuple[str, str] | None = None) -> None:
 
     _ensure_docker()
 
+    # Каталог и файлы логов готовим ДО старта контейнера: если примонтировать
+    # несуществующий путь, Docker создаст на хосте каталог вместо файла.
+    prepare_node_logs()
+
     compose = (NODE_COMPOSE_TEMPLATE
                .replace("__PORT__", node_port)
-               .replace("__SECRET__", secret_key))
+               .replace("__SECRET__", secret_key)
+               .replace("__LOG_VOLUME__", REMNANODE_VOLUME))
     # 0600: в файле лежит SECRET_KEY панели
     write_file(NODE_COMPOSE_PATH, compose, mode=0o600)
     console.print(f"[green]✓ Конфигурация записана: {NODE_COMPOSE_PATH}[/green]")
@@ -1279,8 +1315,9 @@ def block_torrent() -> None:
     if shutil.which("nft") is None:
         run(["apt-get", "install", "-y", "nftables"])
 
-    # tblocker читает access.log — каталог должен существовать
-    os.makedirs("/var/log/remnanode", exist_ok=True)
+    # tblocker читает access.log — каталог и сам файл должны существовать,
+    # иначе служба стартует, но следить ей не за чем
+    prepare_node_logs()
 
     # dpkg -l возвращает 0 и для удалённого пакета с оставшимися конфигами (rc),
     # поэтому используем ту же строгую проверку, что и детекторы.

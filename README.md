@@ -48,7 +48,7 @@ sudo curl -fsSL https://raw.githubusercontent.com/kifchandr/ahrinodemaker/main/a
 | Блок | Что делает |
 |---|---|
 | Установка пакетов | `fail2ban`, `ufw`, `unattended-upgrades`, `cron`, `psmisc`; включает автообновления безопасности |
-| Установка Remnawave Node | ставит Docker, спрашивает `SECRET_KEY` и порт (по умолчанию 2222), создаёт `/opt/remnanode/docker-compose.yml` и поднимает контейнер. Пункт появляется, **только если ноды на сервере нет** |
+| Установка Remnawave Node | ставит Docker, спрашивает `SECRET_KEY` и порт (по умолчанию 2222), создаёт `/opt/remnanode/docker-compose.yml` (сразу с volume для логов), готовит `/var/log/remnanode/{access,error}.log` и поднимает контейнер. Пункт появляется, **только если ноды на сервере нет** |
 | Часовой пояс + cron | `Europe/Moscow` и автоперезагрузка в 03:00 — ежедневно или по понедельникам (на выбор) |
 | Fail2Ban | jail `sshd`: 5 попыток за 10 минут, бан на 12 часов |
 | UFW | входящие запрещены, исходящие разрешены, `limit ssh`, открыты 80/443/8443/9999, порт 2222 — только с адреса панели; можно добавить свои порты |
@@ -75,6 +75,8 @@ sudo curl -fsSL https://raw.githubusercontent.com/kifchandr/ahrinodemaker/main/a
 - `/opt/tblocker/config.yaml`
 - `/opt/remnanode/docker-compose.yml` — только при установке ноды. Содержит
   `SECRET_KEY`, поэтому создаётся с правами `0600`
+- `/var/log/remnanode/access.log`, `/var/log/remnanode/error.log` — пустые файлы
+  под логи ноды. Существующие логи не перезаписываются
 
 Перед перезаписью существующего файла создаётся копия `<файл>.bak-<дата>`, запись
 атомарная. Если содержимое уже нужное — файл не трогается и копия не плодится.
