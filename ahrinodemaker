@@ -839,6 +839,13 @@ def block_remnanode_logs(compose_path: str | None) -> None:
     console.print("[green]✓ /etc/logrotate.d/remnanode записан[/green]")
     # 3. Volume в docker-compose.yml ноды
     if not compose_path:
+        # Путь спрашивается до выполнения блоков, а нода могла быть установлена
+        # только что блоком node_install — тогда compose появился уже после.
+        found = find_compose_candidates()
+        if found:
+            compose_path = found[0]
+            console.print(f"[green]Найден docker-compose ноды:[/green] {compose_path}")
+    if not compose_path:
         console.print("[yellow]docker-compose.yml ноды не задан — volume не добавлен.[/yellow]")
         return
     result = patch_compose_volume(compose_path)
@@ -849,6 +856,123 @@ def block_remnanode_logs(compose_path: str | None) -> None:
         recreate_node(compose_path)
     else:
         console.print(f"[yellow]Не удалось обновить {compose_path}: {result}[/yellow]")
+
+
+# ------------------------------------------------------------------ #
+# Установка ноды (docker + docker-compose.yml + запуск контейнера)
+# ------------------------------------------------------------------ #
+NODE_COMPOSE_PATH = f"{INSTALL_DIR}/docker-compose.yml"
+NODE_DEFAULT_PORT = "2222"
+
+NODE_COMPOSE_TEMPLATE = """services:
+  remnanode:
+    container_name: remnanode
+    hostname: remnanode
+    image: remnawave/node:latest
+    network_mode: host
+    restart: always
+    cap_add:
+      - NET_ADMIN
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    environment:
+      - NODE_PORT=__PORT__
+      - SECRET_KEY=__SECRET__
+"""
+
+
+def _ensure_docker() -> None:
+    """Ставит Docker вместе с плагином compose, если его нет."""
+    if shutil.which("docker") and probe(["docker", "compose", "version"]).returncode == 0:
+        console.print("[green]✓ Docker уже установлен[/green]")
+        return
+
+    console.print("[cyan]Устанавливаю Docker…[/cyan]")
+    ensure_packages("curl", "ca-certificates")
+    # Официальный установщик Docker. Единственная внешняя загрузка в этом
+    # блоке: раскладку репозиториев под каждый дистрибутив он делает сам.
+    with tempfile.TemporaryDirectory(prefix="get-docker-") as tmpdir:
+        script = os.path.join(tmpdir, "get-docker.sh")
+        _download("https://get.docker.com", script, timeout=60)
+        run(["sh", script])
+
+    run(["systemctl", "enable", "--now", "docker"], check=False)
+    if not shutil.which("docker"):
+        raise RuntimeError("Docker не установился — проверьте вывод выше")
+    if probe(["docker", "compose", "version"]).returncode != 0:
+        raise RuntimeError("Docker установлен, но плагин `docker compose` "
+                           "недоступен — обновление и запуск ноды невозможны")
+    console.print("[green]✓ Docker установлен[/green]")
+
+
+def block_node_install(params: tuple[str, str] | None = None) -> None:
+    step("Установка Remnawave Node")
+
+    if params is None:
+        console.print("[yellow]Не заданы SECRET_KEY и порт — установка "
+                      "пропущена.[/yellow]")
+        return
+    secret_key, node_port = params
+
+    # Подстраховка: пункт показывается только когда ноды нет, но за время
+    # работы скрипта её мог поставить кто-то ещё. Чужой конфиг не перезаписываем.
+    if os.path.isfile(NODE_COMPOSE_PATH):
+        console.print(f"[yellow]{NODE_COMPOSE_PATH} уже существует — установка "
+                      "пропущена, чтобы не затереть рабочую конфигурацию.[/yellow]")
+        return
+
+    _ensure_docker()
+
+    compose = (NODE_COMPOSE_TEMPLATE
+               .replace("__PORT__", node_port)
+               .replace("__SECRET__", secret_key))
+    # 0600: в файле лежит SECRET_KEY панели
+    write_file(NODE_COMPOSE_PATH, compose, mode=0o600)
+    console.print(f"[green]✓ Конфигурация записана: {NODE_COMPOSE_PATH}[/green]")
+
+    base = compose_base(NODE_COMPOSE_PATH)
+    if base is None:
+        raise RuntimeError("docker compose недоступен — контейнер не запущен")
+    run(base + ["pull"])
+    run(base + ["up", "-d", "--remove-orphans"])
+
+    running = probe(["docker", "inspect", "-f", "{{.State.Running}}", "remnanode"])
+    if running.stdout.strip() == "true":
+        console.print(f"[green]✓ Нода запущена на порту {node_port}[/green]")
+    else:
+        console.print("[yellow]Контейнер remnanode не в состоянии running. "
+                      "Проверьте: docker logs remnanode[/yellow]")
+
+    console.print("[bold]Не забудьте:[/bold] открыть порт "
+                  f"{node_port} для адреса панели (блок «Настройка UFW» делает "
+                  "это для порта 2222).")
+
+
+def ask_node_install_params() -> tuple[str, str] | None:
+    """Спрашивает SECRET_KEY и порт до начала выполнения — как и остальные
+    параметры, чтобы установка дальше шла без вопросов."""
+    secret = questionary.text(
+        "SECRET_KEY ноды (скопируйте из панели Remnawave):",
+        default="", style=CUSTOM_STYLE).ask()
+    if secret is None or not secret.strip():
+        console.print("[yellow]SECRET_KEY не задан — установка ноды будет "
+                      "пропущена.[/yellow]")
+        return None
+    secret = secret.strip()
+
+    port = questionary.text(
+        f"Порт ноды (Enter — {NODE_DEFAULT_PORT}):",
+        default=NODE_DEFAULT_PORT, style=CUSTOM_STYLE).ask()
+    if port is None:
+        return None
+    port = port.strip() or NODE_DEFAULT_PORT
+    if not port.isdigit() or not 1 <= int(port) <= 65535:
+        console.print(f"[red]Некорректный порт «{port}» — установка ноды "
+                      "пропущена.[/red]")
+        return None
+    return (secret, port)
 
 
 # ------------------------------------------------------------------ #
@@ -1279,6 +1403,9 @@ def block_trafficguard() -> None:
 # бинарники появляются только после установки пакетов.
 BLOCKS = [
     ("packages", "Установка пакетов (fail2ban, ufw, unattended-upgrades, cron)", block_packages),
+    # Стоит до remnanode_logs и node_update: они работают с docker-compose.yml,
+    # который появляется только после установки.
+    ("node_install", "Установка Remnawave Node (docker + compose + запуск)", block_node_install),
     ("time_cron", f"Часовой пояс {TIMEZONE} + cron (перезагрузка по расписанию)", block_time_cron),
     ("fail2ban", "Настройка Fail2Ban", block_fail2ban),
     ("ufw", "Настройка UFW (firewall)", block_ufw),
@@ -1512,6 +1639,13 @@ def menu_remnawave_node() -> None:
     shown_keys: list[str] = []
     choices = []
     for key, label, _ in BLOCKS:
+        if key == "node_install":
+            # Пункт нужен только когда ноды на сервере нет: 'absent' означает,
+            # что docker-compose ноды не найден либо в нём нет образа.
+            if node_status == "absent" and not find_compose_candidates():
+                choices.append(questionary.Choice(label, value=key, checked=True))
+                shown_keys.append(key)
+            continue
         if key == "node_update":
             if node_status == "update":
                 choices.append(questionary.Choice(label, value=key, checked=True))
@@ -1540,7 +1674,14 @@ def menu_remnawave_node() -> None:
         console.print("[yellow]Ничего не выбрано — возврат в главное меню.[/yellow]")
         return
 
-    # 3. Расписание перезагрузки — только если выбран блок cron
+    # 3. Параметры установки ноды — спрашиваем до выполнения
+    node_params: tuple[str, str] | None = None
+    if "node_install" in selected:
+        node_params = ask_node_install_params()
+        if node_params is None:
+            selected = [k for k in selected if k != "node_install"]
+
+    # 4. Расписание перезагрузки — только если выбран блок cron
     reboot_schedule = "daily"
     if "time_cron" in selected:
         reboot_schedule = ask_reboot_schedule()
@@ -1579,9 +1720,16 @@ def menu_remnawave_node() -> None:
         console.print(f"[bold]Перезагрузка:[/bold] {schedule_human} (МСК)")
     if extra_ports:
         console.print(f"[bold]Доп. порты UFW:[/bold] {', '.join(extra_ports)}")
+    if node_params:
+        # SECRET_KEY не печатаем целиком — он уходит в лог терминала и в скроллбек
+        console.print(f"[bold]Установка ноды:[/bold] порт {node_params[1]}, "
+                      f"SECRET_KEY указан ([dim]…{node_params[0][-4:]}[/dim])")
     if "remnanode_logs" in selected:
         if compose_path:
             console.print(f"[bold]docker-compose ноды:[/bold] {compose_path}")
+        elif "node_install" in selected:
+            console.print(f"[bold]docker-compose ноды:[/bold] {NODE_COMPOSE_PATH} "
+                          "[dim](будет создан установкой ноды)[/dim]")
         else:
             console.print("[bold]docker-compose ноды:[/bold] [dim]не задан (volume будет пропущен)[/dim]")
 
@@ -1618,6 +1766,8 @@ def menu_remnawave_node() -> None:
         try:
             if key == "ufw":
                 func(extra_ports)
+            elif key == "node_install":
+                func(node_params)
             elif key == "remnanode_logs":
                 func(compose_path)
             elif key == "node_update":
