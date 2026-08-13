@@ -504,14 +504,27 @@ def block_fail2ban() -> None:
 
     # Служба может стартовать и тут же упасть из-за неверного фильтра —
     # проверяем, что jail действительно поднялся, а не просто «команда прошла».
-    # fail2ban-client отвечает не мгновенно после restart, поэтому даём время.
-    for _ in range(5):
-        status = probe(["fail2ban-client", "status", "sshd"])
-        if status.returncode == 0:
-            console.print("[green]✓ Fail2Ban настроен, jail sshd активен[/green]")
+    #
+    # Юнит fail2ban — Type=simple, поэтому `systemctl restart` возвращает
+    # управление до того, как демон создаст /var/run/fail2ban/fail2ban.sock.
+    # Сразу после restart клиент отвечает «Failed to access socket path… Is
+    # fail2ban running?», хотя служба в порядке, — ждём готовности сокета.
+    for attempt in range(15):
+        if probe(["fail2ban-client", "ping"]).returncode == 0:
+            jail = probe(["fail2ban-client", "status", "sshd"])
+            if jail.returncode == 0:
+                console.print("[green]✓ Fail2Ban настроен, jail sshd активен[/green]")
+                return
+            console.print("[yellow]Fail2Ban работает, но jail sshd не найден:"
+                          f"[/yellow]\n{(jail.stderr or jail.stdout or '').strip()}")
             return
+        # Если служба уже упала, ждать готовности сокета бессмысленно
+        if attempt >= 2 and probe(["systemctl", "is-active", "--quiet",
+                                   "fail2ban"]).returncode != 0:
+            break
         time.sleep(1)
-    console.print("[yellow]Fail2Ban запущен, но jail sshd не отвечает:[/yellow]\n"
+
+    console.print("[yellow]Fail2Ban не отвечает после запуска:[/yellow]\n"
                   + (service_diagnostics("fail2ban", 15) or "нет данных в журнале"))
 
 
