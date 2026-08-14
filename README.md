@@ -56,6 +56,7 @@ sudo curl -fsSL https://raw.githubusercontent.com/kifchandr/ahrinodemaker/main/a
 | Логи remnanode | каталог `/var/log/remnanode`, ротация через logrotate, добавление volume в `docker-compose.yml` ноды. Пункт для нод, установленных **не этим скриптом**: при установке ноды отсюда всё это уже сделано, и пункт скрывается |
 | Обновление remnanode | `docker compose pull` + пересоздание контейнера. Пункт появляется, только если образ устарел или версию не удалось проверить |
 | Hysteria2 (QUIC) | при отсутствии сертификата выпускает его через certbot, монтирует `/dev/shm` в контейнер, кладёт туда сертификаты, открывает `443/udp`, заводит cron на их обновление и генерирует заготовку inbound'а для панели. **По умолчанию выключен** |
+| WARP | поднимает контейнер `caomingjun/warp` с SOCKS5 на `127.0.0.1:40000`, дожидается туннеля и генерирует outbound + правило маршрутизации для панели. Нужен, когда сервис режет IP дата-центров: Gemini, ChatGPT, Spotify. **По умолчанию выключен** |
 | Блокировка торрентов | `tblocker` + резервный egress-фильтр на nftables (порты 6881–6889, 51413) + справка по настройке панели |
 | TrafficGuard-auto | установка [TrafficGuard-auto](https://github.com/DonMatteoVPN/TrafficGuard-auto) — защита от сканеров и ботов, меню `rknpidor` |
 
@@ -91,6 +92,8 @@ ZeroSSL или Google Trust Services. Последним двум нужны EAB
 - `/opt/remnanode/apply-torrent-egress-filter.sh`, `/opt/remnanode/panel-torrent-block-config.json`
 - `/opt/remnanode/panel-hysteria-inbound.json` — заготовка inbound'а Hysteria2
   с подставленным доменом, для вставки в конфиг ноды через панель
+- `/opt/warp/docker-compose.yml` и `/opt/remnanode/panel-warp-outbound.json` —
+  только при включении WARP
 - `/opt/tblocker/config.yaml`
 - `/opt/remnanode/docker-compose.yml` — только при установке ноды. Содержит
   `SECRET_KEY`, поэтому создаётся с правами `0600`

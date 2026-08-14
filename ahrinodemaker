@@ -1600,6 +1600,157 @@ def ask_hysteria_params() -> tuple[str, dict | None] | None:
 
 
 # ------------------------------------------------------------------ #
+# WARP: чистый egress для сервисов, режущих IP дата-центров
+# ------------------------------------------------------------------ #
+# Нейросети, Spotify и часть стримингов блокируют адреса хостингов. WARP даёт
+# ноде второй выход в интернет через Cloudflare, и в панели можно направить
+# туда только нужные домены — остальной трафик продолжает идти напрямую.
+#
+# Взят вариант с отдельным контейнером, отдающим SOCKS5 на localhost, а не
+# wireguard-outbound внутри Xray: тот требует вычислять поле reserved из
+# client_id аккаунта WARP, и при неверном значении хэндшейк молча висит.
+# Контейнер держит туннель сам и переживает перезапуск ноды.
+WARP_DIR = "/opt/warp"
+WARP_SOCKS_PORT = 40000
+WARP_CONTAINER = "warp"
+
+WARP_COMPOSE = f"""services:
+  warp:
+    image: caomingjun/warp
+    container_name: {WARP_CONTAINER}
+    restart: always
+    ports:
+      - "127.0.0.1:{WARP_SOCKS_PORT}:1080"
+    environment:
+      - WARP_SLEEP=2
+    cap_add:
+      - NET_ADMIN
+    sysctls:
+      - net.ipv4.conf.all.src_valid_mark=1
+    volumes:
+      - ./data:/var/lib/cloudflare-warp
+"""
+
+# Домены, которые имеет смысл выпускать через WARP. Список — отправная точка,
+# править его удобнее в панели: он попадает в справку, а не в код ноды.
+WARP_DOMAINS = [
+    "geosite:openai",
+    "domain:chatgpt.com",
+    "domain:oaistatic.com",
+    "domain:gemini.google.com",
+    "domain:generativelanguage.googleapis.com",
+    "domain:aistudio.google.com",
+    "domain:claude.ai",
+    "domain:anthropic.com",
+    "domain:perplexity.ai",
+    "domain:spotify.com",
+    "domain:scdn.co",
+]
+
+
+def _warp_socks_address() -> str:
+    """Адрес SOCKS-прокси с точки зрения контейнера ноды.
+
+    При network_mode: host контейнер видит localhost хоста напрямую. В обычной
+    docker-сети 127.0.0.1 указывал бы внутрь самого контейнера ноды, поэтому
+    нужен адрес шлюза docker0."""
+    mode = probe(["docker", "inspect", "-f", "{{.HostConfig.NetworkMode}}",
+                  "remnanode"]).stdout.strip()
+    if mode == "host":
+        return "127.0.0.1"
+    gw = probe(["docker", "network", "inspect", "bridge", "-f",
+                "{{range .IPAM.Config}}{{.Gateway}}{{end}}"]).stdout.strip()
+    return gw or "172.17.0.1"
+
+
+def warp_outbound_reference(socks_address: str) -> str:
+    """Outbound и правило маршрутизации для вставки в Config Profile панели."""
+    return json.dumps({
+        "outboundToAdd": {
+            "tag": "warp",
+            "protocol": "socks",
+            "settings": {
+                "servers": [{"address": socks_address, "port": WARP_SOCKS_PORT}]
+            },
+        },
+        "routingRuleToAdd": {
+            "type": "field",
+            "outboundTag": "warp",
+            "domain": WARP_DOMAINS,
+        },
+        "_note": (
+            "Правило добавляйте ВЫШЕ правила, отправляющего трафик в DIRECT: "
+            "маршрутизация Xray выбирает первое совпавшее. Host в панели для "
+            "WARP не нужен — это внутренний выход ноды, клиенту он не виден."
+        ),
+    }, indent=2, ensure_ascii=False) + "\n"
+
+
+def _warp_check() -> tuple[bool, str]:
+    """Проверяет, что через SOCKS виден чистый адрес Cloudflare."""
+    r = probe(["curl", "-x", f"socks5://127.0.0.1:{WARP_SOCKS_PORT}", "-s",
+               "--max-time", "10", "https://www.cloudflare.com/cdn-cgi/trace"])
+    if r.returncode != 0 or not r.stdout:
+        return False, ""
+    warp_on = any(line.strip() in ("warp=on", "warp=plus")
+                  for line in r.stdout.splitlines())
+    ip = ""
+    for line in r.stdout.splitlines():
+        if line.startswith("ip="):
+            ip = line.split("=", 1)[1].strip()
+    return warp_on, ip
+
+
+def block_warp() -> None:
+    step("WARP: чистый egress для нейросетей и стримингов")
+
+    if shutil.which("docker") is None:
+        raise RuntimeError("Docker не установлен — сначала установите ноду")
+    ensure_packages("curl")
+
+    os.makedirs(WARP_DIR, exist_ok=True)
+    compose_path = f"{WARP_DIR}/docker-compose.yml"
+    write_file(compose_path, WARP_COMPOSE)
+    console.print(f"[green]✓ Конфигурация записана: {compose_path}[/green]")
+
+    base = compose_base(compose_path)
+    if base is None:
+        raise RuntimeError("docker compose недоступен — контейнер WARP не запущен")
+    run(base + ["pull"], check=False)
+    run(base + ["up", "-d"])
+
+    # Контейнеру нужно зарегистрироваться в Cloudflare — это не мгновенно
+    console.print("[cyan]Жду, пока WARP поднимет туннель…[/cyan]")
+    ok, ip = False, ""
+    for _ in range(24):          # до двух минут
+        ok, ip = _warp_check()
+        if ok:
+            break
+        time.sleep(5)
+
+    if not ok:
+        logs = probe(["docker", "logs", "--tail", "20", WARP_CONTAINER]).stdout
+        raise RuntimeError(
+            "WARP не поднялся за две минуты — трафик через него пойти не может.\n"
+            f"  Последние строки журнала контейнера:\n{logs.strip() or '  (пусто)'}")
+
+    console.print(f"[green]✓ WARP работает, внешний адрес: {ip or 'неизвестен'}[/green]")
+
+    socks_address = _warp_socks_address()
+    ref_path = f"{INSTALL_DIR}/panel-warp-outbound.json"
+    os.makedirs(INSTALL_DIR, exist_ok=True)
+    write_file(ref_path, warp_outbound_reference(socks_address))
+    console.print(f"[green]✓ Заготовка для панели: {ref_path}[/green]")
+    console.print(f"[dim]Адрес SOCKS для ноды: {socks_address}:{WARP_SOCKS_PORT} "
+                  "(определён по сетевому режиму контейнера ноды)[/dim]")
+
+    console.print(
+        "[bold yellow]Важно:[/bold yellow] серверная часть готова. В панели "
+        f"Remnawave добавьте в Config Profile outbound и правило из {ref_path}. "
+        "Правило должно стоять ВЫШЕ правила с DIRECT, иначе оно не сработает.")
+
+
+# ------------------------------------------------------------------ #
 # Блокировка торрентов: tblocker + egress-фильтр (nft) + справка панели
 # ------------------------------------------------------------------ #
 # Единый источник правды по портам: раньше список дублировался в bash-скрипте
@@ -1995,6 +2146,7 @@ BLOCKS = [
     ("remnanode_logs", "Логи remnanode: каталог + logrotate + volume в docker-compose", block_remnanode_logs),
     ("node_update", "Обновление remnanode (docker compose pull + пересоздание)", block_node_update),
     ("hysteria", "Hysteria2 (QUIC): сертификаты в /dev/shm + 443/udp + автообновление", block_hysteria),
+    ("warp", "WARP: чистый egress для нейросетей (Gemini, ChatGPT) и стримингов", block_warp),
     ("torrent", "Блокировка торрентов (tblocker + egress-фильтр + конфиг панели)", block_torrent),
     ("trafficguard", "TrafficGuard-auto: защита от сканеров и ботов (rknpidor)", block_trafficguard),
 ]
@@ -2014,7 +2166,7 @@ INSTALLS_PACKAGES = {"packages", "node_install", "fail2ban", "ufw",
 # Блоки, которые по умолчанию идут БЕЗ галочки, даже если ещё не настроены.
 # Hysteria2 — дополнительный транспорт: он нужен не всем, требует сертификата
 # и ручной настройки inbound'а в панели, поэтому включается осознанно.
-DEFAULT_OFF = {"hysteria"}
+DEFAULT_OFF = {"hysteria", "warp"}
 
 
 # ================================================================== #
@@ -2069,6 +2221,11 @@ def _detect_hysteria() -> bool:
     return cr.returncode == 0 and HYSTERIA_CERT in cr.stdout
 
 
+def _detect_warp() -> bool:
+    r = probe(["docker", "inspect", "-f", "{{.State.Running}}", WARP_CONTAINER])
+    return r.returncode == 0 and r.stdout.strip() == "true"
+
+
 def _detect_torrent() -> bool:
     return _pkg_installed("tblocker") and os.path.isfile("/opt/tblocker/config.yaml")
 
@@ -2086,6 +2243,7 @@ DETECTORS = {
     "time_cron":      _detect_time_cron,
     "remnanode_logs": _detect_remnanode_logs,
     "hysteria":       _detect_hysteria,
+    "warp":           _detect_warp,
     "torrent":        _detect_torrent,
     "trafficguard":   _detect_trafficguard,
 }
