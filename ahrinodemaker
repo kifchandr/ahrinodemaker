@@ -1659,11 +1659,16 @@ WARP_DOMAINS = [
     "domain:aistudio.google.com",
     "domain:notebooklm.google.com",
     "domain:generativelanguage.googleapis.com",
+    # accounts.google.com обязателен для консистентности сессии, но учтите:
+    # через WARP пойдут ВСЕ входы в Google, включая YouTube и почту.
     "domain:accounts.google.com",
     "domain:apis.google.com",
     "domain:clients6.google.com",
     "domain:googleusercontent.com",
-    "domain:gstatic.com",
+    # gstatic.com сюда намеренно НЕ входит: это бескуковый CDN статики, к
+    # опознанию сессии он отношения не имеет, зато используется ютубом и
+    # остальными сервисами Google — маршрут через WARP только добавил бы им
+    # задержку.
     # Прочие нейросети
     "domain:claude.ai",
     "domain:anthropic.com",
