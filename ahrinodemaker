@@ -1614,7 +1614,16 @@ WARP_DIR = "/opt/warp"
 WARP_SOCKS_PORT = 40000
 WARP_CONTAINER = "warp"
 
-WARP_COMPOSE = f"""services:
+def warp_compose(license_key: str = "") -> str:
+    """docker-compose для контейнера WARP.
+
+    Бесплатный WARP отдаёт сильно разделяемые адреса, которые Google и OpenAI
+    регулярно помечают как подозрительные. Ключ WARP+ подставляется в
+    WARP_LICENSE_KEY и заметно улучшает положение."""
+    env = ["      - WARP_SLEEP=2"]
+    if license_key:
+        env.append(f"      - WARP_LICENSE_KEY={license_key}")
+    return f"""services:
   warp:
     image: caomingjun/warp
     container_name: {WARP_CONTAINER}
@@ -1622,7 +1631,7 @@ WARP_COMPOSE = f"""services:
     ports:
       - "127.0.0.1:{WARP_SOCKS_PORT}:1080"
     environment:
-      - WARP_SLEEP=2
+{chr(10).join(env)}
     cap_add:
       - NET_ADMIN
     sysctls:
@@ -1633,16 +1642,33 @@ WARP_COMPOSE = f"""services:
 
 # Домены, которые имеет смысл выпускать через WARP. Список — отправная точка,
 # править его удобнее в панели: он попадает в справку, а не в код ноды.
+#
+# ВАЖНО про Google: мало направить в WARP только gemini.google.com. Страница
+# тянет авторизацию и API с соседних доменов, и если они пойдут напрямую, Google
+# увидит в одной сессии два разных адреса — узел и WARP — и покажет
+# «Мы зарегистрировали подозрительный трафик». Поэтому вся сессионная обвязка
+# Google идёт тем же маршрутом, что и сам Gemini.
 WARP_DOMAINS = [
+    # OpenAI / ChatGPT
     "geosite:openai",
     "domain:chatgpt.com",
     "domain:oaistatic.com",
+    "domain:oaiusercontent.com",
+    # Google AI + сессионные домены: порознь их пускать нельзя
     "domain:gemini.google.com",
-    "domain:generativelanguage.googleapis.com",
     "domain:aistudio.google.com",
+    "domain:notebooklm.google.com",
+    "domain:generativelanguage.googleapis.com",
+    "domain:accounts.google.com",
+    "domain:apis.google.com",
+    "domain:clients6.google.com",
+    "domain:googleusercontent.com",
+    "domain:gstatic.com",
+    # Прочие нейросети
     "domain:claude.ai",
     "domain:anthropic.com",
     "domain:perplexity.ai",
+    # Стриминги, режущие адреса хостингов
     "domain:spotify.com",
     "domain:scdn.co",
 ]
@@ -1701,7 +1727,18 @@ def _warp_check() -> tuple[bool, str]:
     return warp_on, ip
 
 
-def block_warp() -> None:
+def ask_warp_license() -> str:
+    """Ключ WARP+ спрашиваем заранее; пустой — бесплатный WARP."""
+    key = questionary.text(
+        "Ключ WARP+ (Enter — бесплатный WARP).\n"
+        "  Бесплатные адреса сильно разделяемые, Google и OpenAI помечают их\n"
+        "  как подозрительные заметно чаще.\n"
+        "  Ключ:",
+        default="", style=CUSTOM_STYLE).ask()
+    return (key or "").strip()
+
+
+def block_warp(license_key: str = "") -> None:
     step("WARP: чистый egress для нейросетей и стримингов")
 
     if shutil.which("docker") is None:
@@ -1710,7 +1747,9 @@ def block_warp() -> None:
 
     os.makedirs(WARP_DIR, exist_ok=True)
     compose_path = f"{WARP_DIR}/docker-compose.yml"
-    write_file(compose_path, WARP_COMPOSE)
+    write_file(compose_path, warp_compose(license_key))
+    if license_key:
+        console.print("[dim]Используется ключ WARP+[/dim]")
     console.print(f"[green]✓ Конфигурация записана: {compose_path}[/green]")
 
     base = compose_base(compose_path)
@@ -2451,6 +2490,8 @@ def menu_remnawave_node() -> None:
             selected = [k for k in selected if k != "node_install"]
 
     # 4. Домен для Hysteria2 — только если выбран этот блок
+    warp_license = ask_warp_license() if "warp" in selected else ""
+
     hysteria_params: tuple[str, dict | None] | None = None
     if "hysteria" in selected:
         hysteria_params = ask_hysteria_params()
@@ -2550,6 +2591,8 @@ def menu_remnawave_node() -> None:
                 func(node_params)
             elif key == "hysteria":
                 func(hysteria_params)
+            elif key == "warp":
+                func(warp_license)
             elif key == "remnanode_logs":
                 func(compose_path)
             elif key == "node_update":
