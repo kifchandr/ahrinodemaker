@@ -3057,6 +3057,8 @@ DANTE_CONF = "/etc/danted.conf"
 DANTE_GROUP = "danteproxy"          # по группе отличаем наших пользователей от системных
 DANTE_DEFAULT_PORT = "1080"
 
+DANTE_MARKER = "# Создано AhriNode tool"
+
 DANTE_CONF_HEADER = """# Создано AhriNode tool
 logoutput: syslog
 user.privileged: root
@@ -3125,6 +3127,18 @@ def _default_iface() -> str:
     out = probe(["ip", "-4", "route", "show", "default"]).stdout
     m = re.search(r"\bdev\s+(\S+)", out)
     return m.group(1) if m else "eth0"
+
+
+def _dante_configured() -> bool:
+    """Наш ли конфиг лежит в /etc/danted.conf.
+
+    Пакет dante-server кладёт собственный образец конфига, с которым служба
+    не стартует, — по одному лишь наличию файла судить нельзя."""
+    try:
+        with open(DANTE_CONF, encoding="utf-8") as f:
+            return DANTE_MARKER in f.read(200)
+    except OSError:
+        return False
 
 
 def _dante_port() -> str:
@@ -3214,13 +3228,29 @@ def _server_ip() -> str:
 def menu_dante() -> None:
     while True:
         console.print()
-        installed = _pkg_installed("dante-server") and os.path.isfile(DANTE_CONF)
+        pkg = _pkg_installed("dante-server")
+        configured = _dante_configured()
+        installed = pkg and configured
         active = probe(["systemctl", "is-active", "--quiet", "danted"]).returncode == 0
         users = _dante_users()
-        state = ("[green]работает[/green]" if active else
-                 "[yellow]установлен, но не запущен[/yellow]" if installed else
-                 "[dim]не установлен[/dim]")
+        if active:
+            state = "[green]работает[/green]"
+        elif pkg and not configured:
+            state = ("[yellow]пакет установлен, но не настроен[/yellow] "
+                     "[dim](в /etc/danted.conf лежит образец из пакета, "
+                     "с ним служба не стартует)[/dim]")
+        elif pkg:
+            state = "[yellow]настроен, но не запущен[/yellow]"
+        else:
+            state = "[dim]не установлен[/dim]"
         console.print(f"[bold]Dante:[/bold] {state}")
+        if pkg and not active:
+            reason = probe(["systemctl", "is-failed", "danted"]).stdout.strip()
+            if reason == "failed":
+                console.print("[dim]Последняя причина отказа: "
+                              + (probe(["systemctl", "show", "danted",
+                                        "-p", "Result", "--value"]).stdout.strip()
+                                 or "неизвестна") + "[/dim]")
         if installed:
             console.print(f"[bold]Порт:[/bold] {_dante_port()}   "
                           f"[bold]Пользователи:[/bold] "
@@ -3232,6 +3262,7 @@ def menu_dante() -> None:
                 questionary.Choice("Установить / перенастроить", value="setup"),
                 questionary.Choice("Добавить пользователя", value="adduser"),
                 questionary.Choice("Удалить пользователя", value="deluser"),
+                questionary.Choice("Запустить / перезапустить", value="start"),
                 questionary.Choice("Параметры подключения", value="info"),
                 questionary.Choice("Проверить работу", value="check"),
                 questionary.Choice("Удалить Dante", value="purge"),
@@ -3305,6 +3336,25 @@ def menu_dante() -> None:
                     continue
                 probe(["userdel", victim])
                 console.print(f"[green]✓ {victim} удалён[/green]")
+
+            elif choice == "start":
+                if not pkg:
+                    console.print("[yellow]Dante не установлен — сначала "
+                                  "выполните установку.[/yellow]")
+                    continue
+                if not configured:
+                    console.print("[yellow]В /etc/danted.conf лежит образец из "
+                                  "пакета — служба с ним не запустится. "
+                                  "Выберите «Установить / перенастроить».[/yellow]")
+                    continue
+                run(["systemctl", "enable", "danted"], check=False)
+                if probe(["systemctl", "restart", "danted"]).returncode == 0 and probe(
+                        ["systemctl", "is-active", "--quiet", "danted"]).returncode == 0:
+                    console.print("[green]✓ Служба danted запущена[/green]")
+                else:
+                    console.print("[red]Не запустилась:[/red]\n"
+                                  + (service_diagnostics("danted")
+                                     or "нет данных в журнале"))
 
             elif choice == "info":
                 if not installed:
