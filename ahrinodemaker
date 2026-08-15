@@ -3151,12 +3151,26 @@ def _dante_port() -> str:
 
 
 def _dante_users() -> list[str]:
-    """Пользователи прокси — участники нашей группы."""
+    """Пользователи прокси — те, у кого наша группа основная или добавочная.
+
+    Одного списка участников из /etc/group мало: useradd -g делает группу
+    ОСНОВНОЙ, а основное членство в /etc/group не записывается. Из-за этого
+    созданные пользователи не отображались, меню показывало «нет», и повторное
+    добавление падало с «user already exists»."""
     r = probe(["getent", "group", DANTE_GROUP])
     if r.returncode != 0:
         return []
-    members = r.stdout.strip().split(":")[-1]
-    return [u for u in members.split(",") if u]
+    parts = r.stdout.strip().split(":")
+    if len(parts) < 4:
+        return []
+    gid = parts[2]
+    users = [u for u in parts[3].split(",") if u]      # добавочное членство
+
+    for line in probe(["getent", "passwd"]).stdout.splitlines():
+        fields = line.split(":")
+        if len(fields) > 3 and fields[3] == gid:       # основная группа
+            users.append(fields[0])
+    return sorted(set(users))
 
 
 def _dante_add_user(name: str, password: str) -> None:
@@ -3173,11 +3187,18 @@ def _dante_add_user(name: str, password: str) -> None:
     if r.returncode != 0:
         raise RuntimeError(f"не удалось создать пользователя: "
                            f"{(r.stderr or '').strip()}")
-    # Пароль передаём через stdin, а не аргументом: аргументы видны в ps
+    try:
+        _dante_set_password(name, password)
+    except RuntimeError:
+        probe(["userdel", name])       # не оставляем учётку без пароля
+        raise
+
+
+def _dante_set_password(name: str, password: str) -> None:
+    """Пароль передаём через stdin: аргументы командной строки видны в ps."""
     chp = subprocess.run(["chpasswd"], input=f"{name}:{password}\n",
                          text=True, capture_output=True)
     if chp.returncode != 0:
-        probe(["userdel", name])
         raise RuntimeError(f"не удалось задать пароль: {(chp.stderr or '').strip()}")
 
 
@@ -3271,6 +3292,7 @@ def menu_dante() -> None:
             choices=[
                 questionary.Choice("Установить / перенастроить", value="setup"),
                 questionary.Choice("Добавить пользователя", value="adduser"),
+                questionary.Choice("Сменить пароль пользователя", value="passwd"),
                 questionary.Choice("Удалить пользователя", value="deluser"),
                 questionary.Choice("Запустить / перезапустить", value="start"),
                 questionary.Choice("Параметры подключения", value="info"),
@@ -3296,7 +3318,7 @@ def menu_dante() -> None:
                     continue
                 raw_allow = questionary.text(
                     "Кому разрешить подключаться. Можно несколько через запятую.\n"
-                    "  Примеры: 109.248.168.27, 10.0.0.0/8\n"
+                    "  Примеры: 203.0.113.10, 10.0.0.0/8\n"
                     "  Enter — всем (0.0.0.0/0). Логин и пароль в SOCKS5 идут\n"
                     "  открытым текстом, поэтому ограничение по адресу — не\n"
                     "  придирка, а основная защита.\n"
@@ -3334,6 +3356,25 @@ def menu_dante() -> None:
                               f"  пароль: [bold]{pwd}[/bold]\n"
                               "[dim]Пароль больше нигде не хранится в открытом "
                               "виде — сохраните его сейчас.[/dim]")
+
+            elif choice == "passwd":
+                if not users:
+                    console.print("[yellow]Пользователей нет.[/yellow]")
+                    continue
+                who = questionary.select("Кому сменить пароль:",
+                                         choices=[*users, "← Отмена"],
+                                         style=CUSTOM_STYLE).ask()
+                if who in (None, "← Отмена"):
+                    continue
+                pwd = questionary.text("Новый пароль (Enter — сгенерировать):",
+                                       default="", style=CUSTOM_STYLE).ask()
+                if pwd is None:
+                    continue
+                pwd = pwd.strip() or secrets.token_urlsafe(15)
+                _dante_set_password(who, pwd)
+                console.print(f"[green]✓ Пароль обновлён[/green]\n"
+                              f"  логин: [bold]{who}[/bold]\n"
+                              f"  пароль: [bold]{pwd}[/bold]")
 
             elif choice == "deluser":
                 users = _dante_users()
