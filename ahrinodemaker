@@ -3224,6 +3224,21 @@ def _dante_setup(port: str, allow: list[str]) -> None:
         raise RuntimeError("конфигурация Dante отвергнута:\n  "
                            + "\n  ".join(problems))
 
+    # Штатный юнит стартует после network.target, но `external:` задан именем
+    # интерфейса: если на загрузке он ещё не поднят, danted падает и больше не
+    # пытается — служба молча не работает до ручного вмешательства. Особенно
+    # некстати при включённой ночной перезагрузке. Дополняем юнит ожиданием
+    # сети и повторными попытками.
+    write_file("/etc/systemd/system/danted.service.d/override.conf",
+               "[Unit]\n"
+               "After=network-online.target\n"
+               "Wants=network-online.target\n"
+               "\n"
+               "[Service]\n"
+               "Restart=on-failure\n"
+               "RestartSec=5\n")
+    run(["systemctl", "daemon-reload"], check=False)
+
     run(["systemctl", "enable", "danted"], check=False)
     restart = probe(["systemctl", "restart", "danted"])
     if restart.returncode != 0 or probe(
