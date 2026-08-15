@@ -3193,6 +3193,16 @@ def _dante_setup(port: str, allow: list[str]) -> None:
         run(["ufw", "allow", f"{port}/tcp"], check=False)
         console.print(f"[green]✓ Открыт порт {port}/tcp[/green]")
 
+    # danted -V разбирает конфиг и выходит, не трогая службу. Без этой проверки
+    # ошибка синтаксиса всплывала бы только как «служба не запустилась», а
+    # настоящую причину пришлось бы искать в журнале.
+    check = probe(["danted", "-V", "-f", DANTE_CONF])
+    problems = [ln for ln in (check.stderr + check.stdout).splitlines()
+                if "error:" in ln]
+    if problems:
+        raise RuntimeError("конфигурация Dante отвергнута:\n  "
+                           + "\n  ".join(problems))
+
     run(["systemctl", "enable", "danted"], check=False)
     restart = probe(["systemctl", "restart", "danted"])
     if restart.returncode != 0 or probe(
