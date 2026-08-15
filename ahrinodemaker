@@ -19,6 +19,7 @@ import time
 import shlex
 import hashlib
 import secrets
+import ipaddress
 import shutil
 import subprocess
 import importlib
@@ -3056,7 +3057,7 @@ DANTE_CONF = "/etc/danted.conf"
 DANTE_GROUP = "danteproxy"          # по группе отличаем наших пользователей от системных
 DANTE_DEFAULT_PORT = "1080"
 
-DANTE_CONF_TEMPLATE = """# Создано AhriNode tool
+DANTE_CONF_HEADER = """# Создано AhriNode tool
 logoutput: syslog
 user.privileged: root
 user.unprivileged: nobody
@@ -3068,7 +3069,12 @@ external: __IFACE__
 # Dante 1.4 проверяет их через PAM и своей базы не имеет.
 clientmethod: none
 socksmethod: username
+"""
 
+# В синтаксисе Dante `from:` принимает ровно один адрес или подсеть —
+# перечисление через запятую он не разбирает и отказывается стартовать.
+# Для нескольких источников нужен отдельный блок правил на каждый.
+DANTE_RULE_TEMPLATE = """
 client pass {
     from: __FROM__ to: 0.0.0.0/0
     log: error
@@ -3081,6 +3087,37 @@ socks pass {
     socksmethod: username
 }
 """
+
+
+def parse_allow_list(raw: str) -> tuple[list[str], list[str]]:
+    """Разбирает список адресов и подсетей. Возвращает (корректные, ошибочные).
+
+    Одиночный адрес дополняется маской /32: Dante принимает и без неё, но с
+    явной маской конфиг читается однозначно."""
+    valid, invalid = [], []
+    for item in re.split(r"[,\s]+", raw.strip()):
+        if not item:
+            continue
+        try:
+            net = ipaddress.ip_network(item, strict=False)
+        except ValueError:
+            invalid.append(item)
+            continue
+        if net.version != 4:
+            # internal слушает на 0.0.0.0, поэтому IPv6-источников не будет
+            invalid.append(item)
+            continue
+        valid.append(str(net))
+    return valid, invalid
+
+
+def build_dante_conf(port: str, iface: str, allow: list[str]) -> str:
+    conf = (DANTE_CONF_HEADER
+            .replace("__PORT__", port)
+            .replace("__IFACE__", iface))
+    for addr in allow:
+        conf += DANTE_RULE_TEMPLATE.replace("__FROM__", addr)
+    return conf
 
 
 def _default_iface() -> str:
@@ -3130,16 +3167,13 @@ def _dante_add_user(name: str, password: str) -> None:
         raise RuntimeError(f"не удалось задать пароль: {(chp.stderr or '').strip()}")
 
 
-def _dante_setup(port: str, allow_from: str) -> None:
+def _dante_setup(port: str, allow: list[str]) -> None:
     ensure_packages("dante-server")
     iface = _default_iface()
-    conf = (DANTE_CONF_TEMPLATE
-            .replace("__PORT__", port)
-            .replace("__IFACE__", iface)
-            .replace("__FROM__", allow_from))
-    write_file(DANTE_CONF, conf)
+    write_file(DANTE_CONF, build_dante_conf(port, iface, allow))
     console.print(f"[green]✓ {DANTE_CONF} записан (интерфейс {iface}, "
                   f"порт {port})[/green]")
+    console.print(f"[dim]Разрешённые источники: {', '.join(allow)}[/dim]")
 
     if shutil.which("ufw") and "Status: active" in probe(["ufw", "status"]).stdout:
         run(["ufw", "allow", f"{port}/tcp"], check=False)
@@ -3219,16 +3253,24 @@ def menu_dante() -> None:
                 if not port.isdigit() or not 1 <= int(port) <= 65535:
                     console.print("[red]Некорректный порт.[/red]")
                     continue
-                allow = questionary.text(
-                    "Кому разрешить подключаться.\n"
+                raw_allow = questionary.text(
+                    "Кому разрешить подключаться. Можно несколько через запятую.\n"
+                    "  Примеры: 109.248.168.27, 10.0.0.0/8\n"
                     "  Enter — всем (0.0.0.0/0). Логин и пароль в SOCKS5 идут\n"
                     "  открытым текстом, поэтому ограничение по адресу — не\n"
                     "  придирка, а основная защита.\n"
-                    "  Адрес или подсеть:",
+                    "  Адреса:",
                     default="", style=CUSTOM_STYLE).ask()
-                if allow is None:
+                if raw_allow is None:
                     continue
-                allow = allow.strip() or "0.0.0.0/0"
+                if not raw_allow.strip():
+                    allow = ["0.0.0.0/0"]
+                else:
+                    allow, bad = parse_allow_list(raw_allow)
+                    if bad:
+                        console.print(f"[red]Не похоже на адрес или подсеть: "
+                                      f"{', '.join(bad)}[/red]")
+                        continue
                 _dante_setup(port, allow)
                 if not _dante_users():
                     console.print("[yellow]Пользователей нет — добавьте хотя бы "
