@@ -18,6 +18,7 @@ import json
 import time
 import shlex
 import hashlib
+import secrets
 import shutil
 import subprocess
 import importlib
@@ -3044,6 +3045,271 @@ def menu_backup_restore() -> None:
             console.print(f"[red]✗ Ошибка: {exc}[/red]")
 
 
+# ================================================================== #
+# Tools → SOCKS5-прокси Dante
+# ================================================================== #
+# Выбран Dante: пакет dante-server есть в репозиториях Debian/Ubuntu, версия
+# 1.4 умеет авторизацию по логину и правила доступа. Рассмотренные альтернативы:
+# 3proxy (своя база пользователей, но в репозиториях Ubuntu отсутствует) и
+# microsocks (один пользователь, без ACL).
+DANTE_CONF = "/etc/danted.conf"
+DANTE_GROUP = "danteproxy"          # по группе отличаем наших пользователей от системных
+DANTE_DEFAULT_PORT = "1080"
+
+DANTE_CONF_TEMPLATE = """# Создано AhriNode tool
+logoutput: syslog
+user.privileged: root
+user.unprivileged: nobody
+
+internal: 0.0.0.0 port = __PORT__
+external: __IFACE__
+
+# Авторизация по логину и паролю. Пользователи — системные, с nologin:
+# Dante 1.4 проверяет их через PAM и своей базы не имеет.
+clientmethod: none
+socksmethod: username
+
+client pass {
+    from: __FROM__ to: 0.0.0.0/0
+    log: error
+}
+
+socks pass {
+    from: __FROM__ to: 0.0.0.0/0
+    command: connect
+    log: error
+    socksmethod: username
+}
+"""
+
+
+def _default_iface() -> str:
+    """Интерфейс с маршрутом по умолчанию — его Dante использует как external."""
+    out = probe(["ip", "-4", "route", "show", "default"]).stdout
+    m = re.search(r"\bdev\s+(\S+)", out)
+    return m.group(1) if m else "eth0"
+
+
+def _dante_port() -> str:
+    try:
+        with open(DANTE_CONF, encoding="utf-8") as f:
+            m = re.search(r"internal:.*port\s*=\s*(\d+)", f.read())
+            return m.group(1) if m else DANTE_DEFAULT_PORT
+    except OSError:
+        return DANTE_DEFAULT_PORT
+
+
+def _dante_users() -> list[str]:
+    """Пользователи прокси — участники нашей группы."""
+    r = probe(["getent", "group", DANTE_GROUP])
+    if r.returncode != 0:
+        return []
+    members = r.stdout.strip().split(":")[-1]
+    return [u for u in members.split(",") if u]
+
+
+def _dante_add_user(name: str, password: str) -> None:
+    if not re.match(r"^[a-z_][a-z0-9_-]{0,31}$", name):
+        raise RuntimeError("имя пользователя: латиница в нижнем регистре, цифры, "
+                           "дефис и подчёркивание, начиная с буквы")
+    probe(["groupadd", "-f", DANTE_GROUP])
+    if name in _dante_users():
+        raise RuntimeError(f"пользователь {name} уже существует")
+    # -M без домашнего каталога, nologin — учётка нужна только для авторизации
+    # в прокси, входить ей в систему незачем
+    r = probe(["useradd", "-r", "-M", "-s", "/usr/sbin/nologin",
+               "-g", DANTE_GROUP, name])
+    if r.returncode != 0:
+        raise RuntimeError(f"не удалось создать пользователя: "
+                           f"{(r.stderr or '').strip()}")
+    # Пароль передаём через stdin, а не аргументом: аргументы видны в ps
+    chp = subprocess.run(["chpasswd"], input=f"{name}:{password}\n",
+                         text=True, capture_output=True)
+    if chp.returncode != 0:
+        probe(["userdel", name])
+        raise RuntimeError(f"не удалось задать пароль: {(chp.stderr or '').strip()}")
+
+
+def _dante_setup(port: str, allow_from: str) -> None:
+    ensure_packages("dante-server")
+    iface = _default_iface()
+    conf = (DANTE_CONF_TEMPLATE
+            .replace("__PORT__", port)
+            .replace("__IFACE__", iface)
+            .replace("__FROM__", allow_from))
+    write_file(DANTE_CONF, conf)
+    console.print(f"[green]✓ {DANTE_CONF} записан (интерфейс {iface}, "
+                  f"порт {port})[/green]")
+
+    if shutil.which("ufw") and "Status: active" in probe(["ufw", "status"]).stdout:
+        run(["ufw", "allow", f"{port}/tcp"], check=False)
+        console.print(f"[green]✓ Открыт порт {port}/tcp[/green]")
+
+    run(["systemctl", "enable", "danted"], check=False)
+    restart = probe(["systemctl", "restart", "danted"])
+    if restart.returncode != 0 or probe(
+            ["systemctl", "is-active", "--quiet", "danted"]).returncode != 0:
+        raise RuntimeError("Dante не запустился.\n"
+                           + (service_diagnostics("danted") or ""))
+    console.print("[green]✓ Служба danted работает[/green]")
+
+
+def _dante_check(user: str, password: str) -> None:
+    port = _dante_port()
+    ensure_packages("curl")
+    # socks5h — резолвить домены на стороне прокси, как это делает клиент
+    r = probe(["curl", "-x", f"socks5h://{user}:{password}@127.0.0.1:{port}",
+               "-s", "--max-time", "15", "https://www.cloudflare.com/cdn-cgi/trace"])
+    ip = ""
+    for line in r.stdout.splitlines():
+        if line.startswith("ip="):
+            ip = line.split("=", 1)[1].strip()
+    if r.returncode == 0 and ip:
+        console.print(f"[green]✓ Прокси отвечает, внешний адрес: {ip}[/green]")
+    else:
+        console.print("[yellow]Проверка не прошла. Убедитесь, что логин и пароль "
+                      "верны, и посмотрите: journalctl -u danted -n 30[/yellow]")
+
+
+def _server_ip() -> str:
+    out = probe(["ip", "-4", "-o", "addr", "show", "scope", "global"]).stdout
+    ips = re.findall(r"inet\s+(\d{1,3}(?:\.\d{1,3}){3})", out)
+    return ips[0] if ips else "АДРЕС_СЕРВЕРА"
+
+
+def menu_dante() -> None:
+    while True:
+        console.print()
+        installed = _pkg_installed("dante-server") and os.path.isfile(DANTE_CONF)
+        active = probe(["systemctl", "is-active", "--quiet", "danted"]).returncode == 0
+        users = _dante_users()
+        state = ("[green]работает[/green]" if active else
+                 "[yellow]установлен, но не запущен[/yellow]" if installed else
+                 "[dim]не установлен[/dim]")
+        console.print(f"[bold]Dante:[/bold] {state}")
+        if installed:
+            console.print(f"[bold]Порт:[/bold] {_dante_port()}   "
+                          f"[bold]Пользователи:[/bold] "
+                          f"{', '.join(users) if users else 'нет'}")
+
+        choice = questionary.select(
+            "SOCKS5-прокси Dante:",
+            choices=[
+                questionary.Choice("Установить / перенастроить", value="setup"),
+                questionary.Choice("Добавить пользователя", value="adduser"),
+                questionary.Choice("Удалить пользователя", value="deluser"),
+                questionary.Choice("Параметры подключения", value="info"),
+                questionary.Choice("Проверить работу", value="check"),
+                questionary.Choice("Удалить Dante", value="purge"),
+                questionary.Choice("← Назад", value="back"),
+            ],
+            style=CUSTOM_STYLE,
+        ).ask()
+        if choice in (None, "back"):
+            return
+
+        try:
+            if choice == "setup":
+                port = questionary.text(f"Порт (Enter — {DANTE_DEFAULT_PORT}):",
+                                        default=DANTE_DEFAULT_PORT,
+                                        style=CUSTOM_STYLE).ask()
+                if port is None:
+                    continue
+                port = port.strip() or DANTE_DEFAULT_PORT
+                if not port.isdigit() or not 1 <= int(port) <= 65535:
+                    console.print("[red]Некорректный порт.[/red]")
+                    continue
+                allow = questionary.text(
+                    "Кому разрешить подключаться.\n"
+                    "  Enter — всем (0.0.0.0/0). Логин и пароль в SOCKS5 идут\n"
+                    "  открытым текстом, поэтому ограничение по адресу — не\n"
+                    "  придирка, а основная защита.\n"
+                    "  Адрес или подсеть:",
+                    default="", style=CUSTOM_STYLE).ask()
+                if allow is None:
+                    continue
+                allow = allow.strip() or "0.0.0.0/0"
+                _dante_setup(port, allow)
+                if not _dante_users():
+                    console.print("[yellow]Пользователей нет — добавьте хотя бы "
+                                  "одного, иначе подключиться будет некому.[/yellow]")
+
+            elif choice == "adduser":
+                name = questionary.text("Имя пользователя:", default="",
+                                        style=CUSTOM_STYLE).ask()
+                if not name or not name.strip():
+                    continue
+                pwd = questionary.text(
+                    "Пароль (Enter — сгенерировать):", default="",
+                    style=CUSTOM_STYLE).ask()
+                if pwd is None:
+                    continue
+                pwd = pwd.strip() or secrets.token_urlsafe(15)
+                _dante_add_user(name.strip(), pwd)
+                console.print(f"[green]✓ Пользователь создан[/green]\n"
+                              f"  логин: [bold]{name.strip()}[/bold]\n"
+                              f"  пароль: [bold]{pwd}[/bold]\n"
+                              "[dim]Пароль больше нигде не хранится в открытом "
+                              "виде — сохраните его сейчас.[/dim]")
+
+            elif choice == "deluser":
+                users = _dante_users()
+                if not users:
+                    console.print("[yellow]Пользователей нет.[/yellow]")
+                    continue
+                victim = questionary.select("Кого удалить:", choices=[*users, "← Отмена"],
+                                            style=CUSTOM_STYLE).ask()
+                if victim in (None, "← Отмена"):
+                    continue
+                probe(["userdel", victim])
+                console.print(f"[green]✓ {victim} удалён[/green]")
+
+            elif choice == "info":
+                if not installed:
+                    console.print("[yellow]Dante не установлен.[/yellow]")
+                    continue
+                port = _dante_port()
+                console.print(Panel.fit(
+                    f"Сервер:   [bold]{_server_ip()}[/bold]\n"
+                    f"Порт:     [bold]{port}[/bold]\n"
+                    f"Протокол: [bold]SOCKS5[/bold] (с логином и паролем)\n"
+                    f"Пользователи: {', '.join(users) if users else 'нет'}\n\n"
+                    f"[dim]curl -x socks5h://ЛОГИН:ПАРОЛЬ@{_server_ip()}:{port} "
+                    "https://ipinfo.io/ip[/dim]",
+                    title="Параметры подключения", border_style="cyan"))
+
+            elif choice == "check":
+                users = _dante_users()
+                if not users:
+                    console.print("[yellow]Сначала добавьте пользователя.[/yellow]")
+                    continue
+                user = questionary.select("Под каким пользователем проверить:",
+                                          choices=users, style=CUSTOM_STYLE).ask()
+                if user is None:
+                    continue
+                pwd = questionary.text(f"Пароль для {user}:", default="",
+                                       style=CUSTOM_STYLE).ask()
+                if not pwd:
+                    continue
+                _dante_check(user, pwd.strip())
+
+            elif choice == "purge":
+                confirm = questionary.confirm(
+                    "Удалить Dante вместе с пользователями прокси?",
+                    default=False, style=CUSTOM_STYLE).ask()
+                if not confirm:
+                    continue
+                run(["systemctl", "disable", "--now", "danted"], check=False)
+                for u in _dante_users():
+                    probe(["userdel", u])
+                probe(["groupdel", DANTE_GROUP])
+                run(["apt-get", "purge", "-y", "dante-server"], check=False)
+                console.print("[green]✓ Dante удалён[/green]")
+
+        except (subprocess.CalledProcessError, OSError, RuntimeError) as exc:
+            console.print(f"[red]✗ Ошибка: {exc}[/red]")
+
+
 def menu_vendor_updates() -> None:
     """Сверяет зафиксированные копии сторонних скриптов с апстримом."""
     step("Проверка версий сторонних скриптов")
@@ -3091,6 +3357,7 @@ def menu_tools() -> None:
             choices=[
                 questionary.Choice("Remnawave Backup & Restore (distillium)",
                                    value="backup_restore"),
+                questionary.Choice("SOCKS5-прокси Dante", value="dante"),
                 questionary.Choice("Проверить обновления сторонних скриптов",
                                    value="vendor_updates"),
                 questionary.Choice("← Назад", value="back"),
@@ -3101,6 +3368,8 @@ def menu_tools() -> None:
             return
         if choice == "backup_restore":
             menu_backup_restore()
+        elif choice == "dante":
+            menu_dante()
         elif choice == "vendor_updates":
             try:
                 menu_vendor_updates()
