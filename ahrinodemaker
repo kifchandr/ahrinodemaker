@@ -3686,6 +3686,117 @@ def menu_vendor_updates() -> None:
         console.print("\n[green]Всё актуально — обновлять нечего.[/green]")
 
 
+# ================================================================== #
+# Раздел «Тесты» — диагностика сервера
+# ================================================================== #
+IPREGION_URL = "https://ipregion.xyz"
+IPERF3_RU_URL = ("https://raw.githubusercontent.com/itdoginfo/"
+                 "russian-iperf3-servers/main/speedtest.sh")
+
+
+def _run_remote_script(url: str, title: str) -> None:
+    """Скачивает сторонний скрипт и выполняет его на нашем терминале.
+
+    В отличие от установщиков в разделах выше, тесты ничего не меняют на
+    сервере, поэтому копии в vendor/ для них не заводятся. Но код всё равно
+    чужой и запускается от root — качаем в файл, чтобы при обрыве связи не
+    исполнить обрезанный скрипт, как это делает `bash <(wget -qO- …)`."""
+    ensure_packages("curl")
+    with tempfile.TemporaryDirectory(prefix="test-") as tmpdir:
+        path = os.path.join(tmpdir, "script.sh")
+        _download(url, path, timeout=60)
+        if os.path.getsize(path) == 0:
+            raise RuntimeError(f"{url} вернул пустой ответ")
+        console.print(f"[dim]Запускаю {title} ({os.path.getsize(path)} байт "
+                      f"с {url})[/dim]")
+        subprocess.run(["bash", path], env=ENV)
+
+
+def test_region() -> None:
+    step("Тест регионов: как сервисы видят адрес сервера")
+    _run_remote_script(IPREGION_URL, "ipregion.xyz")
+
+
+def test_speed_eu() -> None:
+    step("Скорость через европейские серверы (speedtest)")
+    ensure_packages("speedtest-cli")
+    # Пакет ставит и speedtest, и speedtest-cli; берём то, что нашлось
+    cmd = "speedtest" if shutil.which("speedtest") else "speedtest-cli"
+    if shutil.which(cmd) is None:
+        raise RuntimeError("speedtest не установился")
+    subprocess.run([cmd], env=ENV)
+
+
+def test_speed_ru() -> None:
+    step("Скорость через российские серверы (iperf3)")
+    if not _pkg_installed("iperf3"):
+        # Установщик iperf3 спрашивает, поднимать ли демон. Отвечаем заранее,
+        # иначе apt зависнет на диалоге посреди неинтерактивного прогона.
+        subprocess.run(["debconf-set-selections"],
+                       input="iperf3 iperf3/start_daemon boolean false\n",
+                       text=True, capture_output=True)
+        ensure_packages("iperf3")
+    _run_remote_script(IPERF3_RU_URL, "russian-iperf3-servers")
+
+
+def test_telegram() -> None:
+    step("Доступность Telegram")
+    ensure_packages("curl")
+    targets = [
+        ("core.telegram.org", "https://core.telegram.org/"),
+        ("api.telegram.org", "https://api.telegram.org/"),
+    ]
+    table = Table(box=box.ROUNDED, border_style="cyan", padding=(0, 1))
+    table.add_column("Хост")
+    table.add_column("Результат")
+    for name, url in targets:
+        r = probe(["curl", "-sS", "-o", "/dev/null", "--max-time", "15",
+                   "-w", "%{http_code} %{time_total} %{remote_ip}", url])
+        if r.returncode != 0:
+            table.add_row(name, f"[red]недоступен[/red]\n[dim]"
+                                f"{(r.stderr or '').strip()[:90]}[/dim]")
+            continue
+        parts = r.stdout.split()
+        code = parts[0] if parts else "?"
+        # 4xx и 5xx тоже означают, что соединение прошло: блокировка выглядит
+        # как таймаут или ошибка TLS, а не как ответ сервера
+        colour = "green" if code.startswith(("2", "3", "4")) else "yellow"
+        cell = f"[{colour}]HTTP {code}[/{colour}]"
+        if len(parts) > 2:
+            cell += f"  [dim]{parts[1]}с, адрес {parts[2]}[/dim]"
+        table.add_row(name, cell)
+    console.print(table)
+    console.print("[dim]Ответ сервера, включая 4xx, означает что соединение "
+                  "проходит. Блокировка выглядит как таймаут или ошибка TLS.[/dim]")
+
+
+TESTS = [
+    ("region",   "Тест регионов — как сервисы видят адрес сервера", test_region),
+    ("speed_eu", "Проверка скорости — Европа (speedtest)", test_speed_eu),
+    ("speed_ru", "Проверка скорости — Россия (iperf3)", test_speed_ru),
+    ("telegram", "Доступен ли Telegram", test_telegram),
+]
+
+
+def menu_tests() -> None:
+    while True:
+        console.print()
+        choice = questionary.select(
+            "Тесты:",
+            choices=[*[questionary.Choice(label, value=key)
+                       for key, label, _ in TESTS],
+                     questionary.Choice("← Назад", value="back")],
+            style=CUSTOM_STYLE,
+        ).ask()
+        if choice in (None, "back"):
+            return
+        func = next(f for k, _, f in TESTS if k == choice)
+        try:
+            func()
+        except (subprocess.CalledProcessError, OSError, RuntimeError) as exc:
+            console.print(f"[red]✗ Тест не выполнен: {exc}[/red]")
+
+
 def menu_tools() -> None:
     while True:
         console.print()
@@ -3742,6 +3853,7 @@ def main() -> None:
                 questionary.Choice("Remnawave Node — настройка сервера под ноду",
                                    value="node"),
                 questionary.Choice("Tools — вспомогательные утилиты", value="tools"),
+                questionary.Choice("Тесты — диагностика сервера", value="tests"),
                 questionary.Choice("Выход", value="exit"),
             ],
             style=CUSTOM_STYLE,
@@ -3754,6 +3866,8 @@ def main() -> None:
             menu_remnawave_node()
         elif choice == "tools":
             menu_tools()
+        elif choice == "tests":
+            menu_tests()
 
 
 if __name__ == "__main__":
