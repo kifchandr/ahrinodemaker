@@ -3689,12 +3689,20 @@ def menu_vendor_updates() -> None:
 # ================================================================== #
 # Раздел «Тесты» — диагностика сервера
 # ================================================================== #
-IPREGION_URL = "https://ipregion.xyz"
-IPERF3_RU_URL = ("https://raw.githubusercontent.com/itdoginfo/"
-                 "russian-iperf3-servers/main/speedtest.sh")
+# ipregion.xyz отдаёт тот же скрипт, что лежит в репозитории автора. Берём
+# сперва из репозитория: источник виден и проверяем. Короткий адрес оставлен
+# запасным — raw.githubusercontent местами блокируют.
+IPREGION_URLS = [
+    "https://raw.githubusercontent.com/Davoyan/ipregion/main/ipregion.sh",
+    "https://ipregion.xyz",
+]
+IPERF3_RU_URLS = [
+    "https://raw.githubusercontent.com/itdoginfo/"
+    "russian-iperf3-servers/main/speedtest.sh",
+]
 
 
-def _run_remote_script(url: str, title: str) -> None:
+def _run_remote_script(urls: list[str], title: str) -> None:
     """Скачивает сторонний скрипт и выполняет его на нашем терминале.
 
     В отличие от установщиков в разделах выше, тесты ничего не меняют на
@@ -3704,17 +3712,30 @@ def _run_remote_script(url: str, title: str) -> None:
     ensure_packages("curl")
     with tempfile.TemporaryDirectory(prefix="test-") as tmpdir:
         path = os.path.join(tmpdir, "script.sh")
-        _download(url, path, timeout=60)
-        if os.path.getsize(path) == 0:
-            raise RuntimeError(f"{url} вернул пустой ответ")
-        console.print(f"[dim]Запускаю {title} ({os.path.getsize(path)} байт "
-                      f"с {url})[/dim]")
-        subprocess.run(["bash", path], env=ENV)
+        errors = []
+        for url in urls:
+            try:
+                _download(url, path, timeout=60)
+            except RuntimeError as exc:
+                errors.append(str(exc))
+                continue
+            if os.path.getsize(path) == 0:
+                errors.append(f"{url} вернул пустой ответ")
+                continue
+            console.print(f"[dim]Запускаю {title}: {os.path.getsize(path)} байт "
+                          f"с {url}[/dim]")
+            subprocess.run(["bash", path], env=ENV)
+            return
+        raise RuntimeError("не удалось получить скрипт:\n  "
+                           + "\n  ".join(errors))
 
 
 def test_region() -> None:
     step("Тест регионов: как сервисы видят адрес сервера")
-    _run_remote_script(IPREGION_URL, "ipregion.xyz")
+    # Зависимости скрипта — ставим сами, чтобы он не занимался этим сам
+    # и чтобы отказ установки был виден отдельно от отказа самого теста
+    ensure_packages("jq", "curl", "util-linux")
+    _run_remote_script(IPREGION_URLS, "ipregion")
 
 
 def test_speed_eu() -> None:
@@ -3736,7 +3757,7 @@ def test_speed_ru() -> None:
                        input="iperf3 iperf3/start_daemon boolean false\n",
                        text=True, capture_output=True)
         ensure_packages("iperf3")
-    _run_remote_script(IPERF3_RU_URL, "russian-iperf3-servers")
+    _run_remote_script(IPERF3_RU_URLS, "russian-iperf3-servers")
 
 
 def test_telegram() -> None:
