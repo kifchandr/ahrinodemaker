@@ -14,11 +14,19 @@
 curl -fsSL https://raw.githubusercontent.com/kifchandr/ahrinodemaker/main/ahrinodemaker | sudo python3
 ```
 
-Либо установить как команду и запускать потом просто `sudo ahrinodemaker`:
+Либо в главном меню выбрать **«Установить короткую команду `ahri`»** — скрипт
+пропишется в `/usr/local/bin`, и дальше достаточно:
+
+```bash
+sudo ahri
+```
+
+Пункт показывается, только пока команда не установлена. То же самое вручную:
 
 ```bash
 sudo curl -fsSL https://raw.githubusercontent.com/kifchandr/ahrinodemaker/main/ahrinodemaker \
-     -o /usr/local/bin/ahrinodemaker && sudo chmod +x /usr/local/bin/ahrinodemaker
+     -o /usr/local/bin/ahrinodemaker && sudo chmod +x /usr/local/bin/ahrinodemaker \
+     && sudo ln -sf /usr/local/bin/ahrinodemaker /usr/local/bin/ahri
 ```
 
 При первом запуске скрипт доустановит две Python-библиотеки для самого меню

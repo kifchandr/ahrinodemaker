@@ -3835,6 +3835,65 @@ def menu_tools() -> None:
 
 
 # ================================================================== #
+# Установка самого скрипта как команды
+# ================================================================== #
+SELF_PATH = "/usr/local/bin/ahrinodemaker"
+SELF_SHORTCUT = "/usr/local/bin/ahri"
+
+
+def _self_installed() -> bool:
+    return os.path.isfile(SELF_PATH) and os.path.exists(SELF_SHORTCUT)
+
+
+def install_self() -> None:
+    """Кладёт скрипт в /usr/local/bin и заводит короткое имя `ahri`.
+
+    Источник берём с диска, если скрипт уже запущен из файла, иначе качаем из
+    репозитория: при запуске через `curl | python3` файла попросту нет."""
+    step("Короткая команда для запуска")
+
+    source = None
+    try:
+        here = os.path.abspath(__file__)
+        if os.path.isfile(here):
+            source = here
+    except NameError:
+        pass   # запуск из потока — __file__ не определён
+
+    with tempfile.TemporaryDirectory(prefix="self-") as tmpdir:
+        if source and os.path.abspath(source) != SELF_PATH:
+            staged = os.path.join(tmpdir, "ahrinodemaker")
+            shutil.copyfile(source, staged)
+            console.print(f"[dim]Беру файл, из которого запущен скрипт: "
+                          f"{source}[/dim]")
+        elif source:
+            staged = source          # уже установлен, просто обновим ярлык
+        else:
+            staged = os.path.join(tmpdir, "ahrinodemaker")
+            _download(f"{REPO_RAW_BASE}/ahrinodemaker", staged, timeout=60)
+            console.print("[dim]Скрипт скачан из репозитория[/dim]")
+
+        with open(staged, encoding="utf-8", errors="replace") as f:
+            head = f.read(64)
+        if "python3" not in head:
+            raise RuntimeError("полученный файл не похож на этот скрипт — "
+                               "установка отменена")
+
+        if os.path.abspath(staged) != SELF_PATH:
+            with open(staged, encoding="utf-8") as f:
+                write_file(SELF_PATH, f.read(), mode=0o755)
+
+    # Ярлык переcоздаём всегда: он мог указывать на старое место
+    if os.path.islink(SELF_SHORTCUT) or os.path.exists(SELF_SHORTCUT):
+        os.unlink(SELF_SHORTCUT)
+    os.symlink(SELF_PATH, SELF_SHORTCUT)
+
+    console.print(f"[green]✓ Установлено: {SELF_PATH}[/green]")
+    console.print("[green]✓ Короткая команда: [bold]sudo ahri[/bold][/green]")
+    console.print("[dim]Полное имя тоже работает: sudo ahrinodemaker[/dim]")
+
+
+# ================================================================== #
 # Точка входа: главное меню
 # ================================================================== #
 def main() -> None:
@@ -3856,17 +3915,21 @@ def main() -> None:
 
     while True:
         console.print()
+        choices = [
+            questionary.Choice("Remnawave Node — настройка сервера под ноду",
+                               value="node"),
+            questionary.Choice("Tools — вспомогательные утилиты", value="tools"),
+            questionary.Choice("Тесты — диагностика сервера", value="tests"),
+        ]
+        # Пункт показываем, только пока команда не установлена: дальше он
+        # превратился бы в постоянный шум в меню.
+        if not _self_installed():
+            choices.append(questionary.Choice(
+                "Установить короткую команду «ahri»", value="install_self"))
+        choices.append(questionary.Choice("Выход", value="exit"))
+
         choice = questionary.select(
-            "Главное меню:",
-            choices=[
-                questionary.Choice("Remnawave Node — настройка сервера под ноду",
-                                   value="node"),
-                questionary.Choice("Tools — вспомогательные утилиты", value="tools"),
-                questionary.Choice("Тесты — диагностика сервера", value="tests"),
-                questionary.Choice("Выход", value="exit"),
-            ],
-            style=CUSTOM_STYLE,
-        ).ask()
+            "Главное меню:", choices=choices, style=CUSTOM_STYLE).ask()
 
         if choice in (None, "exit"):
             console.print("[dim]Выход.[/dim]")
@@ -3877,6 +3940,11 @@ def main() -> None:
             menu_tools()
         elif choice == "tests":
             menu_tests()
+        elif choice == "install_self":
+            try:
+                install_self()
+            except (subprocess.CalledProcessError, OSError, RuntimeError) as exc:
+                console.print(f"[red]✗ Не удалось установить команду: {exc}[/red]")
 
 
 if __name__ == "__main__":
