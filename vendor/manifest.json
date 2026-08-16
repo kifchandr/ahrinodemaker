@@ -26,6 +26,24 @@
       "size_bytes": 150762,
       "vendored_at": "2026-08-12",
       "note": "Умеет обновлять сам себя из апстрима — после самообновления на сервере окажется версия автора, а не зафиксированная здесь."
+    },
+    {
+      "name": "ipregion.sh",
+      "project": "Davoyan/ipregion",
+      "upstream_url": "https://raw.githubusercontent.com/Davoyan/ipregion/main/ipregion.sh",
+      "sha256": "17eb73e776f7ab292e30f12223a78c8f25a0ed6808e8204434d122f06e4b4b0e",
+      "size_bytes": 55787,
+      "vendored_at": "2026-08-16",
+      "note": "Тест регионов. Тот же скрипт раздаётся с ipregion.xyz. Ничего не меняет на сервере, но исполняется от root. Список проверяемых сервисов со временем устаревает — обновляйте копию."
+    },
+    {
+      "name": "iperf3-ru-speedtest.sh",
+      "project": "itdoginfo/russian-iperf3-servers",
+      "upstream_url": "https://raw.githubusercontent.com/itdoginfo/russian-iperf3-servers/main/speedtest.sh",
+      "sha256": "068d37703beab0ec7e44a24ed45f6e911af51511ea6476a85add7250fab3d3dc",
+      "size_bytes": 8800,
+      "vendored_at": "2026-08-16",
+      "note": "Замер скорости до российских серверов iperf3. Список серверов зашит в скрипте, поэтому со временем устаревает."
     }
   ]
 }

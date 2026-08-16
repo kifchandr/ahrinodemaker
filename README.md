@@ -187,14 +187,11 @@ OAuth-доступы, что и backup-restore, — берёт их из `/opt/r
 | Скорость, Россия | `iperf3` до российских серверов из списка [itdoginfo/russian-iperf3-servers](https://github.com/itdoginfo/russian-iperf3-servers) |
 | Доступен ли Telegram | ответ `core.telegram.org` и `api.telegram.org` с кодом, временем и адресом |
 
-Два теста выполняют сторонние скрипты. В отличие от установщиков они ничего не
-меняют на сервере, поэтому копии в `vendor/` для них не заводятся — но скрипт
-всё равно скачивается в файл целиком и лишь затем запускается: `bash <(wget …)`
-при обрыве связи исполнил бы обрезанный текст.
-
-Тест регионов берётся сперва из репозитория автора, а короткий адрес
-`ipregion.xyz` остаётся запасным: источник виден и проверяем, но
-`raw.githubusercontent.com` местами блокируют.
+Два теста выполняют сторонние скрипты, и они тоже зафиксированы в `vendor/` с
+проверкой sha256 — исполняются от root, значит подчиняются тому же правилу, что
+и установщики. Плата за это: список проверяемых сервисов и список серверов
+iperf3 зашиты в копиях и со временем устаревают, поэтому за ними стоит следить
+через **Tools → Проверить обновления сторонних скриптов**.
 
 Установщик `iperf3` спрашивает, поднимать ли демон. Ответ задаётся заранее через
 `debconf-set-selections`, иначе `apt` встал бы на диалоге.
@@ -213,6 +210,8 @@ sha256 зашиты в сам `ahrinodemaker`. Перед запуском ко�
 |---|---|
 | `vendor/install-trafficguard.sh` | [DonMatteoVPN/TrafficGuard-auto](https://github.com/DonMatteoVPN/TrafficGuard-auto) |
 | `vendor/backup-restore.sh` | [distillium/remnawave-backup-restore](https://github.com/distillium/remnawave-backup-restore) |
+| `vendor/ipregion.sh` | [Davoyan/ipregion](https://github.com/Davoyan/ipregion) — он же раздаётся с `ipregion.xyz` |
+| `vendor/iperf3-ru-speedtest.sh` | [itdoginfo/russian-iperf3-servers](https://github.com/itdoginfo/russian-iperf3-servers) |
 
 Метаданные копий — в [`vendor/manifest.json`](vendor/manifest.json).
 

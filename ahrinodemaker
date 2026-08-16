@@ -69,6 +69,20 @@ VENDOR = {
         "upstream": ("https://raw.githubusercontent.com/distillium/"
                      "remnawave-backup-restore/main/backup-restore.sh"),
     },
+    "ipregion": {
+        "file":     "ipregion.sh",
+        "title":    "Тест регионов (Davoyan/ipregion)",
+        "sha256":   "17eb73e776f7ab292e30f12223a78c8f25a0ed6808e8204434d122f06e4b4b0e",
+        "upstream": ("https://raw.githubusercontent.com/Davoyan/ipregion/"
+                     "main/ipregion.sh"),
+    },
+    "iperf3_ru": {
+        "file":     "iperf3-ru-speedtest.sh",
+        "title":    "Скорость до серверов РФ (itdoginfo/russian-iperf3-servers)",
+        "sha256":   "068d37703beab0ec7e44a24ed45f6e911af51511ea6476a85add7250fab3d3dc",
+        "upstream": ("https://raw.githubusercontent.com/itdoginfo/"
+                     "russian-iperf3-servers/main/speedtest.sh"),
+    },
 }
 
 
@@ -3689,45 +3703,19 @@ def menu_vendor_updates() -> None:
 # ================================================================== #
 # Раздел «Тесты» — диагностика сервера
 # ================================================================== #
-# ipregion.xyz отдаёт тот же скрипт, что лежит в репозитории автора. Берём
-# сперва из репозитория: источник виден и проверяем. Короткий адрес оставлен
-# запасным — raw.githubusercontent местами блокируют.
-IPREGION_URLS = [
-    "https://raw.githubusercontent.com/Davoyan/ipregion/main/ipregion.sh",
-    "https://ipregion.xyz",
-]
-IPERF3_RU_URLS = [
-    "https://raw.githubusercontent.com/itdoginfo/"
-    "russian-iperf3-servers/main/speedtest.sh",
-]
+def _run_vendored_script(key: str) -> None:
+    """Запускает зафиксированную копию стороннего скрипта.
 
-
-def _run_remote_script(urls: list[str], title: str) -> None:
-    """Скачивает сторонний скрипт и выполняет его на нашем терминале.
-
-    В отличие от установщиков в разделах выше, тесты ничего не меняют на
-    сервере, поэтому копии в vendor/ для них не заводятся. Но код всё равно
-    чужой и запускается от root — качаем в файл, чтобы при обрыве связи не
-    исполнить обрезанный скрипт, как это делает `bash <(wget -qO- …)`."""
+    Тесты ничего не меняют на сервере, но исполняются от root, поэтому идут
+    через тот же механизм, что и установщики: копия берётся из vendor/ этого
+    репозитория и сверяется по sha256. Плата за это — список проверок
+    обновляется не сам: следите за пунктом «Проверить обновления сторонних
+    скриптов» в разделе Tools."""
     ensure_packages("curl")
     with tempfile.TemporaryDirectory(prefix="test-") as tmpdir:
-        path = os.path.join(tmpdir, "script.sh")
-        errors = []
-        for url in urls:
-            try:
-                _download(url, path, timeout=60)
-            except RuntimeError as exc:
-                errors.append(str(exc))
-                continue
-            if os.path.getsize(path) == 0:
-                errors.append(f"{url} вернул пустой ответ")
-                continue
-            console.print(f"[dim]Запускаю {title}: {os.path.getsize(path)} байт "
-                          f"с {url}[/dim]")
-            subprocess.run(["bash", path], env=ENV)
-            return
-        raise RuntimeError("не удалось получить скрипт:\n  "
-                           + "\n  ".join(errors))
+        path = fetch_vendored(key, tmpdir)
+        console.print(f"[dim]Запускаю {VENDOR[key]['title']}[/dim]")
+        subprocess.run(["bash", path], env=ENV)
 
 
 def test_region() -> None:
@@ -3735,7 +3723,7 @@ def test_region() -> None:
     # Зависимости скрипта — ставим сами, чтобы он не занимался этим сам
     # и чтобы отказ установки был виден отдельно от отказа самого теста
     ensure_packages("jq", "curl", "util-linux")
-    _run_remote_script(IPREGION_URLS, "ipregion")
+    _run_vendored_script("ipregion")
 
 
 def test_speed_eu() -> None:
@@ -3757,7 +3745,7 @@ def test_speed_ru() -> None:
                        input="iperf3 iperf3/start_daemon boolean false\n",
                        text=True, capture_output=True)
         ensure_packages("iperf3")
-    _run_remote_script(IPERF3_RU_URLS, "russian-iperf3-servers")
+    _run_vendored_script("iperf3_ru")
 
 
 def test_telegram() -> None:
