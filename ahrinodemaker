@@ -1797,6 +1797,151 @@ def block_warp(license_key: str = "") -> None:
 
 
 # ------------------------------------------------------------------ #
+# Psiphon: второй вариант чистого egress
+# ------------------------------------------------------------------ #
+# Альтернатива WARP с другой природой выходных адресов. Полезна там, где WARP
+# не помогает: его диапазоны хорошо известны и у Google с OpenAI на плохом
+# счету. Psiphon выпускает трафик через свою сеть в выбранной стране.
+#
+# Порт 41080 выбран намеренно: 1080 обычно занят Dante, 40000 — контейнером
+# WARP, а диапазон эфемерных портов начинается с 32768.
+PSIPHON_DIR = "/opt/psiphon"
+PSIPHON_SOCKS_PORT = 41080
+PSIPHON_CONTAINER = "psiphon"
+
+# Страны выхода. Для Gemini годится любая, где он доступен.
+PSIPHON_REGIONS = ["US", "GB", "NL", "DE", "FR", "SE", "CA", "JP", "SG"]
+
+
+def psiphon_compose(egress_region: str, device_region: str) -> str:
+    """docker-compose для контейнера Psiphon.
+
+    Порт публикуется только на localhost: SOCKS без авторизации, открывать его
+    наружу нельзя. HTTP-порт не публикуется вовсе — он не нужен."""
+    return f"""services:
+  psiphon:
+    image: swarupsengupta2007/psiphon:latest
+    container_name: {PSIPHON_CONTAINER}
+    restart: unless-stopped
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - HTTP_PORT=8080
+      - SOCKS_PORT=1080
+      - DEVICE_REGION={device_region}
+      - EGRESS_REGION={egress_region}
+    volumes:
+      - ./config:/config
+    ports:
+      - "127.0.0.1:{PSIPHON_SOCKS_PORT}:1080"
+"""
+
+
+def psiphon_outbound_reference(socks_address: str) -> str:
+    return json.dumps({
+        "outboundToAdd": {
+            "tag": "psiphon-out",
+            "protocol": "socks",
+            "settings": {
+                "servers": [{"address": socks_address,
+                             "port": PSIPHON_SOCKS_PORT}]
+            },
+        },
+        "routingRuleToAdd": {
+            "type": "field",
+            "outboundTag": "psiphon-out",
+            "domain": WARP_DOMAINS,
+        },
+        "_note": (
+            "Правило ставьте ВЫШЕ правила с DIRECT. Если для тех же доменов уже "
+            "заведён WARP, оставьте что-то одно: два правила на один домен "
+            "бессмысленны, сработает верхнее. Домены Google перечислены целиком "
+            "не случайно — авторизация и сам сервис обязаны выходить одним "
+            "адресом, иначе Google сочтёт трафик подозрительным."
+        ),
+    }, indent=2, ensure_ascii=False) + "\n"
+
+
+def _psiphon_check() -> tuple[bool, str]:
+    r = probe(["curl", "-x", f"socks5h://127.0.0.1:{PSIPHON_SOCKS_PORT}", "-s",
+               "--max-time", "15", "https://ipinfo.io/json"])
+    if r.returncode != 0 or not r.stdout.strip():
+        return False, ""
+    try:
+        data = json.loads(r.stdout)
+    except ValueError:
+        return False, ""
+    return True, f"{data.get('ip', '?')} ({data.get('country', '?')})"
+
+
+def block_psiphon(params: tuple[str, str] | None = None) -> None:
+    step("Psiphon: альтернативный egress для нейросетей")
+
+    if shutil.which("docker") is None:
+        raise RuntimeError("Docker не установлен — сначала установите ноду")
+    ensure_packages("curl")
+
+    egress, device = params if params else ("US", "US")
+
+    os.makedirs(f"{PSIPHON_DIR}/config", exist_ok=True)
+    compose_path = f"{PSIPHON_DIR}/docker-compose.yml"
+    write_file(compose_path, psiphon_compose(egress, device))
+    console.print(f"[green]✓ Конфигурация записана: {compose_path} "
+                  f"(страна выхода {egress})[/green]")
+
+    base = compose_base(compose_path)
+    if base is None:
+        raise RuntimeError("docker compose недоступен — контейнер не запущен")
+    run(base + ["pull"], check=False)
+    run(base + ["up", "-d"])
+
+    console.print("[cyan]Жду, пока Psiphon подберёт сервер…[/cyan]")
+    ok, ip = False, ""
+    for _ in range(24):          # до двух минут
+        ok, ip = _psiphon_check()
+        if ok:
+            break
+        time.sleep(5)
+
+    if not ok:
+        logs = probe(["docker", "logs", "--tail", "20", PSIPHON_CONTAINER]).stdout
+        raise RuntimeError(
+            "Psiphon не построил туннель за две минуты.\n"
+            f"  Последние строки журнала:\n{logs.strip() or '  (пусто)'}")
+
+    console.print(f"[green]✓ Psiphon работает, внешний адрес: {ip}[/green]")
+
+    socks_address = _warp_socks_address()   # логика та же: host или шлюз docker0
+    ref_path = f"{INSTALL_DIR}/panel-psiphon-outbound.json"
+    os.makedirs(INSTALL_DIR, exist_ok=True)
+    write_file(ref_path, psiphon_outbound_reference(socks_address))
+    console.print(f"[green]✓ Заготовка для панели: {ref_path}[/green]")
+    console.print(
+        "[bold yellow]Важно:[/bold yellow] в панели Remnawave добавьте outbound "
+        f"и правило из {ref_path}, поставив правило ВЫШЕ правила с DIRECT. "
+        "Если те же домены уже уходят в WARP — оставьте что-то одно.")
+
+
+def ask_psiphon_params() -> tuple[str, str] | None:
+    egress = questionary.select(
+        "Страна выхода Psiphon (через неё сервисы увидят ваш трафик):",
+        choices=[*PSIPHON_REGIONS, "Другая (ввести код)"],
+        style=CUSTOM_STYLE).ask()
+    if egress is None:
+        return None
+    if egress.startswith("Другая"):
+        raw = questionary.text("Код страны, две буквы (например NO):",
+                               default="", style=CUSTOM_STYLE).ask()
+        if not raw or not re.match(r"^[A-Za-z]{2}$", raw.strip()):
+            console.print("[red]Нужен двухбуквенный код страны.[/red]")
+            return None
+        egress = raw.strip().upper()
+    # DEVICE_REGION описывает «откуда» клиент: оставляем совпадающим с выходом,
+    # чтобы Psiphon не подбирал маршрут под другую страну.
+    return (egress, egress)
+
+
+# ------------------------------------------------------------------ #
 # Блокировка торрентов: tblocker + egress-фильтр (nft) + справка панели
 # ------------------------------------------------------------------ #
 # Единый источник правды по портам: раньше список дублировался в bash-скрипте
@@ -2193,6 +2338,7 @@ BLOCKS = [
     ("node_update", "Обновление remnanode (docker compose pull + пересоздание)", block_node_update),
     ("hysteria", "Hysteria2 (QUIC): сертификаты в /dev/shm + 443/udp + автообновление", block_hysteria),
     ("warp", "WARP: чистый egress для нейросетей (Gemini, ChatGPT) и стримингов", block_warp),
+    ("psiphon", "Psiphon: альтернативный egress, если WARP не помог", block_psiphon),
     ("torrent", "Блокировка торрентов (tblocker + egress-фильтр + конфиг панели)", block_torrent),
     ("trafficguard", "TrafficGuard-auto: защита от сканеров и ботов (rknpidor)", block_trafficguard),
 ]
@@ -2212,7 +2358,7 @@ INSTALLS_PACKAGES = {"packages", "node_install", "fail2ban", "ufw",
 # Блоки, которые по умолчанию идут БЕЗ галочки, даже если ещё не настроены.
 # Hysteria2 — дополнительный транспорт: он нужен не всем, требует сертификата
 # и ручной настройки inbound'а в панели, поэтому включается осознанно.
-DEFAULT_OFF = {"hysteria", "warp"}
+DEFAULT_OFF = {"hysteria", "warp", "psiphon"}
 
 
 # ================================================================== #
@@ -2272,6 +2418,11 @@ def _detect_warp() -> bool:
     return r.returncode == 0 and r.stdout.strip() == "true"
 
 
+def _detect_psiphon() -> bool:
+    r = probe(["docker", "inspect", "-f", "{{.State.Running}}", PSIPHON_CONTAINER])
+    return r.returncode == 0 and r.stdout.strip() == "true"
+
+
 def _detect_torrent() -> bool:
     return _pkg_installed("tblocker") and os.path.isfile("/opt/tblocker/config.yaml")
 
@@ -2290,6 +2441,7 @@ DETECTORS = {
     "remnanode_logs": _detect_remnanode_logs,
     "hysteria":       _detect_hysteria,
     "warp":           _detect_warp,
+    "psiphon":        _detect_psiphon,
     "torrent":        _detect_torrent,
     "trafficguard":   _detect_trafficguard,
 }
@@ -2499,6 +2651,12 @@ def menu_remnawave_node() -> None:
     # 4. Домен для Hysteria2 — только если выбран этот блок
     warp_license = ask_warp_license() if "warp" in selected else ""
 
+    psiphon_params: tuple[str, str] | None = None
+    if "psiphon" in selected:
+        psiphon_params = ask_psiphon_params()
+        if psiphon_params is None:
+            selected = [k for k in selected if k != "psiphon"]
+
     hysteria_params: tuple[str, dict | None] | None = None
     if "hysteria" in selected:
         hysteria_params = ask_hysteria_params()
@@ -2600,6 +2758,8 @@ def menu_remnawave_node() -> None:
                 func(hysteria_params)
             elif key == "warp":
                 func(warp_license)
+            elif key == "psiphon":
+                func(psiphon_params)
             elif key == "remnanode_logs":
                 func(compose_path)
             elif key == "node_update":
