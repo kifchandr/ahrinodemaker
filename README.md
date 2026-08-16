@@ -14,11 +14,11 @@
 curl -fsSL https://raw.githubusercontent.com/kifchandr/ahrinodemaker/main/ahrinodemaker | sudo python3
 ```
 
-Либо в главном меню выбрать **«Установить короткую команду `ahri`»** — скрипт
-пропишется в `/usr/local/bin`, и дальше достаточно:
+Либо в главном меню выбрать **«Установить короткие команды `ahri` и
+`ahrinode`»** — скрипт пропишется в `/usr/local/bin`, и дальше достаточно:
 
 ```bash
-sudo ahri
+sudo ahri          # или sudo ahrinode, или sudo ahrinodemaker
 ```
 
 Пункт показывается, только пока команда не установлена. То же самое вручную:
@@ -26,7 +26,8 @@ sudo ahri
 ```bash
 sudo curl -fsSL https://raw.githubusercontent.com/kifchandr/ahrinodemaker/main/ahrinodemaker \
      -o /usr/local/bin/ahrinodemaker && sudo chmod +x /usr/local/bin/ahrinodemaker \
-     && sudo ln -sf /usr/local/bin/ahrinodemaker /usr/local/bin/ahri
+     && sudo ln -sf /usr/local/bin/ahrinodemaker /usr/local/bin/ahri \
+     && sudo ln -sf /usr/local/bin/ahrinodemaker /usr/local/bin/ahrinode
 ```
 
 При первом запуске скрипт доустановит две Python-библиотеки для самого меню
@@ -58,7 +59,10 @@ sudo curl -fsSL https://raw.githubusercontent.com/kifchandr/ahrinodemaker/main/a
 Перед показом списка скрипт проверяет, что уже настроено на сервере: настроенные
 блоки идут **без галочки**, чтобы не выполнять их повторно. Отметить вручную и
 прогнать заново можно всегда. Также выводится сводка: свободное место на диске,
-текущее расписание автоперезагрузки и состояние образа ноды.
+текущее расписание автоперезагрузки и путь к compose ноды.
+
+Реестр образов при входе в меню не опрашивается — это добавляло несколько секунд
+ожидания, а решение о том, обновлять ли ноду, всё равно за вами.
 
 | Блок | Что делает |
 |---|---|
@@ -69,10 +73,11 @@ sudo curl -fsSL https://raw.githubusercontent.com/kifchandr/ahrinodemaker/main/a
 | UFW | входящие запрещены, исходящие разрешены, `limit ssh`, открыты 80/443/8443/9999, порт 2222 — только с адреса панели; можно добавить свои порты |
 | Сеть | `nf_conntrack` + `sysctl`: BBR + fq, увеличенные буферы и очереди, keepalive, отключение IPv6, `swappiness=10` |
 | Логи remnanode | каталог `/var/log/remnanode`, ротация через logrotate, добавление volume в `docker-compose.yml` ноды. Пункт для нод, установленных **не этим скриптом**: при установке ноды отсюда всё это уже сделано, и пункт скрывается |
-| Обновление remnanode | `docker compose pull` + пересоздание контейнера. Пункт появляется, только если образ устарел или версию не удалось проверить |
+| Обновление remnanode | `docker compose pull` + пересоздание контейнера. Пункт появляется, если нода установлена, и идёт **без галочки** — тянуть образ при каждом прогоне незачем |
+| Автообновление ноды | `@reboot`-задача обновляет образ при каждой загрузке сервера, с журналом в `/var/log/remnanode/auto-update.log`. **По умолчанию включено** |
 | Hysteria2 (QUIC) | при отсутствии сертификата выпускает его через certbot, монтирует `/dev/shm` в контейнер, кладёт туда сертификаты, открывает `443/udp`, заводит cron на их обновление и генерирует заготовку inbound'а для панели. **По умолчанию выключен** |
 | WARP | поднимает контейнер `caomingjun/warp` с SOCKS5 на `127.0.0.1:40000`, дожидается туннеля и генерирует outbound + правило маршрутизации для панели. Нужен, когда сервис режет IP дата-центров: Gemini, ChatGPT, Spotify. **По умолчанию выключен** |
-| Psiphon | альтернатива WARP: контейнер `swarupsengupta2007/psiphon` с SOCKS5 на `127.0.0.1:41080`, страна выхода на выбор. Пригодится, если адреса WARP у сервиса на плохом счету. При смене страны прежний `psiphon.config` удаляется — иначе переменные окружения не применятся. **По умолчанию выключен** |
+| Psiphon | альтернатива WARP: контейнер `swarupsengupta2007/psiphon` с SOCKS5 на `127.0.0.1:41080`, страна выхода на выбор — 31 страна плюс ввод произвольного кода. Пригодится, если адреса WARP у сервиса на плохом счету. При смене страны прежний `psiphon.config` удаляется — иначе переменные окружения не применятся. **По умолчанию выключен** |
 | Блокировка торрентов | `tblocker` + резервный egress-фильтр на nftables (порты 6881–6889, 51413) + справка по настройке панели |
 | TrafficGuard-auto | установка [TrafficGuard-auto](https://github.com/DonMatteoVPN/TrafficGuard-auto) — защита от сканеров и ботов, меню `rknpidor` |
 
@@ -113,6 +118,7 @@ ZeroSSL или Google Trust Services. Последним двум нужны EAB
 - `/opt/psiphon/docker-compose.yml` и `/opt/remnanode/panel-psiphon-outbound.json` —
   только при включении Psiphon
 - `/opt/tblocker/config.yaml`
+- `/opt/remnanode/auto-update.sh` — при включённом автообновлении ноды
 - `/opt/remnanode/docker-compose.yml` — только при установке ноды. Содержит
   `SECRET_KEY`, поэтому создаётся с правами `0600`
 - `/var/log/remnanode/access.log`, `/var/log/remnanode/error.log` — пустые файлы

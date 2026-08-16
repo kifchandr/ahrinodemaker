@@ -1190,6 +1190,85 @@ def block_node_update(compose_path: str | None = None) -> None:
 
 
 # ------------------------------------------------------------------ #
+# Автообновление ноды при загрузке сервера
+# ------------------------------------------------------------------ #
+NODE_AUTOUPDATE_SCRIPT = f"{INSTALL_DIR}/auto-update.sh"
+NODE_AUTOUPDATE_LOG = f"{NODE_LOG_DIR}/auto-update.log"
+NODE_AUTOUPDATE_MARKER = "# AhriNode tool: автообновление ноды при загрузке"
+
+NODE_AUTOUPDATE_BODY = """#!/usr/bin/env bash
+# Обновление образа ноды при старте сервера. Создано AhriNode tool.
+set -uo pipefail
+
+COMPOSE=__COMPOSE__
+LOG=__LOG__
+
+log() { echo "[$(date '+%F %T')] $*" >> "$LOG"; }
+
+# Докеру нужно время после загрузки: без ожидания pull падает на неготовом демоне
+for _ in $(seq 1 30); do
+  docker info >/dev/null 2>&1 && break
+  sleep 5
+done
+
+if ! docker info >/dev/null 2>&1; then
+  log "docker не поднялся — обновление пропущено"
+  exit 1
+fi
+
+if [ ! -f "$COMPOSE" ]; then
+  log "файл $COMPOSE не найден — обновление пропущено"
+  exit 1
+fi
+
+before=$(docker inspect -f '{{.Image}}' remnanode 2>/dev/null || echo none)
+if ! out=$(docker compose -f "$COMPOSE" pull 2>&1); then
+  log "pull не удался: $(echo "$out" | tail -n 3 | tr '\\n' ' ')"
+  exit 1
+fi
+if ! out=$(docker compose -f "$COMPOSE" up -d --remove-orphans 2>&1); then
+  log "up не удался: $(echo "$out" | tail -n 3 | tr '\\n' ' ')"
+  exit 1
+fi
+after=$(docker inspect -f '{{.Image}}' remnanode 2>/dev/null || echo none)
+
+if [ "$before" = "$after" ]; then
+  log "образ не изменился ($after)"
+else
+  log "обновлено: $before -> $after"
+fi
+"""
+
+
+def block_node_autoupdate(compose_path: str | None = None) -> None:
+    step("Автообновление ноды при загрузке сервера")
+
+    if not compose_path:
+        found = find_compose_candidates()
+        compose_path = found[0] if found else None
+    if not compose_path:
+        console.print("[yellow]docker-compose ноды не найден — автообновление "
+                      "пропущено.[/yellow]")
+        return
+
+    prepare_node_logs()
+    body = (NODE_AUTOUPDATE_BODY
+            .replace("__COMPOSE__", shlex.quote(compose_path))
+            .replace("__LOG__", shlex.quote(NODE_AUTOUPDATE_LOG)))
+    write_file(NODE_AUTOUPDATE_SCRIPT, body, mode=0o755)
+
+    # @reboot, а не расписание по времени: сервер и так перезагружается по
+    # cron, так что обновление приходит вместе с перезагрузкой и не роняет
+    # ноду посреди рабочего дня.
+    _crontab_replace_block(NODE_AUTOUPDATE_MARKER,
+                           [f"@reboot {NODE_AUTOUPDATE_SCRIPT}"])
+    console.print("[green]✓ Нода будет обновляться при каждой загрузке "
+                  "сервера[/green]")
+    console.print(f"[dim]Скрипт: {NODE_AUTOUPDATE_SCRIPT}, "
+                  f"журнал: {NODE_AUTOUPDATE_LOG}[/dim]")
+
+
+# ------------------------------------------------------------------ #
 # Hysteria2 (QUIC) поверх уже работающей ноды
 # ------------------------------------------------------------------ #
 # Hysteria2 в Remnawave требует TLS-сертификата в виде файлов, доступных
@@ -1824,7 +1903,11 @@ PSIPHON_SOCKS_PORT = 41080
 PSIPHON_CONTAINER = "psiphon"
 
 # Страны выхода. Для Gemini годится любая, где он доступен.
-PSIPHON_REGIONS = ["US", "GB", "NL", "DE", "FR", "SE", "CA", "JP", "SG"]
+PSIPHON_REGIONS = [
+    "AT", "AU", "BE", "BG", "CA", "CH", "CZ", "DE", "DK", "EE", "ES", "FI",
+    "FR", "GB", "HU", "IE", "IN", "IT", "JP", "LV", "NL", "NO", "PL", "PT",
+    "RO", "RS", "SE", "SG", "SK", "UA", "US",
+]
 
 
 def psiphon_compose(egress_region: str, device_region: str) -> str:
@@ -2369,6 +2452,7 @@ BLOCKS = [
     ("network", "Сеть: conntrack + sysctl (BBR, буферы, очереди)", block_network),
     ("remnanode_logs", "Логи remnanode: каталог + logrotate + volume в docker-compose", block_remnanode_logs),
     ("node_update", "Обновление remnanode (docker compose pull + пересоздание)", block_node_update),
+    ("node_autoupdate", "Автообновление ноды при загрузке сервера", block_node_autoupdate),
     ("hysteria", "Hysteria2 (QUIC): сертификаты в /dev/shm + 443/udp + автообновление", block_hysteria),
     ("warp", "WARP: чистый egress для нейросетей (Gemini, ChatGPT) и стримингов", block_warp),
     ("psiphon", "Psiphon: альтернативный egress, если WARP не помог", block_psiphon),
@@ -2439,6 +2523,13 @@ def _detect_remnanode_logs() -> bool:
             and os.path.isdir("/var/log/remnanode"))
 
 
+def _detect_node_autoupdate() -> bool:
+    if not os.path.isfile(NODE_AUTOUPDATE_SCRIPT):
+        return False
+    cr = probe(["crontab", "-l"])
+    return cr.returncode == 0 and NODE_AUTOUPDATE_SCRIPT in cr.stdout
+
+
 def _detect_hysteria() -> bool:
     if not (os.path.isfile(HYSTERIA_CERT) and os.path.isfile(HYSTERIA_KEY)):
         return False
@@ -2472,6 +2563,7 @@ DETECTORS = {
     "network":        _detect_network,
     "time_cron":      _detect_time_cron,
     "remnanode_logs": _detect_remnanode_logs,
+    "node_autoupdate": _detect_node_autoupdate,
     "hysteria":       _detect_hysteria,
     "warp":           _detect_warp,
     "psiphon":        _detect_psiphon,
@@ -2599,22 +2691,14 @@ def menu_remnawave_node() -> None:
     console.print(f"[bold]Текущее расписание перезагрузки:[/bold] "
                   f"{current_reboot_schedule()}")
 
-    # Состояние remnanode (проверка версии в реестре может занять пару секунд)
-    console.print("[dim]Проверяю версию remnanode…[/dim]")
-    try:
-        node_status, node_path, node_image = node_update_status()
-    except OSError as exc:
-        # Проверка версии — вспомогательная; её сбой не должен мешать меню.
-        console.print(f"[dim]Не удалось определить состояние ноды: {exc}[/dim]")
-        node_status, node_path, node_image = "absent", None, None
-    node_note = {
-        "update":  "[yellow]доступно обновление[/yellow]",
-        "latest":  "[green]установлена последняя версия[/green]",
-        "unknown": "[dim]не удалось проверить версию (реестр недоступен)[/dim]",
-    }.get(node_status)
-    if node_note:
-        suffix = f" [dim]({node_image})[/dim]" if node_image else ""
-        console.print(f"[bold]remnanode:[/bold] {node_note}{suffix}")
+    # Раньше здесь опрашивался реестр образов, чтобы узнать, вышла ли новая
+    # версия ноды. Это добавляло несколько секунд ожидания при каждом входе в
+    # меню, а пользы давало мало: пункт обновления безвреден и когда версия
+    # свежая. Ограничиваемся дешёвой проверкой — есть ли на сервере compose.
+    node_candidates = find_compose_candidates()
+    node_path = node_candidates[0] if node_candidates else None
+    if node_path:
+        console.print(f"[bold]Нода:[/bold] {node_path}")
     console.print()
 
     # 1. Проверяем, что уже настроено на сервере, — такие блоки по умолчанию
@@ -2625,13 +2709,13 @@ def menu_remnawave_node() -> None:
     console.print()
 
     # 2. Выбор блоков галочками. Уже настроенные блоки идут без галочки.
-    #    Пункт обновления ноды показываем только если нода установлена и её
-    #    версия не последняя (или версию не удалось проверить).
-    # Ноды на сервере нет: 'absent' означает, что docker-compose не найден либо
-    # в нём нет образа. В этом случае показываем пункт установки, а блок логов
-    # прячем — установка сама создаёт каталог, файлы, volume и ротацию, а
-    # патчить ему всё равно нечего: compose ещё не существует.
-    node_missing = node_status == "absent" and not find_compose_candidates()
+    #    Пункты установки и обновления ноды взаимоисключающие: показываем тот,
+    #    что уместен. Ноды нет — предлагаем установку и прячем блок логов
+    #    (установка сама всё сделает, а патчить нечего: compose ещё нет).
+    #    Нода есть — предлагаем обновление, но БЕЗ галочки: тянуть образ при
+    #    каждом прогоне незачем, а нужна ли свежая версия, скрипт больше не
+    #    выясняет заранее.
+    node_missing = node_path is None
 
     shown_keys: list[str] = []
     choices = []
@@ -2641,18 +2725,15 @@ def menu_remnawave_node() -> None:
                 choices.append(questionary.Choice(label, value=key, checked=True))
                 shown_keys.append(key)
             continue
+        # Блок логов при отсутствии ноды бесполезен: установка делает то же
+        # самое. А вот автообновление прятать нельзя — установка его не
+        # настраивает, и стоит оно после неё, так что compose уже появится.
         if key == "remnanode_logs" and node_missing:
             continue
         if key == "node_update":
-            if node_status == "update":
-                choices.append(questionary.Choice(label, value=key, checked=True))
+            if not node_missing:
+                choices.append(questionary.Choice(label, value=key, checked=False))
                 shown_keys.append(key)
-            elif node_status == "unknown":
-                choices.append(questionary.Choice(
-                    label + "   [версию проверить не удалось]",
-                    value=key, checked=False))
-                shown_keys.append(key)
-            # 'absent' и 'latest' — пункт не показываем
             continue
         is_applied = applied.get(key, False)
         suffix = "   [уже настроено]" if is_applied else ""
@@ -2795,7 +2876,7 @@ def menu_remnawave_node() -> None:
                 func(psiphon_params)
             elif key == "remnanode_logs":
                 func(compose_path)
-            elif key == "node_update":
+            elif key in ("node_update", "node_autoupdate"):
                 func(node_path)
             elif key == "time_cron":
                 func(reboot_schedule)
@@ -3838,11 +3919,12 @@ def menu_tools() -> None:
 # Установка самого скрипта как команды
 # ================================================================== #
 SELF_PATH = "/usr/local/bin/ahrinodemaker"
-SELF_SHORTCUT = "/usr/local/bin/ahri"
+SELF_SHORTCUTS = ["/usr/local/bin/ahri", "/usr/local/bin/ahrinode"]
 
 
 def _self_installed() -> bool:
-    return os.path.isfile(SELF_PATH) and os.path.exists(SELF_SHORTCUT)
+    return (os.path.isfile(SELF_PATH)
+            and all(os.path.exists(p) for p in SELF_SHORTCUTS))
 
 
 def install_self() -> None:
@@ -3883,14 +3965,17 @@ def install_self() -> None:
             with open(staged, encoding="utf-8") as f:
                 write_file(SELF_PATH, f.read(), mode=0o755)
 
-    # Ярлык переcоздаём всегда: он мог указывать на старое место
-    if os.path.islink(SELF_SHORTCUT) or os.path.exists(SELF_SHORTCUT):
-        os.unlink(SELF_SHORTCUT)
-    os.symlink(SELF_PATH, SELF_SHORTCUT)
+    # Ярлыки пересоздаём всегда: они могли указывать на старое место
+    for link in SELF_SHORTCUTS:
+        if os.path.islink(link) or os.path.exists(link):
+            os.unlink(link)
+        os.symlink(SELF_PATH, link)
 
+    names = ", ".join(os.path.basename(p) for p in SELF_SHORTCUTS)
     console.print(f"[green]✓ Установлено: {SELF_PATH}[/green]")
-    console.print("[green]✓ Короткая команда: [bold]sudo ahri[/bold][/green]")
-    console.print("[dim]Полное имя тоже работает: sudo ahrinodemaker[/dim]")
+    console.print(f"[green]✓ Короткие команды: [bold]{names}[/bold][/green]")
+    console.print("[dim]Любая из них запускает скрипт: sudo ahri, "
+                  "sudo ahrinode, sudo ahrinodemaker[/dim]")
 
 
 # ================================================================== #
@@ -3925,7 +4010,8 @@ def main() -> None:
         # превратился бы в постоянный шум в меню.
         if not _self_installed():
             choices.append(questionary.Choice(
-                "Установить короткую команду «ahri»", value="install_self"))
+                "Установить короткие команды «ahri» и «ahrinode»",
+                value="install_self"))
         choices.append(questionary.Choice("Выход", value="exit"))
 
         choice = questionary.select(
