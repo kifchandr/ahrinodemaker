@@ -1885,7 +1885,26 @@ def block_psiphon(params: tuple[str, str] | None = None) -> None:
 
     os.makedirs(f"{PSIPHON_DIR}/config", exist_ok=True)
     compose_path = f"{PSIPHON_DIR}/docker-compose.yml"
+
+    # Переменные окружения контейнер читает ТОЛЬКО при первом запуске: дальше
+    # он берёт параметры из config/psiphon.config. Без этой очистки смена
+    # страны выхода в compose молча не применялась бы, и трафик продолжал бы
+    # выходить через прежнюю страну.
+    region_marker = f"{PSIPHON_DIR}/.egress-region"
+    previous = ""
+    try:
+        with open(region_marker, encoding="utf-8") as f:
+            previous = f.read().strip()
+    except OSError:
+        pass
+    generated = f"{PSIPHON_DIR}/config/psiphon.config"
+    if previous and previous != egress and os.path.isfile(generated):
+        os.unlink(generated)
+        console.print(f"[cyan]Страна выхода меняется {previous} → {egress}: "
+                      "прежний psiphon.config удалён, иначе он бы победил.[/cyan]")
+
     write_file(compose_path, psiphon_compose(egress, device))
+    write_file(region_marker, egress + "\n")
     console.print(f"[green]✓ Конфигурация записана: {compose_path} "
                   f"(страна выхода {egress})[/green]")
 
