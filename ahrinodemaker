@@ -2016,6 +2016,13 @@ FAIL_MIN=30; FAIL_MAX=120
 # Как часто дёргать саму страницу Gemini, если страна выхода не менялась
 FULL_EVERY=900
 
+# Порог «слишком медленно». Скорость берётся из той же загрузки страницы, что и
+# проверка доступности, — отдельного замера, а значит и лишнего трафика, нет.
+# Медленно ≠ сломано, поэтому страна меняется только после SLOW_STRIKES подряд.
+SLOW_SPEED=30000      # байт/с
+SLOW_SECS=15          # секунд на страницу
+SLOW_STRIKES=3
+
 log() { echo "[$(date '+%F %T')] $*" >> "$LOG"; }
 rnd() { echo $(( RANDOM % ($2 - $1 + 1) + $1 )); }
 
@@ -2027,18 +2034,43 @@ exit_country() {
        https://ipinfo.io/country 2>/dev/null | tr -d '[:space:]'
 }
 
-# 0 — работает, 1 — заглушка «недоступно в вашей стране», 2 — сеть/туннель
+# 0 — работает, 1 — заглушка «недоступно в вашей стране», 2 — сеть/туннель,
+# 3 — открывается, но медленно. Замеры кладём в LAST_SPEED и LAST_TIME.
+LAST_SPEED=0; LAST_TIME=0
 check_gemini() {
-  local out code body
-  out=$(curl -s -x "socks5h://127.0.0.1:$PORT" --max-time 25 \
+  local out stats code speed tsec body
+  out=$(curl -s -x "socks5h://127.0.0.1:$PORT" --max-time 40 \
         -H 'Accept-Language: en-US,en;q=0.9' -A "$UA" \
-        -w '\n%{http_code}' https://gemini.google.com/app 2>/dev/null) || return 2
-  code=${out##*$'\n'}
+        -w '\n%{http_code} %{speed_download} %{time_total}' \
+        https://gemini.google.com/app 2>/dev/null) || return 2
+  stats=${out##*$'\n'}
   body=${out%$'\n'*}
+  code=$(echo "$stats" | cut -d' ' -f1)
+  speed=$(echo "$stats" | cut -d' ' -f2 | cut -d. -f1)
+  tsec=$(echo "$stats" | cut -d' ' -f3 | cut -d. -f1)
+  LAST_SPEED=${speed:-0}; LAST_TIME=${tsec:-0}
+
   [ "$code" = "200" ] || return 2
   [ ${#body} -lt 500 ] && return 2
   grep -qiE "$MARKERS" <<<"$body" && return 1
+  # Скорость считаем только на осмысленном объёме: на крошечном ответе
+  # speed_download отражает задержку, а не пропускную способность
+  if [ ${#body} -gt 50000 ]; then
+    if [ "$LAST_SPEED" -lt "$SLOW_SPEED" ] || [ "$LAST_TIME" -gt "$SLOW_SECS" ]; then
+      return 3
+    fi
+  fi
   return 0
+}
+
+human_speed() {
+  if [ "$LAST_SPEED" -ge 1048576 ]; then
+    echo "$((LAST_SPEED / 1048576)) МБ/с"
+  elif [ "$LAST_SPEED" -ge 1024 ]; then
+    echo "$((LAST_SPEED / 1024)) КБ/с"
+  else
+    echo "$LAST_SPEED Б/с"
+  fi
 }
 
 current_region() {
@@ -2076,8 +2108,9 @@ rotate() {
     switch_region "$region" || { log "$region: туннель не построился"; continue; }
     check_gemini
     case $? in
-      0) log "$region: Gemini доступен, страна закреплена"; return 0 ;;
+      0) log "$region: Gemini доступен ($(human_speed)), страна закреплена"; return 0 ;;
       1) log "$region: заглушка, пробую дальше" ;;
+      3) log "$region: открывается, но медленно ($(human_speed)), пробую дальше" ;;
       *) log "$region: туннель не отвечает, пробую дальше" ;;
     esac
   done < "$COUNTRIES"
@@ -2111,19 +2144,23 @@ while true; do
   # Иначе страна прежняя и полная проверка недавняя — считаем, что всё в порядке
 
   if [ $rc -eq 0 ]; then
-    [ $fails -gt 0 ] && log "снова работает (страна $country)"
+    [ $fails -gt 0 ] && log "снова работает (страна $country, $(human_speed))"
     fails=0
     sleep "$(rnd $OK_MIN $OK_MAX)"
     continue
   fi
 
   fails=$((fails + 1))
-  reason=$([ $rc -eq 1 ] && echo "заглушка «недоступно в вашей стране»" || echo "туннель недоступен")
+  case $rc in
+    1) reason="заглушка «недоступно в вашей стране»"; need=2 ;;
+    3) reason="медленно: $(human_speed), страница за ${LAST_TIME}с"; need=$SLOW_STRIKES ;;
+    *) reason="туннель недоступен"; need=2 ;;
+  esac
   log "проверка не прошла ($reason, страна ${country:-неизвестна}), подряд: $fails"
 
   # Одиночный сбой не повод дёргать контейнер: сеть моргает, Psiphon
-  # переподключается. Меняем страну только после двух подряд.
-  if [ $fails -ge 2 ]; then
+  # переподключается. Медленно — сигнал ещё более шумный, поэтому порог выше.
+  if [ $fails -ge $need ]; then
     if rotate; then
       fails=0
       last_country=$(exit_country)
