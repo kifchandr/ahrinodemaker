@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import re
+import argparse
 import sys
 import json
 import time
@@ -41,6 +42,11 @@ INSTALL_DIR  = "/opt/remnanode"
 
 # Часовой пояс сервера. Расписание перезагрузки (03:00) считается по нему.
 TIMEZONE = "Europe/Moscow"
+
+# Порт, по которому панель Remnawave управляет нодой. Сам адрес панели в коде
+# не хранится: он спрашивается при настройке UFW либо передаётся аргументом
+# --panel-ip, чтобы скрипт не нёс в себе сведений о чужой инфраструктуре.
+PANEL_PORT = "2222"
 
 # ------------------------------------------------------------------ #
 # Сторонние скрипты: зафиксированные копии (vendoring)
@@ -89,6 +95,25 @@ VENDOR = {
 # ------------------------------------------------------------------ #
 # Заголовок окна терминала
 # ------------------------------------------------------------------ #
+def parse_cli() -> dict:
+    """Аргументы командной строки.
+
+    При запуске через конвейер их тоже можно передать — интерпретатору нужно
+    явно указать чтение со стандартного ввода:
+        curl -fsSL <URL> | sudo python3 - --panel-ip 203.0.113.10
+    """
+    parser = argparse.ArgumentParser(
+        prog=APP_NAME, add_help=True,
+        description="Настройка сервера под ноду Remnawave.")
+    parser.add_argument(
+        "--panel-ip", metavar="АДРЕС", default=None,
+        help="адрес или подсеть панели: порт %s откроется только для них. "
+             "Если не задан, скрипт спросит при настройке UFW." % PANEL_PORT)
+    # parse_known_args: посторонние аргументы не должны валить запуск
+    args, _ = parser.parse_known_args()
+    return {"panel_ip": args.panel_ip}
+
+
 def set_window_title(title: str) -> None:
     try:
         sys.stdout.write(f"\33]0;{title}\a")
@@ -572,7 +597,7 @@ def block_fail2ban() -> None:
                   + (service_diagnostics("fail2ban", 15) or "нет данных в журнале"))
 
 
-def block_ufw(extra_ports: list[str]) -> None:
+def block_ufw(extra_ports: list[str], panel_ip: str | None = None) -> None:
     step("Настройка UFW (firewall)")
     ensure_packages("ufw")
     run(["ufw", "default", "deny", "incoming"])
@@ -580,8 +605,19 @@ def block_ufw(extra_ports: list[str]) -> None:
     run(["ufw", "limit", "ssh"])
     for port in ("80/tcp", "443/tcp", "8443/tcp", "9999/tcp"):
         run(["ufw", "allow", port])
-    run(["ufw", "allow", "from", "109.248.168.105", "to", "any",
-         "port", "2222", "proto", "tcp"])
+
+    # Порт, по которому панель управляет нодой. Адрес панели в коде не зашит:
+    # он спрашивается при настройке или передаётся аргументом --panel-ip.
+    if panel_ip:
+        run(["ufw", "allow", "from", panel_ip, "to", "any",
+             "port", PANEL_PORT, "proto", "tcp"])
+        console.print(f"[green]✓ Порт {PANEL_PORT} открыт только для "
+                      f"{panel_ip}[/green]")
+    else:
+        run(["ufw", "allow", f"{PANEL_PORT}/tcp"])
+        console.print(f"[yellow]Порт {PANEL_PORT} открыт для всех адресов. "
+                      "Ограничить его адресом панели можно, прогнав блок "
+                      "заново или запустив скрипт с --panel-ip.[/yellow]")
     # Дополнительные порты, введённые пользователем
     for port in extra_ports:
         run(["ufw", "allow", port])
@@ -2671,6 +2707,31 @@ def parse_extra_ports(raw: str) -> tuple[list[str], list[str]]:
     return valid, invalid
 
 
+def ask_panel_ip() -> str | None:
+    """Ограничивать ли порт панели одним адресом.
+
+    Пропуск — осознанный выбор «не ограничивать»: порт откроется для всех.
+    Ограничение спрашивается, только если адрес не передан аргументом."""
+    raw = questionary.text(
+        f"Ограничить порт {PANEL_PORT} (панель → нода) адресом панели?\n"
+        "  Введите адрес или подсеть — порт откроется только для них.\n"
+        "  Enter — не ограничивать, порт будет открыт для всех.\n"
+        "  Адрес:",
+        default="", style=CUSTOM_STYLE).ask()
+    if raw is None or not raw.strip():
+        return None
+    value = raw.strip()
+    try:
+        net = ipaddress.ip_network(value, strict=False)
+    except ValueError:
+        console.print(f"[red]«{value}» не похож на адрес или подсеть — "
+                      "ограничение не будет применено.[/red]")
+        return None
+    # Одиночный адрес отдаём без маски: ufw принимает и так, а в выводе
+    # `ufw status` он выглядит привычнее
+    return value if "/" in value else str(net.network_address)
+
+
 def ask_extra_ports() -> list[str]:
     while True:
         raw = questionary.text(
@@ -2792,7 +2853,13 @@ def menu_remnawave_node() -> None:
 
     # 3. Доп. порты — только если выбран блок UFW
     extra_ports: list[str] = []
+    panel_ip = CLI.get("panel_ip")
     if "ufw" in selected:
+        if panel_ip:
+            console.print(f"[dim]Адрес панели взят из аргумента --panel-ip: "
+                          f"{panel_ip}[/dim]")
+        else:
+            panel_ip = ask_panel_ip()
         extra_ports = ask_extra_ports()
 
     # 4. Путь к docker-compose ноды — только если выбран блок логов remnanode
@@ -2825,6 +2892,10 @@ def menu_remnawave_node() -> None:
         console.print("[bold]Обновление пакетов:[/bold] да (apt update && upgrade)")
     if "time_cron" in selected:
         console.print(f"[bold]Перезагрузка:[/bold] {schedule_human} (МСК)")
+    if "ufw" in selected:
+        console.print(f"[bold]Порт {PANEL_PORT}:[/bold] "
+                      + (f"только для {panel_ip}" if panel_ip
+                         else "[yellow]открыт для всех[/yellow]"))
     if extra_ports:
         console.print(f"[bold]Доп. порты UFW:[/bold] {', '.join(extra_ports)}")
     if node_params:
@@ -2875,7 +2946,7 @@ def menu_remnawave_node() -> None:
             continue
         try:
             if key == "ufw":
-                func(extra_ports)
+                func(extra_ports, panel_ip)
             elif key == "node_install":
                 func(node_params)
             elif key == "hysteria":
@@ -3991,7 +4062,13 @@ def install_self() -> None:
 # ================================================================== #
 # Точка входа: главное меню
 # ================================================================== #
+CLI: dict = {}
+
+
 def main() -> None:
+    global CLI
+    CLI = parse_cli()
+
     if not reattach_tty():
         console.print(
             "[red]Нет доступа к терминалу для интерактивного выбора.[/red]\n"
