@@ -1978,6 +1978,176 @@ def psiphon_compose(egress_region: str, device_region: str) -> str:
 """
 
 
+PSIPHON_WATCHDOG = f"{PSIPHON_DIR}/watchdog.sh"
+PSIPHON_WATCHDOG_LOG = f"{PSIPHON_DIR}/watchdog.log"
+PSIPHON_COUNTRIES_FILE = f"{PSIPHON_DIR}/watchdog.countries"
+
+# Страница «Gemini пока не поддерживается в вашей стране» отдаётся с кодом 200,
+# поэтому отличить её от рабочей можно только по содержимому. Маркеры собраны
+# на нескольких языках: Accept-Language мы задаём английский, но Google не
+# всегда его слушается.
+GEMINI_BLOCK_MARKERS = "|".join([
+    "not available in your country",
+    "isn.t available in your country",
+    "not supported in your country",
+    "isn.t supported in your country",
+    "not currently supported in your country",
+    "не поддерживается в вашей стране",
+    "недоступен в вашей стране",
+])
+
+PSIPHON_WATCHDOG_BODY = """#!/usr/bin/env bash
+# Следит за доступностью Gemini через Psiphon и подбирает страну.
+# Создано AhriNode tool.
+set -uo pipefail
+
+DIR=__DIR__
+PORT=__PORT__
+LOG=__LOG__
+COUNTRIES=__COUNTRIES__
+MARKERS=__MARKERS__
+STATE="$DIR/.watchdog-state"
+COMPOSE="$DIR/docker-compose.yml"
+UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0 Safari/537.36"
+
+log() { echo "[$(date '+%F %T')] $*" >> "$LOG"; }
+
+# 0 — работает, 1 — заглушка «недоступно в вашей стране», 2 — сеть/туннель
+check_gemini() {
+  local out code body
+  out=$(curl -s -x "socks5h://127.0.0.1:$PORT" --max-time 25 \\
+        -H 'Accept-Language: en-US,en;q=0.9' -A "$UA" \\
+        -w '\\n%{http_code}' https://gemini.google.com/app 2>/dev/null) || return 2
+  code=${out##*$'\\n'}
+  body=${out%$'\\n'*}
+  [ "$code" = "200" ] || return 2
+  # Пустой ответ значит, что через туннель ничего не пришло
+  [ ${#body} -lt 500 ] && return 2
+  grep -qiE "$MARKERS" <<<"$body" && return 1
+  return 0
+}
+
+current_region() {
+  sed -n 's/.*EGRESS_REGION=\\([A-Z][A-Z]\\).*/\\1/p' "$COMPOSE" | head -n1
+}
+
+exit_country() {
+  curl -s -x "socks5h://127.0.0.1:$PORT" --max-time 20 https://ipinfo.io/country 2>/dev/null | tr -d '[:space:]'
+}
+
+switch_region() {
+  local region=$1
+  log "переключаю страну выхода на $region"
+  sed -i "s/EGRESS_REGION=.*/EGRESS_REGION=$region/" "$COMPOSE"
+  sed -i "s/DEVICE_REGION=.*/DEVICE_REGION=$region/" "$COMPOSE"
+  # Переменные окружения читаются только при первом запуске: без удаления
+  # конфига контейнер поднимется со старой страной
+  rm -f "$DIR/config/psiphon.config"
+  echo "$region" > "$DIR/.egress-region"
+  (cd "$DIR" && docker compose up -d --force-recreate) >/dev/null 2>&1
+  # Ждём, пока туннель построится
+  for _ in $(seq 1 24); do
+    sleep 5
+    curl -s -x "socks5h://127.0.0.1:$PORT" --max-time 10 https://ipinfo.io/ip >/dev/null 2>&1 && return 0
+  done
+  return 1
+}
+
+[ -f "$COMPOSE" ] || { log "нет $COMPOSE — сторож остановлен"; exit 1; }
+
+check_gemini; rc=$?
+if [ $rc -eq 0 ]; then
+  echo 0 > "$STATE"
+  exit 0
+fi
+
+# Одиночный сбой не повод дёргать контейнер: сеть моргает, Psiphon
+# переподключается. Меняем страну только после двух подряд.
+fails=$(cat "$STATE" 2>/dev/null || echo 0)
+fails=$((fails + 1))
+echo "$fails" > "$STATE"
+reason=$([ $rc -eq 1 ] && echo "заглушка «недоступно в вашей стране»" || echo "туннель недоступен")
+log "проверка не прошла ($reason), подряд: $fails"
+[ "$fails" -lt 2 ] && exit 0
+
+now=$(current_region)
+log "текущая страна $now, внешний адрес в $(exit_country)"
+
+tried=0
+while read -r region; do
+  [ -z "$region" ] && continue
+  [ "$region" = "$now" ] && continue
+  tried=$((tried + 1))
+  [ "$tried" -gt 4 ] && { log "перебрано 4 страны, ни одна не подошла — до следующего запуска"; break; }
+
+  if ! switch_region "$region"; then
+    log "$region: туннель не построился"
+    continue
+  fi
+  check_gemini; rc=$?
+  if [ $rc -eq 0 ]; then
+    log "$region: Gemini доступен, страна закреплена (адрес в $(exit_country))"
+    echo 0 > "$STATE"
+    exit 0
+  fi
+  log "$region: не помогло ($([ $rc -eq 1 ] && echo заглушка || echo туннель))"
+done < "$COUNTRIES"
+
+log "подходящая страна не найдена"
+exit 1
+"""
+
+PSIPHON_WATCHDOG_SERVICE = f"""[Unit]
+Description=Проверка доступности Gemini через Psiphon
+After=docker.service
+
+[Service]
+Type=oneshot
+ExecStart={PSIPHON_WATCHDOG}
+"""
+
+PSIPHON_WATCHDOG_TIMER = """[Unit]
+Description=Периодическая проверка Gemini через Psiphon
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+"""
+
+
+def _setup_psiphon_watchdog(current: str) -> None:
+    """Сторож: проверяет Gemini и подбирает страну, если он недоступен."""
+    # Кандидаты — страны, где Gemini работает; текущая идёт первой строкой,
+    # чтобы после перебора сторож вернулся к ней при следующей проверке
+    candidates = [c for c, _ in PSIPHON_REGIONS
+                  if c not in ("RS", "UA", "IN")]
+    ordered = [current] + [c for c in candidates if c != current]
+    write_file(PSIPHON_COUNTRIES_FILE, "\n".join(ordered) + "\n")
+
+    body = (PSIPHON_WATCHDOG_BODY
+            .replace("__DIR__", shlex.quote(PSIPHON_DIR))
+            .replace("__PORT__", str(PSIPHON_SOCKS_PORT))
+            .replace("__LOG__", shlex.quote(PSIPHON_WATCHDOG_LOG))
+            .replace("__COUNTRIES__", shlex.quote(PSIPHON_COUNTRIES_FILE))
+            .replace("__MARKERS__", shlex.quote(GEMINI_BLOCK_MARKERS)))
+    write_file(PSIPHON_WATCHDOG, body, mode=0o755)
+
+    write_file("/etc/systemd/system/psiphon-watchdog.service",
+               PSIPHON_WATCHDOG_SERVICE)
+    write_file("/etc/systemd/system/psiphon-watchdog.timer",
+               PSIPHON_WATCHDOG_TIMER)
+    run(["systemctl", "daemon-reload"], check=False)
+    run(["systemctl", "enable", "--now", "psiphon-watchdog.timer"], check=False)
+
+    console.print("[green]✓ Сторож включён: проверка каждые 15 минут[/green]")
+    console.print(f"[dim]Журнал: {PSIPHON_WATCHDOG_LOG}, "
+                  f"список стран: {PSIPHON_COUNTRIES_FILE}[/dim]")
+
+
 def psiphon_outbound_reference(socks_address: str) -> str:
     return json.dumps({
         "outboundToAdd": {
@@ -2015,14 +2185,14 @@ def _psiphon_check() -> tuple[bool, str]:
     return True, f"{data.get('ip', '?')} ({data.get('country', '?')})"
 
 
-def block_psiphon(params: tuple[str, str] | None = None) -> None:
+def block_psiphon(params: tuple[str, str, bool] | None = None) -> None:
     step("Psiphon: альтернативный egress для нейросетей")
 
     if shutil.which("docker") is None:
         raise RuntimeError("Docker не установлен — сначала установите ноду")
     ensure_packages("curl")
 
-    egress, device = params if params else ("US", "US")
+    egress, device, watchdog = params if params else ("US", "US", False)
 
     os.makedirs(f"{PSIPHON_DIR}/config", exist_ok=True)
     compose_path = f"{PSIPHON_DIR}/docker-compose.yml"
@@ -2076,13 +2246,23 @@ def block_psiphon(params: tuple[str, str] | None = None) -> None:
     os.makedirs(INSTALL_DIR, exist_ok=True)
     write_file(ref_path, psiphon_outbound_reference(socks_address))
     console.print(f"[green]✓ Заготовка для панели: {ref_path}[/green]")
+    if watchdog:
+        _setup_psiphon_watchdog(egress)
+    else:
+        # Сторож мог остаться от прежней настройки — выключаем, иначе он
+        # продолжит менять страну вопреки только что сделанному выбору
+        if os.path.isfile("/etc/systemd/system/psiphon-watchdog.timer"):
+            run(["systemctl", "disable", "--now", "psiphon-watchdog.timer"],
+                check=False)
+            console.print("[dim]Автоподбор страны выключен[/dim]")
+
     console.print(
         "[bold yellow]Важно:[/bold yellow] в панели Remnawave добавьте outbound "
         f"и правило из {ref_path}, поставив правило ВЫШЕ правила с DIRECT. "
         "Если те же домены уже уходят в WARP — оставьте что-то одно.")
 
 
-def ask_psiphon_params() -> tuple[str, str] | None:
+def ask_psiphon_params() -> tuple[str, str, bool] | None:
     egress = questionary.select(
         "Страна выхода Psiphon (через неё сервисы увидят ваш трафик):",
         choices=[*[questionary.Choice(f"{code} ({name})", value=code)
@@ -2098,9 +2278,15 @@ def ask_psiphon_params() -> tuple[str, str] | None:
             console.print("[red]Нужен двухбуквенный код страны.[/red]")
             return None
         egress = raw.strip().upper()
+    watchdog = questionary.confirm(
+        "Проверять доступность Gemini и подбирать страну автоматически?",
+        default=True, style=CUSTOM_STYLE).ask()
+    if watchdog is None:
+        return None
+
     # DEVICE_REGION описывает «откуда» клиент: оставляем совпадающим с выходом,
     # чтобы Psiphon не подбирал маршрут под другую страну.
-    return (egress, egress)
+    return (egress, egress, bool(watchdog))
 
 
 # ------------------------------------------------------------------ #
@@ -2836,7 +3022,7 @@ def menu_remnawave_node() -> None:
     # 4. Домен для Hysteria2 — только если выбран этот блок
     warp_license = ask_warp_license() if "warp" in selected else ""
 
-    psiphon_params: tuple[str, str] | None = None
+    psiphon_params: tuple[str, str, bool] | None = None
     if "psiphon" in selected:
         psiphon_params = ask_psiphon_params()
         if psiphon_params is None:
