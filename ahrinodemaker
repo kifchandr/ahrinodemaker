@@ -1904,9 +1904,17 @@ PSIPHON_CONTAINER = "psiphon"
 
 # Страны выхода. Для Gemini годится любая, где он доступен.
 PSIPHON_REGIONS = [
-    "AT", "AU", "BE", "BG", "CA", "CH", "CZ", "DE", "DK", "EE", "ES", "FI",
-    "FR", "GB", "HU", "IE", "IN", "IT", "JP", "LV", "NL", "NO", "PL", "PT",
-    "RO", "RS", "SE", "SG", "SK", "UA", "US",
+    ("AT", "Австрия"),       ("AU", "Австралия"),    ("BE", "Бельгия"),
+    ("BG", "Болгария"),      ("CA", "Канада"),       ("CH", "Швейцария"),
+    ("CZ", "Чехия"),         ("DE", "Германия"),     ("DK", "Дания"),
+    ("EE", "Эстония"),       ("ES", "Испания"),      ("FI", "Финляндия"),
+    ("FR", "Франция"),       ("GB", "Великобритания"), ("HU", "Венгрия"),
+    ("IE", "Ирландия"),      ("IN", "Индия"),        ("IT", "Италия"),
+    ("JP", "Япония"),        ("LV", "Латвия"),       ("NL", "Нидерланды"),
+    ("NO", "Норвегия"),      ("PL", "Польша"),       ("PT", "Португалия"),
+    ("RO", "Румыния"),       ("RS", "Сербия"),       ("SE", "Швеция"),
+    ("SG", "Сингапур"),      ("SK", "Словакия"),     ("UA", "Украина"),
+    ("US", "США"),
 ]
 
 
@@ -2041,11 +2049,13 @@ def block_psiphon(params: tuple[str, str] | None = None) -> None:
 def ask_psiphon_params() -> tuple[str, str] | None:
     egress = questionary.select(
         "Страна выхода Psiphon (через неё сервисы увидят ваш трафик):",
-        choices=[*PSIPHON_REGIONS, "Другая (ввести код)"],
+        choices=[*[questionary.Choice(f"{code} ({name})", value=code)
+                   for code, name in PSIPHON_REGIONS],
+                 questionary.Choice("Другая — ввести код страны", value="__other__")],
         style=CUSTOM_STYLE).ask()
     if egress is None:
         return None
-    if egress.startswith("Другая"):
+    if egress == "__other__":
         raw = questionary.text("Код страны, две буквы (например NO):",
                                default="", style=CUSTOM_STYLE).ask()
         if not raw or not re.match(r"^[A-Za-z]{2}$", raw.strip()):
