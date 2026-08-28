@@ -1771,35 +1771,30 @@ def warp_compose(license_key: str = "") -> str:
       - ./data:/var/lib/cloudflare-warp
 """
 
-# Домены, которые имеет смысл выпускать через WARP. Список — отправная точка,
-# править его удобнее в панели: он попадает в справку, а не в код ноды.
+# Что заворачивать в чистый egress.
 #
-# ВАЖНО про Google: мало направить в WARP только gemini.google.com. Страница
-# тянет авторизацию и API с соседних доменов, и если они пойдут напрямую, Google
-# увидит в одной сессии два разных адреса — узел и WARP — и покажет
-# «Мы зарегистрировали подозрительный трафик». Поэтому вся сессионная обвязка
-# Google идёт тем же маршрутом, что и сам Gemini.
+# Google идёт ЦЕЛИКОМ, а не списком отдельных доменов. Узкий список не работает:
+# обвес вроде gstatic, clients6 и accounts.google уходит напрямую с адреса ноды,
+# Google видит в одной сессии два разных гео и отдаёт заглушку. Этим же
+# объясняется случай «в браузере Gemini работает, а в приложении нет»:
+# приложение ходит по другому набору доменов, и часть из них шла мимо туннеля.
+#
+# Здесь перечислены и geosite:google, и ключевые домены по отдельности — если
+# в сборке Xray на ноде geosite окажется без нужной категории, домены сработают
+# сами по себе.
 WARP_DOMAINS = [
+    # Google целиком
+    "geosite:google",
+    "domain:google.com",
+    "domain:gstatic.com",
+    "domain:googleapis.com",
+    "domain:googleusercontent.com",
+    "domain:withgoogle.com",
     # OpenAI / ChatGPT
     "geosite:openai",
     "domain:chatgpt.com",
     "domain:oaistatic.com",
     "domain:oaiusercontent.com",
-    # Google AI + сессионные домены: порознь их пускать нельзя
-    "domain:gemini.google.com",
-    "domain:aistudio.google.com",
-    "domain:notebooklm.google.com",
-    "domain:generativelanguage.googleapis.com",
-    # accounts.google.com обязателен для консистентности сессии, но учтите:
-    # через WARP пойдут ВСЕ входы в Google, включая YouTube и почту.
-    "domain:accounts.google.com",
-    "domain:apis.google.com",
-    "domain:clients6.google.com",
-    "domain:googleusercontent.com",
-    # gstatic.com сюда намеренно НЕ входит: это бескуковый CDN статики, к
-    # опознанию сессии он отношения не имеет, зато используется ютубом и
-    # остальными сервисами Google — маршрут через WARP только добавил бы им
-    # задержку.
     # Прочие нейросети
     "domain:claude.ai",
     "domain:anthropic.com",
@@ -1807,6 +1802,18 @@ WARP_DOMAINS = [
     # Стриминги, режущие адреса хостингов
     "domain:spotify.com",
     "domain:scdn.co",
+]
+
+# Видео Google в туннель НЕ отправляем: это тяжёлый трафик, он сожжёт полосу и
+# процессор туннеля, а гео для него роли не играет. Правило обязано стоять ВЫШЕ
+# правила с geosite:google — маршрутизация выбирает первое совпавшее.
+WARP_DIRECT_DOMAINS = [
+    "geosite:youtube",
+    "domain:googlevideo.com",
+    "domain:youtube.com",
+    "domain:youtu.be",
+    "domain:ytimg.com",
+    "domain:ggpht.com",
 ]
 
 
@@ -1835,15 +1842,28 @@ def warp_outbound_reference(socks_address: str) -> str:
                 "servers": [{"address": socks_address, "port": WARP_SOCKS_PORT}]
             },
         },
-        "routingRuleToAdd": {
-            "type": "field",
-            "outboundTag": "warp",
-            "domain": WARP_DOMAINS,
-        },
+        # Порядок обязателен: Xray применяет первое совпавшее правило
+        "routingRulesToAdd": [
+            {
+                "type": "field",
+                "outboundTag": "DIRECT",
+                "domain": WARP_DIRECT_DOMAINS,
+                "_comment": "видео мимо туннеля — ставить ПЕРВЫМ",
+            },
+            {
+                "type": "field",
+                "outboundTag": "warp",
+                "domain": WARP_DOMAINS,
+            },
+        ],
         "_note": (
-            "Правило добавляйте ВЫШЕ правила, отправляющего трафик в DIRECT: "
-            "маршрутизация Xray выбирает первое совпавшее. Host в панели для "
-            "WARP не нужен — это внутренний выход ноды, клиенту он не виден."
+            "Оба правила добавляйте ВЫШЕ правила, отправляющего трафик в DIRECT "
+            "по inboundTag, и сохраните их порядок: сначала видео, потом всё "
+            "остальное. Google заворачивается целиком — узкий список доменов не "
+            "работает: обвес уходит напрямую, и Google видит в одной сессии два "
+            "разных гео. На inbound'ах обязателен sniffing с destOverride "
+            "[http, tls, quic], иначе QUIC уйдёт по IP мимо правил. Host в "
+            "панели не нужен — это внутренний выход ноды."
         ),
     }, indent=2, ensure_ascii=False) + "\n"
 
@@ -1982,19 +2002,15 @@ PSIPHON_WATCHDOG = f"{PSIPHON_DIR}/watchdog.sh"
 PSIPHON_WATCHDOG_LOG = f"{PSIPHON_DIR}/watchdog.log"
 PSIPHON_COUNTRIES_FILE = f"{PSIPHON_DIR}/watchdog.countries"
 
-# Страница «Gemini пока не поддерживается в вашей стране» отдаётся с кодом 200,
-# поэтому отличить её от рабочей можно только по содержимому. Маркеры собраны
-# на нескольких языках: Accept-Language мы задаём английский, но Google не
-# всегда его слушается.
-GEMINI_BLOCK_MARKERS = "|".join([
-    "not available in your country",
-    "isn.t available in your country",
-    "not supported in your country",
-    "isn.t supported in your country",
-    "not currently supported in your country",
-    "не поддерживается в вашей стране",
-    "недоступен в вашей стране",
-])
+# Google определяет гео не по стране сервера и не по RIPE, а по собственным
+# данным — и адреса, купленные у российских реселлеров, клеит к RU независимо
+# от того, где сервер физически. Проверять это надёжнее всего по локали,
+# которую Google отдаёт на своей главной: ru_RU означает, что Gemini не пустит,
+# даже если сама страница открывается.
+#
+# Сигнал лучше маркеров заглушки: он не зависит от формулировок Google, виден
+# до обращения к самому Gemini и одинаково работает для браузера и приложения.
+BAD_LOCALES = "ru_RU|be_BY"
 
 PSIPHON_WATCHDOG_BODY = """#!/usr/bin/env bash
 # Следит за доступностью Gemini через Psiphon и подбирает страну.
@@ -2005,7 +2021,7 @@ DIR=__DIR__
 PORT=__PORT__
 LOG=__LOG__
 COUNTRIES=__COUNTRIES__
-MARKERS=__MARKERS__
+BAD_LOCALES=__BAD_LOCALES__
 COMPOSE="$DIR/docker-compose.yml"
 UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0 Safari/537.36"
 
@@ -2034,15 +2050,15 @@ exit_country() {
        https://ipinfo.io/country 2>/dev/null | tr -d '[:space:]'
 }
 
-# 0 — работает, 1 — заглушка «недоступно в вашей стране», 2 — сеть/туннель,
+# 0 — работает, 1 — Google считает адрес российским, 2 — сеть/туннель,
 # 3 — открывается, но медленно. Замеры кладём в LAST_SPEED и LAST_TIME.
-LAST_SPEED=0; LAST_TIME=0
-check_gemini() {
+LAST_SPEED=0; LAST_TIME=0; LAST_LOCALE=""
+check_google() {
   local out stats code speed tsec body
-  out=$(curl -s -x "socks5h://127.0.0.1:$PORT" --max-time 40 \
+  out=$(curl -s -4 -x "socks5h://127.0.0.1:$PORT" --max-time 40 \
         -H 'Accept-Language: en-US,en;q=0.9' -A "$UA" \
         -w '\n%{http_code} %{speed_download} %{time_total}' \
-        https://gemini.google.com/app 2>/dev/null) || return 2
+        https://www.google.com 2>/dev/null) || return 2
   stats=${out##*$'\n'}
   body=${out%$'\n'*}
   code=$(echo "$stats" | cut -d' ' -f1)
@@ -2052,7 +2068,12 @@ check_gemini() {
 
   [ "$code" = "200" ] || return 2
   [ ${#body} -lt 500 ] && return 2
-  grep -qiE "$MARKERS" <<<"$body" && return 1
+
+  # Локаль вида "en_US" в разметке главной страницы
+  LAST_LOCALE=$(grep -oE '"[a-z][a-z]_[A-Z][A-Z]"' <<<"$body" | head -n1 | tr -d '"')
+  [ -z "$LAST_LOCALE" ] && LAST_LOCALE="?"
+  grep -qE "^($BAD_LOCALES)$" <<<"$LAST_LOCALE" && return 1
+
   # Скорость считаем только на осмысленном объёме: на крошечном ответе
   # speed_download отражает задержку, а не пропускную способность
   if [ ${#body} -gt 50000 ]; then
@@ -2106,10 +2127,10 @@ rotate() {
     tried=$((tried + 1))
     [ "$tried" -gt 4 ] && { log "перебрано 4 страны, ни одна не подошла"; return 1; }
     switch_region "$region" || { log "$region: туннель не построился"; continue; }
-    check_gemini
+    check_google
     case $? in
-      0) log "$region: Gemini доступен ($(human_speed)), страна закреплена"; return 0 ;;
-      1) log "$region: заглушка, пробую дальше" ;;
+      0) log "$region: локаль $LAST_LOCALE, $(human_speed) — страна закреплена"; return 0 ;;
+      1) log "$region: локаль $LAST_LOCALE — Gemini не пустит, пробую дальше" ;;
       3) log "$region: открывается, но медленно ($(human_speed)), пробую дальше" ;;
       *) log "$region: туннель не отвечает, пробую дальше" ;;
     esac
@@ -2134,17 +2155,17 @@ while true; do
     rc=2                                  # туннель не отвечает
   elif [ "$country" != "$last_country" ]; then
     [ -n "$last_country" ] && log "страна выхода сменилась: $last_country -> $country"
-    check_gemini; rc=$?
+    check_google; rc=$?
     last_full=$now
     [ $rc -eq 0 ] && last_country=$country
   elif [ $((now - last_full)) -ge $FULL_EVERY ]; then
-    check_gemini; rc=$?
+    check_google; rc=$?
     last_full=$now
   fi
   # Иначе страна прежняя и полная проверка недавняя — считаем, что всё в порядке
 
   if [ $rc -eq 0 ]; then
-    [ $fails -gt 0 ] && log "снова работает (страна $country, $(human_speed))"
+    [ $fails -gt 0 ] && log "снова работает (страна $country, локаль $LAST_LOCALE, $(human_speed))"
     fails=0
     sleep "$(rnd $OK_MIN $OK_MAX)"
     continue
@@ -2152,7 +2173,7 @@ while true; do
 
   fails=$((fails + 1))
   case $rc in
-    1) reason="заглушка «недоступно в вашей стране»"; need=2 ;;
+    1) reason="Google считает адрес российским (локаль $LAST_LOCALE)"; need=2 ;;
     3) reason="медленно: $(human_speed), страница за ${LAST_TIME}с"; need=$SLOW_STRIKES ;;
     *) reason="туннель недоступен"; need=2 ;;
   esac
@@ -2205,7 +2226,7 @@ def _setup_psiphon_watchdog(current: str) -> None:
             .replace("__PORT__", str(PSIPHON_SOCKS_PORT))
             .replace("__LOG__", shlex.quote(PSIPHON_WATCHDOG_LOG))
             .replace("__COUNTRIES__", shlex.quote(PSIPHON_COUNTRIES_FILE))
-            .replace("__MARKERS__", shlex.quote(GEMINI_BLOCK_MARKERS)))
+            .replace("__BAD_LOCALES__", shlex.quote(BAD_LOCALES)))
     write_file(PSIPHON_WATCHDOG, body, mode=0o755)
 
     write_file("/etc/systemd/system/psiphon-watchdog.service",
@@ -2236,17 +2257,28 @@ def psiphon_outbound_reference(socks_address: str) -> str:
                              "port": PSIPHON_SOCKS_PORT}]
             },
         },
-        "routingRuleToAdd": {
-            "type": "field",
-            "outboundTag": "psiphon-out",
-            "domain": WARP_DOMAINS,
-        },
+        # Порядок обязателен: Xray применяет первое совпавшее правило
+        "routingRulesToAdd": [
+            {
+                "type": "field",
+                "outboundTag": "DIRECT",
+                "domain": WARP_DIRECT_DOMAINS,
+                "_comment": "видео мимо туннеля — ставить ПЕРВЫМ",
+            },
+            {
+                "type": "field",
+                "outboundTag": "psiphon-out",
+                "domain": WARP_DOMAINS,
+            },
+        ],
         "_note": (
-            "Правило ставьте ВЫШЕ правила с DIRECT. Если для тех же доменов уже "
-            "заведён WARP, оставьте что-то одно: два правила на один домен "
-            "бессмысленны, сработает верхнее. Домены Google перечислены целиком "
-            "не случайно — авторизация и сам сервис обязаны выходить одним "
-            "адресом, иначе Google сочтёт трафик подозрительным."
+            "Оба правила ставьте ВЫШЕ правила с DIRECT по inboundTag, порядок "
+            "сохраните: сначала видео, потом остальное. Google заворачивается "
+            "целиком — узкий список доменов не работает: обвес уходит напрямую, "
+            "и Google видит в одной сессии два разных гео. На inbound'ах нужен "
+            "sniffing с destOverride [http, tls, quic], иначе QUIC уйдёт по IP "
+            "мимо правил. Если те же домены уже уходят в WARP — оставьте что-то "
+            "одно: сработает верхнее правило."
         ),
     }, indent=2, ensure_ascii=False) + "\n"
 
@@ -4205,7 +4237,42 @@ def test_telegram() -> None:
                   "проходит. Блокировка выглядит как таймаут или ошибка TLS.[/dim]")
 
 
+def test_google_locale() -> None:
+    step("Локаль Google: как Google определяет гео адреса")
+    ensure_packages("curl")
+    console.print("[dim]Google клеит гео по своим данным, а не по стране "
+                  "сервера: ru_RU означает, что Gemini не пустит.[/dim]\n")
+
+    routes = [("напрямую с ноды", [])]
+    if probe(["docker", "inspect", "-f", "{{.State.Running}}",
+              WARP_CONTAINER]).stdout.strip() == "true":
+        routes.append((f"через WARP ({WARP_SOCKS_PORT})",
+                       ["-x", f"socks5h://127.0.0.1:{WARP_SOCKS_PORT}"]))
+    if probe(["docker", "inspect", "-f", "{{.State.Running}}",
+              PSIPHON_CONTAINER]).stdout.strip() == "true":
+        routes.append((f"через Psiphon ({PSIPHON_SOCKS_PORT})",
+                       ["-x", f"socks5h://127.0.0.1:{PSIPHON_SOCKS_PORT}"]))
+
+    table = Table(box=box.ROUNDED, border_style="cyan", padding=(0, 1))
+    table.add_column("Маршрут")
+    table.add_column("Локаль")
+    table.add_column("Вердикт")
+    for name, extra in routes:
+        r = probe(["curl", "-s", "-4", "--max-time", "25", *extra,
+                   "-A", "Mozilla/5.0", "https://www.google.com"])
+        locales = re.findall(r'"([a-z]{2}_[A-Z]{2})"', r.stdout)
+        locale = locales[0] if locales else ""
+        if not locale:
+            table.add_row(name, "[dim]—[/dim]", "[yellow]не удалось получить[/yellow]")
+        elif locale in ("ru_RU", "be_BY"):
+            table.add_row(name, f"[red]{locale}[/red]", "[red]Gemini не пустит[/red]")
+        else:
+            table.add_row(name, f"[green]{locale}[/green]", "[green]годится[/green]")
+    console.print(table)
+
+
 TESTS = [
+    ("locale",   "Локаль Google — пустит ли Gemini", test_google_locale),
     ("region",   "Тест регионов — как сервисы видят адрес сервера", test_region),
     ("speed_eu", "Проверка скорости — Европа (speedtest)", test_speed_eu),
     ("speed_ru", "Проверка скорости — Россия (iperf3)", test_speed_ru),
