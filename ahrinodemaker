@@ -1804,16 +1804,37 @@ WARP_DOMAINS = [
     "domain:scdn.co",
 ]
 
-# Видео Google в туннель НЕ отправляем: это тяжёлый трафик, он сожжёт полосу и
-# процессор туннеля, а гео для него роли не играет. Правило обязано стоять ВЫШЕ
-# правила с geosite:google — маршрутизация выбирает первое совпавшее.
+# Что пускать мимо туннеля. Правило обязано стоять ВЫШЕ правила с geosite:google
+# — маршрутизация выбирает первое совпавшее.
+#
+# Критерий один: домен не участвует в опознании аккаунта Google. Раздача видео,
+# картинок, бинарников и реклама к сессии отношения не имеют, зато это самый
+# тяжёлый трафик — гнать его через туннель бессмысленно.
+#
+# Обратное тоже важно: mail, drive, photos, docs, meet и calendar сюда вносить
+# НЕЛЬЗЯ. Они ходят с той же кукой, что и Gemini, и если часть сервисов пойдёт
+# напрямую, Google снова увидит два разных гео в одной сессии — ровно та
+# поломка, из-за которой Gemini не работал в приложении.
 WARP_DIRECT_DOMAINS = [
+    # Видео и картинки ютуба
     "geosite:youtube",
     "domain:googlevideo.com",
     "domain:youtube.com",
     "domain:youtu.be",
     "domain:ytimg.com",
     "domain:ggpht.com",
+    # Раздача бинарников: обновления Chrome и Android, пакеты Play —
+    # сотни мегабайт, кук аккаунта не несут
+    "domain:gvt1.com",
+    "domain:gvt2.com",
+    "domain:gvt3.com",
+    "domain:dl.google.com",
+    # Реклама и телеметрия: объёмный фоновый шум, на сессию не влияет
+    "domain:doubleclick.net",
+    "domain:googlesyndication.com",
+    "domain:googleadservices.com",
+    "domain:google-analytics.com",
+    "domain:googletagmanager.com",
 ]
 
 
@@ -1848,7 +1869,7 @@ def warp_outbound_reference(socks_address: str) -> str:
                 "type": "field",
                 "outboundTag": "DIRECT",
                 "domain": WARP_DIRECT_DOMAINS,
-                "_comment": "видео мимо туннеля — ставить ПЕРВЫМ",
+                "_comment": "мимо туннеля: видео, бинарники, реклама — ставить ПЕРВЫМ",
             },
             {
                 "type": "field",
@@ -2280,7 +2301,7 @@ def psiphon_outbound_reference(socks_address: str) -> str:
                 "type": "field",
                 "outboundTag": "DIRECT",
                 "domain": WARP_DIRECT_DOMAINS,
-                "_comment": "видео мимо туннеля — ставить ПЕРВЫМ",
+                "_comment": "мимо туннеля: видео, бинарники, реклама — ставить ПЕРВЫМ",
             },
             {
                 "type": "field",
