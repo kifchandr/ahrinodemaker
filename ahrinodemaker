@@ -597,7 +597,58 @@ def block_fail2ban() -> None:
                   + (service_diagnostics("fail2ban", 15) or "нет данных в журнале"))
 
 
-def block_ufw(extra_ports: list[str], panel_ip: str | None = None) -> None:
+# Исходящие порты, которые принято закрывать на выходных узлах VPN. Цель не в
+# безопасности сервера, а в его репутации: спам и участие в атаках уходят с
+# адреса ноды, жалоба приходит хостеру, а блокируют адрес целиком — вместе со
+# всеми работающими клиентами.
+#
+# Правило действует на трафик, порождённый хостом, а нода работает в
+# network_mode: host — значит, и на трафик клиентов VPN. Контейнеры в bridge
+# (Psiphon) идут через FORWARD в обход ufw и под эти запреты не попадают.
+EGRESS_DENY_GROUPS: list[tuple[str, str, list[str], bool]] = [
+    ("smtp",
+     "SMTP 25 — основной канал спам-рассылок, закрыт у большинства хостеров",
+     ["25/tcp"], True),
+    ("netbios",
+     "NetBIOS/SMB 135, 137–139, 445 — черви и сканеры чужих сетей",
+     ["135/tcp", "137/udp", "138/udp", "139/tcp", "445/tcp", "445/udp"], True),
+    ("amplification",
+     "Усилители DDoS 19, 17, 111, 389, 1900, 11211",
+     ["19/udp", "17/udp", "111/udp", "111/tcp", "389/udp",
+      "1900/udp", "11211/udp", "11211/tcp"], True),
+    ("submission",
+     "Отправка почты 465, 587, 2525, 26 — закроет почтовые клиенты и у ваших "
+     "пользователей",
+     ["465/tcp", "587/tcp", "2525/tcp", "26/tcp"], False),
+    ("irc",
+     "IRC 6660–6669, 6697 — управление ботнетами",
+     ["6660:6669/tcp", "6697/tcp"], False),
+    ("sip",
+     "SIP 5060, 5061 — перебор VoIP-аккаунтов",
+     ["5060/tcp", "5060/udp", "5061/tcp", "5061/udp"], False),
+]
+
+
+def ask_egress_denies() -> list[str]:
+    """Какие исходящие порты закрыть. Пропуск списка — не закрывать ничего."""
+    choices = [
+        questionary.Choice(title=title, value=key, checked=default)
+        for key, title, _, default in EGRESS_DENY_GROUPS
+    ]
+    picked = questionary.checkbox(
+        "Закрыть исходящие порты (пробел — отметить, Enter — подтвердить):",
+        choices=choices, style=CUSTOM_STYLE).ask()
+    if not picked:
+        return []
+    specs: list[str] = []
+    for key, _, ports, _default in EGRESS_DENY_GROUPS:
+        if key in picked:
+            specs.extend(ports)
+    return specs
+
+
+def block_ufw(extra_ports: list[str], panel_ip: str | None = None,
+              egress_denies: list[str] | None = None) -> None:
     step("Настройка UFW (firewall)")
     ensure_packages("ufw")
     run(["ufw", "default", "deny", "incoming"])
@@ -623,6 +674,15 @@ def block_ufw(extra_ports: list[str], panel_ip: str | None = None) -> None:
         run(["ufw", "allow", port])
     run(["ufw", "allow", "in", "on", "lo"])
     run(["ufw", "allow", "out", "on", "lo"])
+
+    # Запреты исходящего идут после разрешения lo: правила ufw применяются по
+    # порядку, и петля должна остаться открытой при любом наборе запретов.
+    for spec in (egress_denies or []):
+        run(["ufw", "deny", "out", spec])
+    if egress_denies:
+        console.print("[green]✓ Закрыты исходящие порты: "
+                      f"{', '.join(egress_denies)}[/green]")
+
     run(["ufw", "logging", "low"])
     run(["ufw", "--force", "enable"])
     console.print("[green]✓ UFW настроен[/green]")
@@ -1999,12 +2059,18 @@ def psiphon_compose(egress_region: str, device_region: str) -> str:
     """docker-compose для контейнера Psiphon.
 
     Порт публикуется только на localhost: SOCKS без авторизации, открывать его
-    наружу нельзя. HTTP-порт не публикуется вовсе — он не нужен."""
+    наружу нельзя. HTTP-порт не публикуется вовсе — он не нужен.
+
+    mem_limit — страховка для ноды, а не расчёт потребления: в норме туннель
+    занимает несколько десятков мегабайт, и 256 МБ он не выберет никогда. Но
+    если клиент Psiphon однажды потечёт, ядро убьёт его контейнер, а не xray;
+    restart: unless-stopped поднимет туннель обратно."""
     return f"""services:
   psiphon:
     image: swarupsengupta2007/psiphon:latest
     container_name: {PSIPHON_CONTAINER}
     restart: unless-stopped
+    mem_limit: 256m
     environment:
       - PUID=1000
       - PGID=1000
@@ -2250,6 +2316,24 @@ RestartSec=30
 WantedBy=multi-user.target
 """
 
+# Сторож пишет в лог круглые сутки и сам его не подрезает. Строк в день немного,
+# но роста без границы достаточно, чтобы за годы упереться в диск.
+# copytruncate не нужен: каждая запись открывает файл заново (echo >>), поэтому
+# переименование ничего не ломает — сторож откроет уже новый файл.
+PSIPHON_LOGROTATE_PATH = "/etc/logrotate.d/psiphon-watchdog"
+PSIPHON_LOGROTATE_CONF = f"""{PSIPHON_WATCHDOG_LOG} {{
+    su root root
+    weekly
+    rotate 8
+    maxsize 10M
+    missingok
+    notifempty
+    compress
+    delaycompress
+}}
+"""
+
+
 def _setup_psiphon_watchdog(current: str) -> None:
     """Сторож: проверяет Gemini и подбирает страну, если он недоступен."""
     # Кандидаты — страны, где Gemini работает; текущая идёт первой строкой,
@@ -2269,6 +2353,7 @@ def _setup_psiphon_watchdog(current: str) -> None:
 
     write_file("/etc/systemd/system/psiphon-watchdog.service",
                PSIPHON_WATCHDOG_SERVICE)
+    write_file(PSIPHON_LOGROTATE_PATH, PSIPHON_LOGROTATE_CONF)
     # В прежней версии сторож запускался таймером — убираем его, иначе рядом
     # со службой останется вторая копия проверок
     old_timer = "/etc/systemd/system/psiphon-watchdog.timer"
@@ -2281,7 +2366,8 @@ def _setup_psiphon_watchdog(current: str) -> None:
 
     console.print("[green]✓ Сторож включён: проверка каждые 5–15 минут, "
                   "после сбоя — через 30–120 секунд[/green]")
-    console.print(f"[dim]Журнал: {PSIPHON_WATCHDOG_LOG}, "
+    console.print(f"[dim]Журнал: {PSIPHON_WATCHDOG_LOG} "
+                  f"(ротация: {PSIPHON_LOGROTATE_PATH}), "
                   f"список стран: {PSIPHON_COUNTRIES_FILE}[/dim]")
 
 
@@ -3187,6 +3273,7 @@ def menu_remnawave_node() -> None:
 
     # 3. Доп. порты — только если выбран блок UFW
     extra_ports: list[str] = []
+    egress_denies: list[str] = []
     panel_ip = CLI.get("panel_ip")
     if "ufw" in selected:
         if panel_ip:
@@ -3195,6 +3282,7 @@ def menu_remnawave_node() -> None:
         else:
             panel_ip = ask_panel_ip()
         extra_ports = ask_extra_ports()
+        egress_denies = ask_egress_denies()
 
     # 4. Путь к docker-compose ноды — только если выбран блок логов remnanode
     compose_path: str | None = None
@@ -3232,6 +3320,9 @@ def menu_remnawave_node() -> None:
                          else "[yellow]открыт для всех[/yellow]"))
     if extra_ports:
         console.print(f"[bold]Доп. порты UFW:[/bold] {', '.join(extra_ports)}")
+    if egress_denies:
+        console.print("[bold]Закрыть исходящие:[/bold] "
+                      f"{', '.join(egress_denies)}")
     if node_params:
         # SECRET_KEY не печатаем целиком — он уходит в лог терминала и в скроллбек
         console.print(f"[bold]Установка ноды:[/bold] порт {node_params[1]}, "
@@ -3280,7 +3371,7 @@ def menu_remnawave_node() -> None:
             continue
         try:
             if key == "ufw":
-                func(extra_ports, panel_ip)
+                func(extra_ports, panel_ip, egress_denies)
             elif key == "node_install":
                 func(node_params)
             elif key == "hysteria":
