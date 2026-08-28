@@ -2069,10 +2069,21 @@ check_google() {
   [ "$code" = "200" ] || return 2
   [ ${#body} -lt 500 ] && return 2
 
-  # Локаль вида "en_US" в разметке главной страницы
+  # Локаль вида "en_US" в разметке главной страницы. Ищем и в кавычках, и в
+  # виде hl=ru: разметка Google меняется, а страница-согласие выглядит иначе,
+  # чем обычная выдача.
   LAST_LOCALE=$(grep -oE '"[a-z][a-z]_[A-Z][A-Z]"' <<<"$body" | head -n1 | tr -d '"')
-  [ -z "$LAST_LOCALE" ] && LAST_LOCALE="?"
-  grep -qE "^($BAD_LOCALES)$" <<<"$LAST_LOCALE" && return 1
+  if [ -z "$LAST_LOCALE" ]; then
+    hl=$(grep -oE 'hl=[a-z]{2}' <<<"$body" | head -n1 | cut -d= -f2)
+    [ -n "$hl" ] && LAST_LOCALE="hl=$hl"
+  fi
+  if [ -z "$LAST_LOCALE" ]; then
+    # Локаль не найдена — судить не о чем. Отдельный код, чтобы это не
+    # выглядело успехом и было видно в журнале.
+    LAST_LOCALE="не найдена"
+    return 4
+  fi
+  grep -qE "^($BAD_LOCALES)$|^hl=(ru|be)$" <<<"$LAST_LOCALE" && return 1
 
   # Скорость считаем только на осмысленном объёме: на крошечном ответе
   # speed_download отражает задержку, а не пропускную способность
@@ -2131,6 +2142,7 @@ rotate() {
     case $? in
       0) log "$region: локаль $LAST_LOCALE, $(human_speed) — страна закреплена"; return 0 ;;
       1) log "$region: локаль $LAST_LOCALE — Gemini не пустит, пробую дальше" ;;
+      4) log "$region: локаль не определилась, пробую дальше" ;;
       3) log "$region: открывается, но медленно ($(human_speed)), пробую дальше" ;;
       *) log "$region: туннель не отвечает, пробую дальше" ;;
     esac
@@ -2174,6 +2186,7 @@ while true; do
   fails=$((fails + 1))
   case $rc in
     1) reason="Google считает адрес российским (локаль $LAST_LOCALE)"; need=2 ;;
+    4) reason="локаль в ответе Google не найдена — проверьте вручную"; need=99 ;;
     3) reason="медленно: $(human_speed), страница за ${LAST_TIME}с"; need=$SLOW_STRIKES ;;
     *) reason="туннель недоступен"; need=2 ;;
   esac
