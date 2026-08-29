@@ -1358,85 +1358,6 @@ def block_node_update(compose_path: str | None = None) -> None:
 
 
 # ------------------------------------------------------------------ #
-# Автообновление ноды при загрузке сервера
-# ------------------------------------------------------------------ #
-NODE_AUTOUPDATE_SCRIPT = f"{INSTALL_DIR}/auto-update.sh"
-NODE_AUTOUPDATE_LOG = f"{NODE_LOG_DIR}/auto-update.log"
-NODE_AUTOUPDATE_MARKER = "# AhriNode tool: автообновление ноды при загрузке"
-
-NODE_AUTOUPDATE_BODY = """#!/usr/bin/env bash
-# Обновление образа ноды при старте сервера. Создано AhriNode tool.
-set -uo pipefail
-
-COMPOSE=__COMPOSE__
-LOG=__LOG__
-
-log() { echo "[$(date '+%F %T')] $*" >> "$LOG"; }
-
-# Докеру нужно время после загрузки: без ожидания pull падает на неготовом демоне
-for _ in $(seq 1 30); do
-  docker info >/dev/null 2>&1 && break
-  sleep 5
-done
-
-if ! docker info >/dev/null 2>&1; then
-  log "docker не поднялся — обновление пропущено"
-  exit 1
-fi
-
-if [ ! -f "$COMPOSE" ]; then
-  log "файл $COMPOSE не найден — обновление пропущено"
-  exit 1
-fi
-
-before=$(docker inspect -f '{{.Image}}' remnanode 2>/dev/null || echo none)
-if ! out=$(docker compose -f "$COMPOSE" pull 2>&1); then
-  log "pull не удался: $(echo "$out" | tail -n 3 | tr '\\n' ' ')"
-  exit 1
-fi
-if ! out=$(docker compose -f "$COMPOSE" up -d --remove-orphans 2>&1); then
-  log "up не удался: $(echo "$out" | tail -n 3 | tr '\\n' ' ')"
-  exit 1
-fi
-after=$(docker inspect -f '{{.Image}}' remnanode 2>/dev/null || echo none)
-
-if [ "$before" = "$after" ]; then
-  log "образ не изменился ($after)"
-else
-  log "обновлено: $before -> $after"
-fi
-"""
-
-
-def block_node_autoupdate(compose_path: str | None = None) -> None:
-    step("Автообновление ноды при загрузке сервера")
-
-    if not compose_path:
-        found = find_compose_candidates()
-        compose_path = found[0] if found else None
-    if not compose_path:
-        console.print("[yellow]docker-compose ноды не найден — автообновление "
-                      "пропущено.[/yellow]")
-        return
-
-    prepare_node_logs()
-    body = (NODE_AUTOUPDATE_BODY
-            .replace("__COMPOSE__", shlex.quote(compose_path))
-            .replace("__LOG__", shlex.quote(NODE_AUTOUPDATE_LOG)))
-    write_file(NODE_AUTOUPDATE_SCRIPT, body, mode=0o755)
-
-    # @reboot, а не расписание по времени: сервер и так перезагружается по
-    # cron, так что обновление приходит вместе с перезагрузкой и не роняет
-    # ноду посреди рабочего дня.
-    _crontab_replace_block(NODE_AUTOUPDATE_MARKER,
-                           [f"@reboot {NODE_AUTOUPDATE_SCRIPT}"])
-    console.print("[green]✓ Нода будет обновляться при каждой загрузке "
-                  "сервера[/green]")
-    console.print(f"[dim]Скрипт: {NODE_AUTOUPDATE_SCRIPT}, "
-                  f"журнал: {NODE_AUTOUPDATE_LOG}[/dim]")
-
-
-# ------------------------------------------------------------------ #
 # Hysteria2 (QUIC) поверх уже работающей ноды
 # ------------------------------------------------------------------ #
 # Hysteria2 в Remnawave требует TLS-сертификата в виде файлов, доступных
@@ -2568,11 +2489,54 @@ def block_psiphon(params: tuple[str, str, bool] | None = None) -> None:
         "Если те же домены уже уходят в WARP — оставьте что-то одно.")
 
 
+def warp_present() -> bool:
+    """Есть ли что удалять: каталог или контейнер."""
+    # `docker inspect` на несуществующий контейнер печатает "[]" и выходит с
+    # кодом 1 — судить надо по коду, непустой вывод здесь ничего не значит
+    return (os.path.isdir(WARP_DIR)
+            or probe(["docker", "inspect", "-f", "{{.Name}}",
+                      WARP_CONTAINER]).returncode == 0)
+
+
+def remove_warp() -> None:
+    """Снимает WARP с сервера."""
+    step("Удаление WARP")
+
+    console.print(
+        "[yellow]Сначала уберите из профиля ноды в панели outbound "
+        "«warp-out» и правило, которое на него ссылается.[/yellow]\n"
+        "[dim]Если правило останется, xray продолжит слать домены в уже "
+        "несуществующий SOCKS, и они перестанут открываться вовсе.[/dim]")
+    if not questionary.confirm(
+            "В панели правил с warp-out больше нет — удалять?",
+            default=False, style=CUSTOM_STYLE).ask():
+        console.print("[dim]Отменено.[/dim]")
+        return
+
+    compose_path = f"{WARP_DIR}/docker-compose.yml"
+    base = compose_base(compose_path) if os.path.isfile(compose_path) else None
+    if base is not None:
+        run(base + ["down"], check=False)
+    probe(["docker", "rm", "-f", WARP_CONTAINER])
+    probe(["docker", "image", "rm", "caomingjun/warp"])
+    console.print("[green]✓ Контейнер и образ удалены[/green]")
+
+    if os.path.isdir(WARP_DIR):
+        shutil.rmtree(WARP_DIR, ignore_errors=True)
+    ref = f"{INSTALL_DIR}/panel-warp-outbound.json"
+    if os.path.isfile(ref):
+        os.unlink(ref)
+    console.print(f"[green]✓ Каталог {WARP_DIR} и заготовка для панели "
+                  "удалены[/green]")
+    console.print("[green]✓ WARP удалён[/green]")
+
+
 def psiphon_present() -> bool:
     """Есть ли что удалять: контейнер, каталог или юнит сторожа."""
     return (os.path.isdir(PSIPHON_DIR)
             or os.path.isfile("/etc/systemd/system/psiphon-watchdog.service")
-            or bool(probe(["docker", "inspect", PSIPHON_CONTAINER]).stdout.strip()))
+            or probe(["docker", "inspect", "-f", "{{.Name}}",
+                      PSIPHON_CONTAINER]).returncode == 0)
 
 
 def remove_psiphon() -> None:
@@ -3049,7 +3013,6 @@ BLOCKS = [
     ("network", "Сеть: conntrack + sysctl (BBR, буферы, очереди)", block_network),
     ("remnanode_logs", "Логи remnanode: каталог + logrotate + volume в docker-compose", block_remnanode_logs),
     ("node_update", "Обновление remnanode (docker compose pull + пересоздание)", block_node_update),
-    ("node_autoupdate", "Автообновление ноды при загрузке сервера", block_node_autoupdate),
     ("hysteria", "Hysteria2 (QUIC): сертификаты в /dev/shm + 443/udp + автообновление", block_hysteria),
     ("warp", "WARP: чистый egress для нейросетей (Gemini, ChatGPT) и стримингов", block_warp),
     ("psiphon", "Psiphon: альтернативный egress, если WARP не помог", block_psiphon),
@@ -3120,13 +3083,6 @@ def _detect_remnanode_logs() -> bool:
             and os.path.isdir("/var/log/remnanode"))
 
 
-def _detect_node_autoupdate() -> bool:
-    if not os.path.isfile(NODE_AUTOUPDATE_SCRIPT):
-        return False
-    cr = probe(["crontab", "-l"])
-    return cr.returncode == 0 and NODE_AUTOUPDATE_SCRIPT in cr.stdout
-
-
 def _detect_hysteria() -> bool:
     if not (os.path.isfile(HYSTERIA_CERT) and os.path.isfile(HYSTERIA_KEY)):
         return False
@@ -3160,7 +3116,6 @@ DETECTORS = {
     "network":        _detect_network,
     "time_cron":      _detect_time_cron,
     "remnanode_logs": _detect_remnanode_logs,
-    "node_autoupdate": _detect_node_autoupdate,
     "hysteria":       _detect_hysteria,
     "warp":           _detect_warp,
     "psiphon":        _detect_psiphon,
@@ -3348,8 +3303,7 @@ def menu_remnawave_node() -> None:
                 shown_keys.append(key)
             continue
         # Блок логов при отсутствии ноды бесполезен: установка делает то же
-        # самое. А вот автообновление прятать нельзя — установка его не
-        # настраивает, и стоит оно после неё, так что compose уже появится.
+        # самое, и патчить нечего — compose ещё не существует.
         if key == "remnanode_logs" and node_missing:
             continue
         if key == "node_update":
@@ -3358,11 +3312,16 @@ def menu_remnawave_node() -> None:
                 shown_keys.append(key)
             continue
         is_applied = applied.get(key, False)
-        suffix = "   [уже настроено]" if is_applied else ""
-        if key in DEFAULT_OFF and not is_applied:
-            suffix = "   [по умолчанию выкл]"
+        # Пометки различаются не только текстом, но и цветом: они означают
+        # прямо противоположное — «уже сделано, можно пропустить» против
+        # «не сделано, решайте сами», — а одинаково серым читались одинаково.
+        title: list[tuple[str, str]] | str = label
+        if is_applied:
+            title = [("", label), ("fg:ansigreen", "   [уже настроено]")]
+        elif key in DEFAULT_OFF:
+            title = [("", label), ("fg:ansiyellow", "   [по умолчанию выкл]")]
         choices.append(questionary.Choice(
-            title=label + suffix,
+            title=title,
             value=key,
             checked=not is_applied and key not in DEFAULT_OFF,
         ))
@@ -3515,7 +3474,7 @@ def menu_remnawave_node() -> None:
                 func(psiphon_params)
             elif key == "remnanode_logs":
                 func(compose_path)
-            elif key in ("node_update", "node_autoupdate"):
+            elif key == "node_update":
                 func(node_path)
             elif key == "time_cron":
                 func(reboot_schedule)
@@ -4570,10 +4529,19 @@ def menu_tools() -> None:
             questionary.Choice("Проверить обновления сторонних скриптов",
                                value="vendor_updates"),
         ]
-        # Пункт нужен, только пока Psiphon на сервере есть
-        if psiphon_present():
-            choices.append(questionary.Choice("Удалить Psiphon",
-                                              value="psiphon_remove"))
+        # Выходы показываем парой «поставить / снять»: одновременно оба
+        # действия смысла не имеют, а какое уместно — видно по серверу.
+        for name, present, add_key, del_key in (
+                ("WARP", warp_present(), "warp_add", "warp_del"),
+                ("Psiphon", psiphon_present(), "psiphon_add", "psiphon_del")):
+            if present:
+                choices.append(questionary.Choice(
+                    title=[("", f"Удалить {name}"),
+                           ("fg:ansigreen", "   [установлен]")],
+                    value=del_key))
+            else:
+                choices.append(questionary.Choice(f"Установить {name}",
+                                                  value=add_key))
         choices.append(questionary.Choice("← Назад", value="back"))
 
         choice = questionary.select(
@@ -4590,11 +4558,20 @@ def menu_tools() -> None:
                 menu_vendor_updates()
             except (subprocess.CalledProcessError, OSError, RuntimeError) as exc:
                 console.print(f"[red]✗ Ошибка проверки: {exc}[/red]")
-        elif choice == "psiphon_remove":
+        elif choice in ("warp_add", "warp_del", "psiphon_add", "psiphon_del"):
             try:
-                remove_psiphon()
+                if choice == "warp_add":
+                    block_warp(ask_warp_license())
+                elif choice == "warp_del":
+                    remove_warp()
+                elif choice == "psiphon_add":
+                    params = ask_psiphon_params()
+                    if params is not None:
+                        block_psiphon(params)
+                else:
+                    remove_psiphon()
             except (subprocess.CalledProcessError, OSError, RuntimeError) as exc:
-                console.print(f"[red]✗ Ошибка удаления: {exc}[/red]")
+                console.print(f"[red]✗ Ошибка: {exc}[/red]")
 
 
 # ================================================================== #
@@ -4609,20 +4586,48 @@ def _self_installed() -> bool:
             and all(os.path.exists(p) for p in SELF_SHORTCUTS))
 
 
-def install_self() -> None:
+def _self_source_path() -> str | None:
+    """Файл, из которого запущен скрипт. None — запуск через `curl | python3`,
+    когда файла на диске нет вовсе."""
+    try:
+        here = os.path.abspath(__file__)
+    except NameError:
+        return None
+    return here if os.path.isfile(here) else None
+
+
+def self_update_state() -> tuple[str, str]:
+    """Сверяет запущенный файл с копией в репозитории.
+
+    Возвращает ('current' | 'outdated' | 'unknown', причина). Сравниваем
+    содержимое, а не номер версии: версии в скрипте нет, а хеш не соврёт и не
+    требует её вести."""
+    local = _self_source_path()
+    if local is None:
+        return "unknown", "скрипт запущен из потока, сравнивать не с чем"
+    r = probe(["curl", "-fsSL", "--max-time", "6",
+               f"{REPO_RAW_BASE}/ahrinodemaker"])
+    if r.returncode != 0 or not r.stdout:
+        return "unknown", "репозиторий недоступен"
+    remote = hashlib.sha256(r.stdout.encode("utf-8")).hexdigest()
+    try:
+        with open(local, encoding="utf-8") as f:
+            mine = hashlib.sha256(f.read().encode("utf-8")).hexdigest()
+    except OSError as exc:
+        return "unknown", str(exc)
+    return ("current" if mine == remote else "outdated"), ""
+
+
+def install_self(force_download: bool = False) -> None:
     """Кладёт скрипт в /usr/local/bin и заводит короткое имя `ahri`.
 
     Источник берём с диска, если скрипт уже запущен из файла, иначе качаем из
-    репозитория: при запуске через `curl | python3` файла попросту нет."""
+    репозитория: при запуске через `curl | python3` файла попросту нет.
+    force_download — при обновлении: локальный файл как раз и есть устаревший,
+    брать его источником бессмысленно."""
     step("Короткая команда для запуска")
 
-    source = None
-    try:
-        here = os.path.abspath(__file__)
-        if os.path.isfile(here):
-            source = here
-    except NameError:
-        pass   # запуск из потока — __file__ не определён
+    source = None if force_download else _self_source_path()
 
     with tempfile.TemporaryDirectory(prefix="self-") as tmpdir:
         if source and os.path.abspath(source) != SELF_PATH:
@@ -4751,6 +4756,13 @@ def main() -> None:
     for line in egress_status_lines():
         console.print(line)
 
+    # Сверка с репозиторием. Запрос один и с коротким таймаутом; недоступный
+    # GitHub ничего не ломает — состояние просто остаётся неизвестным.
+    self_state, _why = self_update_state()
+    if self_state == "outdated":
+        console.print("[yellow]Доступна новая версия ahrinodemaker "
+                      "— обновить можно из главного меню.[/yellow]")
+
     while True:
         console.print()
         choices = [
@@ -4765,6 +4777,11 @@ def main() -> None:
             choices.append(questionary.Choice(
                 "Установить короткие команды «ahri» и «ahrinode»",
                 value="install_self"))
+        if self_state == "outdated":
+            choices.append(questionary.Choice(
+                title=[("", "Обновить ahrinodemaker"),
+                       ("fg:ansiyellow", "   [вышла новая версия]")],
+                value="update_self"))
         choices.append(questionary.Choice("Выход", value="exit"))
 
         choice = questionary.select(
@@ -4784,6 +4801,17 @@ def main() -> None:
                 install_self()
             except (subprocess.CalledProcessError, OSError, RuntimeError) as exc:
                 console.print(f"[red]✗ Не удалось установить команду: {exc}[/red]")
+        elif choice == "update_self":
+            try:
+                install_self(force_download=True)
+            except (subprocess.CalledProcessError, OSError, RuntimeError) as exc:
+                console.print(f"[red]✗ Не удалось обновить: {exc}[/red]")
+                continue
+            # Дальше работает старый код, уже загруженный в память: продолжать
+            # в нём — значит делать вид, что обновление применилось
+            console.print("[green]✓ Обновлено. Запустите заново: "
+                          "[bold]sudo ahri[/bold][/green]")
+            return
 
 
 if __name__ == "__main__":
