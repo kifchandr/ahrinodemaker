@@ -605,43 +605,54 @@ def block_fail2ban() -> None:
 # Правило действует на трафик, порождённый хостом, а нода работает в
 # network_mode: host — значит, и на трафик клиентов VPN. Контейнеры в bridge
 # (Psiphon) идут через FORWARD в обход ufw и под эти запреты не попадают.
-EGRESS_DENY_GROUPS: list[tuple[str, str, list[str], bool]] = [
-    ("smtp",
-     "SMTP 25 — основной канал спам-рассылок, закрыт у большинства хостеров",
-     ["25/tcp"], True),
-    ("netbios",
-     "NetBIOS/SMB 135, 137–139, 445 — черви и сканеры чужих сетей",
-     ["135/tcp", "137/udp", "138/udp", "139/tcp", "445/tcp", "445/udp"], True),
-    ("amplification",
-     "Усилители DDoS 19, 17, 111, 389, 1900, 11211",
-     ["19/udp", "17/udp", "111/udp", "111/tcp", "389/udp",
-      "1900/udp", "11211/udp", "11211/tcp"], True),
+# Закрывается всегда, без вопроса: ни один из этих портов не нужен обычному
+# пользователю VPN.
+#   25/tcp        — на 25-й ходят почтовые серверы между собой; клиенты
+#                   отправляют почту через 587 и 465, они остаются открыты
+#   135, 137–139, 445 — SMB и NetBIOS в интернете не используются: диск в
+#                   домашней сети клиент видит по локальной сети, а не через
+#                   выходной узел
+#   19, 17        — chargen и qotd, протоколы 1983 года, живы только как
+#                   усилители DDoS
+#   111           — portmap; нужен NFS, а NFS через VPN-выход не монтируют
+#   389/udp       — LDAP поверх UDP; рабочий LDAP ходит по TCP, он не тронут
+#   1900          — SSDP, обнаружение устройств в своей же локальной сети
+#   11211         — memcached, база без авторизации, наружу её не открывают
+EGRESS_DENY_ALWAYS: list[str] = [
+    "25/tcp",
+    "135/tcp", "137/udp", "138/udp", "139/tcp", "445/tcp", "445/udp",
+    "19/udp", "17/udp", "111/udp", "111/tcp", "389/udp",
+    "1900/udp", "11211/udp", "11211/tcp",
+]
+
+# А эти спрашиваются: они тоже привлекают жалобы, но ломают легальные сценарии
+# у ваших же пользователей, поэтому решение за владельцем ноды.
+EGRESS_DENY_OPTIONAL: list[tuple[str, str, list[str]]] = [
     ("submission",
-     "Отправка почты 465, 587, 2525, 26 — закроет почтовые клиенты и у ваших "
-     "пользователей",
-     ["465/tcp", "587/tcp", "2525/tcp", "26/tcp"], False),
+     "Отправка почты 465, 587, 2525, 26 — сломает почтовые клиенты",
+     ["465/tcp", "587/tcp", "2525/tcp", "26/tcp"]),
     ("irc",
-     "IRC 6660–6669, 6697 — управление ботнетами",
-     ["6660:6669/tcp", "6697/tcp"], False),
+     "IRC 6660–6669, 6697 — управление ботнетами, но и обычные чаты",
+     ["6660:6669/tcp", "6697/tcp"]),
     ("sip",
-     "SIP 5060, 5061 — перебор VoIP-аккаунтов",
-     ["5060/tcp", "5060/udp", "5061/tcp", "5061/udp"], False),
+     "SIP 5060, 5061 — перебор VoIP-аккаунтов, но и софтфоны",
+     ["5060/tcp", "5060/udp", "5061/tcp", "5061/udp"]),
 ]
 
 
 def ask_egress_denies() -> list[str]:
-    """Какие исходящие порты закрыть. Пропуск списка — не закрывать ничего."""
-    choices = [
-        questionary.Choice(title=title, value=key, checked=default)
-        for key, title, _, default in EGRESS_DENY_GROUPS
-    ]
+    """Дополнительные исходящие порты. Пропуск — закрыть только обязательный
+    набор, который применяется в любом случае."""
+    choices = [questionary.Choice(title=title, value=key)
+               for key, title, _ in EGRESS_DENY_OPTIONAL]
     picked = questionary.checkbox(
-        "Закрыть исходящие порты (пробел — отметить, Enter — подтвердить):",
+        "Закрыть ещё исходящие порты? Всё перечисленное используется и "
+        "легально —\nEnter без отметок оставит их открытыми:",
         choices=choices, style=CUSTOM_STYLE).ask()
     if not picked:
         return []
     specs: list[str] = []
-    for key, _, ports, _default in EGRESS_DENY_GROUPS:
+    for key, _, ports in EGRESS_DENY_OPTIONAL:
         if key in picked:
             specs.extend(ports)
     return specs
@@ -677,10 +688,19 @@ def block_ufw(extra_ports: list[str], panel_ip: str | None = None,
 
     # Запреты исходящего идут после разрешения lo: правила ufw применяются по
     # порядку, и петля должна остаться открытой при любом наборе запретов.
-    for spec in (egress_denies or []):
+    #
+    # Обязательный набор — deny (пакет молча теряется): спам-бот на 25-м порту
+    # виснет на таймауте, и это ровно то, что нужно. Выбранное вручную — reject
+    # (мгновенный отказ): там за портом стоит живой человек с почтовым клиентом,
+    # и две минуты тишины он не поймёт.
+    for spec in EGRESS_DENY_ALWAYS:
         run(["ufw", "deny", "out", spec])
+    console.print("[green]✓ Закрыты исходящие порты (спам, SMB, усилители "
+                  f"DDoS): {', '.join(EGRESS_DENY_ALWAYS)}[/green]")
+    for spec in (egress_denies or []):
+        run(["ufw", "reject", "out", spec])
     if egress_denies:
-        console.print("[green]✓ Закрыты исходящие порты: "
+        console.print("[green]✓ Дополнительно закрыты: "
                       f"{', '.join(egress_denies)}[/green]")
 
     run(["ufw", "logging", "low"])
@@ -3320,9 +3340,11 @@ def menu_remnawave_node() -> None:
                          else "[yellow]открыт для всех[/yellow]"))
     if extra_ports:
         console.print(f"[bold]Доп. порты UFW:[/bold] {', '.join(extra_ports)}")
-    if egress_denies:
+    if "ufw" in selected:
         console.print("[bold]Закрыть исходящие:[/bold] "
-                      f"{', '.join(egress_denies)}")
+                      + ", ".join(EGRESS_DENY_ALWAYS)
+                      + (" + " + ", ".join(egress_denies) if egress_denies
+                         else ""))
     if node_params:
         # SECRET_KEY не печатаем целиком — он уходит в лог терминала и в скроллбек
         console.print(f"[bold]Установка ноды:[/bold] порт {node_params[1]}, "
