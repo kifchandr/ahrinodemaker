@@ -3037,6 +3037,20 @@ INSTALLS_PACKAGES = {"packages", "node_install", "fail2ban", "ufw",
 # и ручной настройки inbound'а в панели, поэтому включается осознанно.
 DEFAULT_OFF = {"hysteria", "warp", "psiphon"}
 
+# Блоки, у которых при уже выполненной установке пункт меняет смысл на
+# противоположный: ставить нечего, а снять — единственное, что осталось.
+# Ключ → (подпись, что делать, как понять, что оно на сервере есть).
+#
+# Присутствие проверяем не детектором из DETECTORS: тот говорит «контейнер
+# работает», а нам нужно «установлено». Иначе упавший контейнер выглядел бы
+# как отсутствующий, и снять его из меню стало бы нельзя.
+EGRESS_REMOVERS = {
+    "warp": ("Удалить WARP: контейнер, образ и заготовка для панели",
+             lambda: remove_warp(), lambda: warp_present()),
+    "psiphon": ("Удалить Psiphon: сторож, контейнер, образ и заготовка",
+                lambda: remove_psiphon(), lambda: psiphon_present()),
+}
+
 
 # ================================================================== #
 # Детекторы «уже настроено» — снимают галочку с блока по умолчанию,
@@ -3296,6 +3310,10 @@ def menu_remnawave_node() -> None:
 
     shown_keys: list[str] = []
     choices = []
+    labels: dict[str, str] = {key: label for key, label, _ in BLOCKS}
+    # По одному разу на выход: дальше значение нужно и при отрисовке, и при
+    # запуске, а каждый вызов — это docker inspect
+    egress_present = {key: spec[2]() for key, spec in EGRESS_REMOVERS.items()}
     for key, label, _ in BLOCKS:
         if key == "node_install":
             if node_missing:
@@ -3316,10 +3334,17 @@ def menu_remnawave_node() -> None:
         # прямо противоположное — «уже сделано, можно пропустить» против
         # «не сделано, решайте сами», — а одинаково серым читались одинаково.
         title: list[tuple[str, str]] | str = label
-        if is_applied:
+        if egress_present.get(key):
+            # Выход уже стоит, и ставить его заново незачем — на этом месте
+            # полезно ровно обратное действие. Пункт один и тот же, меняется
+            # только смысл, поэтому и живёт он здесь, а не в отдельном меню.
+            label = EGRESS_REMOVERS[key][0]
+            title = [("", label), ("fg:ansigreen", "   [установлен]")]
+        elif is_applied:
             title = [("", label), ("fg:ansigreen", "   [уже настроено]")]
         elif key in DEFAULT_OFF:
             title = [("", label), ("fg:ansiyellow", "   [по умолчанию выкл]")]
+        labels[key] = label
         choices.append(questionary.Choice(
             title=title,
             value=key,
@@ -3343,11 +3368,14 @@ def menu_remnawave_node() -> None:
         if node_params is None:
             selected = [k for k in selected if k != "node_install"]
 
-    # 4. Домен для Hysteria2 — только если выбран этот блок
-    warp_license = ask_warp_license() if "warp" in selected else ""
+    # 4. Параметры выходов — только когда их ставят. Отмеченный выход, который
+    #    уже стоит, означает удаление, и спрашивать там нечего.
+    warp_license = ""
+    if "warp" in selected and not egress_present["warp"]:
+        warp_license = ask_warp_license()
 
     psiphon_params: tuple[str, str, bool] | None = None
-    if "psiphon" in selected:
+    if "psiphon" in selected and not egress_present["psiphon"]:
         psiphon_params = ask_psiphon_params()
         if psiphon_params is None:
             selected = [k for k in selected if k != "psiphon"]
@@ -3391,9 +3419,10 @@ def menu_remnawave_node() -> None:
                   show_header=False, title_style="bold cyan", padding=(0, 1))
     table.add_column(justify="center", width=3)
     table.add_column()
-    for key, label, _ in BLOCKS:
+    for key, _label, _ in BLOCKS:
         if key not in shown_keys:
             continue
+        label = labels[key]
         if key in selected:
             table.add_row("[green]✓[/green]", label)
         else:
@@ -3468,6 +3497,8 @@ def menu_remnawave_node() -> None:
                 func(node_params)
             elif key == "hysteria":
                 func(hysteria_params)
+            elif egress_present.get(key):
+                EGRESS_REMOVERS[key][1]()
             elif key == "warp":
                 func(warp_license)
             elif key == "psiphon":
@@ -4528,22 +4559,8 @@ def menu_tools() -> None:
             questionary.Choice("SOCKS5-прокси Dante", value="dante"),
             questionary.Choice("Проверить обновления сторонних скриптов",
                                value="vendor_updates"),
+            questionary.Choice("← Назад", value="back"),
         ]
-        # Выходы показываем парой «поставить / снять»: одновременно оба
-        # действия смысла не имеют, а какое уместно — видно по серверу.
-        for name, present, add_key, del_key in (
-                ("WARP", warp_present(), "warp_add", "warp_del"),
-                ("Psiphon", psiphon_present(), "psiphon_add", "psiphon_del")):
-            if present:
-                choices.append(questionary.Choice(
-                    title=[("", f"Удалить {name}"),
-                           ("fg:ansigreen", "   [установлен]")],
-                    value=del_key))
-            else:
-                choices.append(questionary.Choice(f"Установить {name}",
-                                                  value=add_key))
-        choices.append(questionary.Choice("← Назад", value="back"))
-
         choice = questionary.select(
             "Tools:", choices=choices, style=CUSTOM_STYLE,
         ).ask()
@@ -4558,20 +4575,6 @@ def menu_tools() -> None:
                 menu_vendor_updates()
             except (subprocess.CalledProcessError, OSError, RuntimeError) as exc:
                 console.print(f"[red]✗ Ошибка проверки: {exc}[/red]")
-        elif choice in ("warp_add", "warp_del", "psiphon_add", "psiphon_del"):
-            try:
-                if choice == "warp_add":
-                    block_warp(ask_warp_license())
-                elif choice == "warp_del":
-                    remove_warp()
-                elif choice == "psiphon_add":
-                    params = ask_psiphon_params()
-                    if params is not None:
-                        block_psiphon(params)
-                else:
-                    remove_psiphon()
-            except (subprocess.CalledProcessError, OSError, RuntimeError) as exc:
-                console.print(f"[red]✗ Ошибка: {exc}[/red]")
 
 
 # ================================================================== #
