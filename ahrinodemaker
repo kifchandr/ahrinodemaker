@@ -2568,6 +2568,65 @@ def block_psiphon(params: tuple[str, str, bool] | None = None) -> None:
         "Если те же домены уже уходят в WARP — оставьте что-то одно.")
 
 
+def psiphon_present() -> bool:
+    """Есть ли что удалять: контейнер, каталог или юнит сторожа."""
+    return (os.path.isdir(PSIPHON_DIR)
+            or os.path.isfile("/etc/systemd/system/psiphon-watchdog.service")
+            or bool(probe(["docker", "inspect", PSIPHON_CONTAINER]).stdout.strip()))
+
+
+def remove_psiphon() -> None:
+    """Снимает Psiphon с сервера целиком.
+
+    Порядок обратный установке: сначала сторож, иначе он успеет пересоздать
+    контейнер между `down` и удалением каталога."""
+    step("Удаление Psiphon")
+
+    # Правила в панели живут отдельно от сервера, и снять их отсюда нельзя.
+    # Если оставить их и убрать контейнер, домены не уйдут напрямую — xray
+    # продолжит слать их в мёртвый SOCKS, и сервисы просто перестанут
+    # открываться. Поэтому спрашиваем до, а не рассказываем после.
+    console.print(
+        "[yellow]Сначала уберите из профиля ноды в панели outbound "
+        "«psiphon-out» и правило, которое на него ссылается.[/yellow]\n"
+        "[dim]Если правило останется, xray продолжит слать домены в уже "
+        "несуществующий SOCKS, и они перестанут открываться вовсе.[/dim]")
+    if not questionary.confirm(
+            "В панели правил с psiphon-out больше нет — удалять?",
+            default=False, style=CUSTOM_STYLE).ask():
+        console.print("[dim]Отменено.[/dim]")
+        return
+
+    for unit in ("psiphon-watchdog.service", "psiphon-watchdog.timer"):
+        path = f"/etc/systemd/system/{unit}"
+        if os.path.isfile(path):
+            run(["systemctl", "disable", "--now", unit], check=False)
+            os.unlink(path)
+    run(["systemctl", "daemon-reload"], check=False)
+    for path in (PSIPHON_LOGROTATE_PATH,):
+        if os.path.isfile(path):
+            os.unlink(path)
+    console.print("[green]✓ Сторож и ротация логов убраны[/green]")
+
+    compose_path = f"{PSIPHON_DIR}/docker-compose.yml"
+    base = compose_base(compose_path) if os.path.isfile(compose_path) else None
+    if base is not None:
+        run(base + ["down"], check=False)
+    # Контейнер мог остаться и без compose — например, после ручной правки
+    probe(["docker", "rm", "-f", PSIPHON_CONTAINER])
+    probe(["docker", "image", "rm", "swarupsengupta2007/psiphon:latest"])
+    console.print("[green]✓ Контейнер и образ удалены[/green]")
+
+    if os.path.isdir(PSIPHON_DIR):
+        shutil.rmtree(PSIPHON_DIR, ignore_errors=True)
+    ref = f"{INSTALL_DIR}/panel-psiphon-outbound.json"
+    if os.path.isfile(ref):
+        os.unlink(ref)
+    console.print(f"[green]✓ Каталог {PSIPHON_DIR} и заготовка для панели "
+                  "удалены[/green]")
+    console.print("[green]✓ Psiphon удалён[/green]")
+
+
 def ask_psiphon_params() -> tuple[str, str, bool] | None:
     egress = questionary.select(
         "Страна выхода Psiphon (через неё сервисы увидят ваш трафик):",
@@ -4446,46 +4505,30 @@ def test_google_locale() -> None:
     console.print("[dim]Google клеит гео по своим данным, а не по стране "
                   "сервера: ru_RU означает, что Gemini не пустит.[/dim]\n")
 
-    routes = [("напрямую с ноды", [])]
-    if probe(["docker", "inspect", "-f", "{{.State.Running}}",
-              WARP_CONTAINER]).stdout.strip() == "true":
-        routes.append((f"через WARP ({WARP_SOCKS_PORT})",
-                       ["-x", f"socks5h://127.0.0.1:{WARP_SOCKS_PORT}"]))
-    if probe(["docker", "inspect", "-f", "{{.State.Running}}",
-              PSIPHON_CONTAINER]).stdout.strip() == "true":
+    routes: list[tuple[str, int | None]] = [("напрямую с ноды", None)]
+    if _detect_warp():
+        routes.append((f"через WARP ({WARP_SOCKS_PORT})", WARP_SOCKS_PORT))
+    if _detect_psiphon():
         routes.append((f"через Psiphon ({PSIPHON_SOCKS_PORT})",
-                       ["-x", f"socks5h://127.0.0.1:{PSIPHON_SOCKS_PORT}"]))
+                       PSIPHON_SOCKS_PORT))
 
     table = Table(box=box.ROUNDED, border_style="cyan", padding=(0, 1))
     table.add_column("Маршрут")
     table.add_column("Локаль")
     table.add_column("Вердикт")
-    for name, extra in routes:
-        r = probe(["curl", "-s", "-4", "--max-time", "25", *extra,
-                   "-A", "Mozilla/5.0", "https://www.google.com"])
-        # Основной признак — атрибут lang тега html (вид lang="en-GB"),
-        # запасные — строка "en_US" в скриптах и hl=xx на странице-согласии
-        locale = ""
-        m = re.search(r'<html[^>]*\slang="([a-zA-Z-]+)"', r.stdout)
-        if m:
-            locale = m.group(1)
-        if not locale:
-            m = re.search(r'"([a-z]{2}_[A-Z]{2})"', r.stdout)
-            locale = m.group(1) if m else ""
-        if not locale:
-            m = re.search(r"hl=([a-z]{2})", r.stdout)
-            locale = m.group(1) if m else ""
-
+    for name, port in routes:
+        # Таймаут щедрее, чем в шапке: сюда приходят разбираться, когда что-то
+        # уже не так, и медленный ответ полезнее пустой строки
+        locale = google_locale(port, timeout=25)
         if not locale:
             table.add_row(name, "[dim]—[/dim]",
                           "[yellow]локаль не найдена[/yellow]")
-            continue
-        lang = re.split(r"[-_]", locale)[0].lower()
-        if lang in ("ru", "be"):
+        elif locale_ok(locale):
+            table.add_row(name, f"[green]{locale}[/green]",
+                          "[green]годится[/green]")
+        else:
             table.add_row(name, f"[red]{locale}[/red]",
                           "[red]Gemini не пустит[/red]")
-        else:
-            table.add_row(name, f"[green]{locale}[/green]", "[green]годится[/green]")
     console.print(table)
 
 
@@ -4520,17 +4563,21 @@ def menu_tests() -> None:
 def menu_tools() -> None:
     while True:
         console.print()
+        choices = [
+            questionary.Choice("Remnawave Backup & Restore (distillium)",
+                               value="backup_restore"),
+            questionary.Choice("SOCKS5-прокси Dante", value="dante"),
+            questionary.Choice("Проверить обновления сторонних скриптов",
+                               value="vendor_updates"),
+        ]
+        # Пункт нужен, только пока Psiphon на сервере есть
+        if psiphon_present():
+            choices.append(questionary.Choice("Удалить Psiphon",
+                                              value="psiphon_remove"))
+        choices.append(questionary.Choice("← Назад", value="back"))
+
         choice = questionary.select(
-            "Tools:",
-            choices=[
-                questionary.Choice("Remnawave Backup & Restore (distillium)",
-                                   value="backup_restore"),
-                questionary.Choice("SOCKS5-прокси Dante", value="dante"),
-                questionary.Choice("Проверить обновления сторонних скриптов",
-                                   value="vendor_updates"),
-                questionary.Choice("← Назад", value="back"),
-            ],
-            style=CUSTOM_STYLE,
+            "Tools:", choices=choices, style=CUSTOM_STYLE,
         ).ask()
         if choice in (None, "back"):
             return
@@ -4543,6 +4590,11 @@ def menu_tools() -> None:
                 menu_vendor_updates()
             except (subprocess.CalledProcessError, OSError, RuntimeError) as exc:
                 console.print(f"[red]✗ Ошибка проверки: {exc}[/red]")
+        elif choice == "psiphon_remove":
+            try:
+                remove_psiphon()
+            except (subprocess.CalledProcessError, OSError, RuntimeError) as exc:
+                console.print(f"[red]✗ Ошибка удаления: {exc}[/red]")
 
 
 # ================================================================== #
@@ -4609,6 +4661,65 @@ def install_self() -> None:
 
 
 # ================================================================== #
+# Состояние выходов в шапке
+# ================================================================== #
+# Google определяет гео не по стране сервера и не по записям RIPE, а по своим
+# данным — и адреса, купленные у российских реселлеров, клеит к RU независимо
+# от того, где сервер стоит физически. Наружу это видно по локали, которую он
+# отдаёт на главной странице: русская означает, что Gemini не пустит.
+#
+# Разметка Google различается, поэтому смотрим в трёх местах. Судим по языку,
+# а не по региону: en-GB и en_US одинаково годятся, ru в любом виде — нет.
+_LOCALE_PATTERNS = (
+    re.compile(r'<html[^>]*\slang="([A-Za-z][A-Za-z_-]+)"'),
+    re.compile(r'"([a-z]{2}_[A-Z]{2})"'),
+    re.compile(r'hl=([a-z]{2})\b'),
+)
+
+
+def google_locale(socks_port: int | None, timeout: int = 5) -> str:
+    """Локаль, которую Google отдаёт на главной. Пусто — не ответил или в
+    разметке её нет.
+
+    socks_port=None — запрос напрямую с сервера."""
+    proxy = ["-x", f"socks5h://127.0.0.1:{socks_port}"] if socks_port else []
+    r = probe(["curl", "-s", "-4", "--max-time", str(timeout), *proxy,
+               "-A", "Mozilla/5.0", "https://www.google.com/"])
+    if not r.stdout:
+        return ""
+    for pattern in _LOCALE_PATTERNS:
+        m = pattern.search(r.stdout)
+        if m:
+            return m.group(1)
+    return ""
+
+
+def locale_ok(locale: str) -> bool:
+    """Судим по языку, а не по региону: en-GB и en_US одинаково годятся."""
+    lang = re.split(r"[-_]", locale)[0].lower()
+    return lang not in BAD_LANGS.split("|")
+
+
+def egress_status_lines() -> list[str]:
+    """Строки о состоянии выходов для шапки. Пусто, если ни один не поднят."""
+    lines = []
+    for name, port, running in (
+            ("WARP", WARP_SOCKS_PORT, _detect_warp()),
+            ("Psiphon", PSIPHON_SOCKS_PORT, _detect_psiphon())):
+        if not running:
+            continue
+        locale = google_locale(port)
+        if not locale:
+            verdict = "[yellow]Google не ответил[/yellow]"
+        elif locale_ok(locale):
+            verdict = f"[green]локаль {locale} — Gemini доступен[/green]"
+        else:
+            verdict = f"[red]локаль {locale} — Gemini не пустит[/red]"
+        lines.append(f"[dim]{name} ({port}):[/dim] {verdict}")
+    return lines
+
+
+# ================================================================== #
 # Точка входа: главное меню
 # ================================================================== #
 CLI: dict = {}
@@ -4633,6 +4744,12 @@ def main() -> None:
         box=box.DOUBLE,
         padding=(1, 4),
     ))
+
+    # Локаль Google через каждый поднятый выход. Запрос дешёвый (главная
+    # отдаётся за доли секунды), а ответ сразу говорит, будет ли работать
+    # Gemini, — то, ради чего эти выходы и стоят.
+    for line in egress_status_lines():
+        console.print(line)
 
     while True:
         console.print()
