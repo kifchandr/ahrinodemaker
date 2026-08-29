@@ -4618,14 +4618,53 @@ def self_update_state() -> tuple[str, str]:
     return ("current" if mine == remote else "outdated"), ""
 
 
-def install_self(force_download: bool = False) -> None:
+# Метка в окружении переживает execv и защищает от петли: если новый файл почему
+# -то снова оказался «устаревшим» (не записался, репозиторий отдаёт другое), без
+# неё скрипт перезапускал бы сам себя бесконечно.
+SELF_UPDATED_ENV = "AHRINODEMAKER_UPDATED"
+
+
+def self_update_and_restart() -> None:
+    """Обновляет скрипт и перезапускается на новой версии.
+
+    Без вопросов: запускают его на разных серверах и редко, и разбираться,
+    какая где версия, — работа, которую скрипт может сделать сам. Молча
+    пропускаем, когда обновляться нечем или некуда: запуск через
+    `curl | python3`, недоступный GitHub, нет прав на запись."""
+    if os.environ.get(SELF_UPDATED_ENV):
+        return
+    state, _why = self_update_state()
+    if state != "outdated":
+        return
+
+    console.print("[yellow]Вышла новая версия — обновляюсь…[/yellow]")
+    try:
+        install_self(force_download=True, quiet=True)
+    except (subprocess.CalledProcessError, OSError, RuntimeError) as exc:
+        console.print(f"[yellow]Обновиться не удалось ({exc}), продолжаю на "
+                      "текущей версии.[/yellow]")
+        return
+
+    os.environ[SELF_UPDATED_ENV] = "1"
+    console.print("[green]✓ Обновлено, перезапускаюсь[/green]\n")
+    try:
+        os.execv(sys.executable, [sys.executable, SELF_PATH, *sys.argv[1:]])
+    except OSError as exc:
+        # execv не вернётся при успехе; сюда попадаем только при сбое
+        console.print(f"[yellow]Перезапуск не удался ({exc}). Запустите "
+                      "заново: [bold]sudo ahri[/bold][/yellow]")
+
+
+def install_self(force_download: bool = False, quiet: bool = False) -> None:
     """Кладёт скрипт в /usr/local/bin и заводит короткое имя `ahri`.
 
     Источник берём с диска, если скрипт уже запущен из файла, иначе качаем из
     репозитория: при запуске через `curl | python3` файла попросту нет.
     force_download — при обновлении: локальный файл как раз и есть устаревший,
-    брать его источником бессмысленно."""
-    step("Короткая команда для запуска")
+    брать его источником бессмысленно. quiet — для автообновления: там всё это
+    происходит до меню, и подробный отчёт об установке только мешает."""
+    if not quiet:
+        step("Короткая команда для запуска")
 
     source = None if force_download else _self_source_path()
 
@@ -4640,7 +4679,8 @@ def install_self(force_download: bool = False) -> None:
         else:
             staged = os.path.join(tmpdir, "ahrinodemaker")
             _download(f"{REPO_RAW_BASE}/ahrinodemaker", staged, timeout=60)
-            console.print("[dim]Скрипт скачан из репозитория[/dim]")
+            if not quiet:
+                console.print("[dim]Скрипт скачан из репозитория[/dim]")
 
         with open(staged, encoding="utf-8", errors="replace") as f:
             head = f.read(64)
@@ -4658,6 +4698,8 @@ def install_self(force_download: bool = False) -> None:
             os.unlink(link)
         os.symlink(SELF_PATH, link)
 
+    if quiet:
+        return
     names = ", ".join(os.path.basename(p) for p in SELF_SHORTCUTS)
     console.print(f"[green]✓ Установлено: {SELF_PATH}[/green]")
     console.print(f"[green]✓ Короткие команды: [bold]{names}[/bold][/green]")
@@ -4750,18 +4792,16 @@ def main() -> None:
         padding=(1, 4),
     ))
 
+    # Обновление идёт до всего остального: иначе состояние сервера напечатала
+    # бы старая версия, а после перезапуска то же самое напечаталось бы второй
+    # раз. Недоступный GitHub ничего не ломает — просто работаем как есть.
+    self_update_and_restart()
+
     # Локаль Google через каждый поднятый выход. Запрос дешёвый (главная
     # отдаётся за доли секунды), а ответ сразу говорит, будет ли работать
     # Gemini, — то, ради чего эти выходы и стоят.
     for line in egress_status_lines():
         console.print(line)
-
-    # Сверка с репозиторием. Запрос один и с коротким таймаутом; недоступный
-    # GitHub ничего не ломает — состояние просто остаётся неизвестным.
-    self_state, _why = self_update_state()
-    if self_state == "outdated":
-        console.print("[yellow]Доступна новая версия ahrinodemaker "
-                      "— обновить можно из главного меню.[/yellow]")
 
     while True:
         console.print()
@@ -4777,11 +4817,6 @@ def main() -> None:
             choices.append(questionary.Choice(
                 "Установить короткие команды «ahri» и «ahrinode»",
                 value="install_self"))
-        if self_state == "outdated":
-            choices.append(questionary.Choice(
-                title=[("", "Обновить ahrinodemaker"),
-                       ("fg:ansiyellow", "   [вышла новая версия]")],
-                value="update_self"))
         choices.append(questionary.Choice("Выход", value="exit"))
 
         choice = questionary.select(
@@ -4801,17 +4836,6 @@ def main() -> None:
                 install_self()
             except (subprocess.CalledProcessError, OSError, RuntimeError) as exc:
                 console.print(f"[red]✗ Не удалось установить команду: {exc}[/red]")
-        elif choice == "update_self":
-            try:
-                install_self(force_download=True)
-            except (subprocess.CalledProcessError, OSError, RuntimeError) as exc:
-                console.print(f"[red]✗ Не удалось обновить: {exc}[/red]")
-                continue
-            # Дальше работает старый код, уже загруженный в память: продолжать
-            # в нём — значит делать вид, что обновление применилось
-            console.print("[green]✓ Обновлено. Запустите заново: "
-                          "[bold]sudo ahri[/bold][/green]")
-            return
 
 
 if __name__ == "__main__":
