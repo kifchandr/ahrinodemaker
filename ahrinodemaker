@@ -640,6 +640,47 @@ EGRESS_DENY_OPTIONAL: list[tuple[str, str, list[str]]] = [
 ]
 
 
+BLOCKED_PORTS_REF = f"{INSTALL_DIR}/panel-blocked-ports.json"
+
+
+def _xray_ports(specs: list[str], proto: str) -> str:
+    """Список портов в записи xray: диапазон через дефис, а не через двоеточие,
+    как у ufw."""
+    ports = []
+    for spec in specs:
+        value, _, kind = spec.partition("/")
+        if kind == proto:
+            ports.append(value.replace(":", "-"))
+    ports.sort(key=lambda p: int(p.split("-")[0]))
+    return ",".join(ports)
+
+
+def blocked_ports_reference(specs: list[str]) -> str:
+    """Правило для панели, повторяющее запреты ufw.
+
+    Дублирование намеренное, уровни разные. UFW ловит всё, что уходит с
+    сервера, включая процессы мимо xray, — это последний рубеж. Правило в
+    панели срабатывает раньше: клиент получает отказ сразу, попытка попадает
+    в error.log с именем пользователя, и запрет можно сузить до одного
+    inbound. Порознь каждый из двух оставляет дыру."""
+    rules = []
+    for proto in ("tcp", "udp"):
+        ports = _xray_ports(specs, proto)
+        if ports:
+            rules.append({"type": "field", "outboundTag": "block",
+                          "network": proto, "port": ports})
+    return json.dumps({
+        "outboundToAdd": {"tag": "block", "protocol": "blackhole"},
+        "routingRulesToAdd": rules,
+        "_note": (
+            "Правила ставьте ПЕРВЫМИ в routing.rules: xray применяет первое "
+            "совпавшее, и запрет ниже разрешающего правила не сработает. "
+            "Если в профиле уже есть outbound с protocol: blackhole — новый не "
+            "добавляйте, подставьте в правила его tag. Это дополнение к "
+            "запретам ufw, а не замена: ufw ловит и то, что идёт мимо xray."),
+    }, ensure_ascii=False, indent=2)
+
+
 def ask_egress_denies() -> list[str]:
     """Дополнительные исходящие порты. Пропуск — закрыть только обязательный
     набор, который применяется в любом случае."""
@@ -702,6 +743,17 @@ def block_ufw(extra_ports: list[str], panel_ip: str | None = None,
     if egress_denies:
         console.print("[green]✓ Дополнительно закрыты: "
                       f"{', '.join(egress_denies)}[/green]")
+
+    # Те же порты — заготовкой для панели. Файл кладём всегда: нода может
+    # стоять и не быть установленной этим скриптом, каталог создаём сами.
+    os.makedirs(INSTALL_DIR, exist_ok=True)
+    write_file(BLOCKED_PORTS_REF,
+               blocked_ports_reference(EGRESS_DENY_ALWAYS + (egress_denies or [])))
+    console.print(f"[green]✓ Те же порты правилом для панели: "
+                  f"{BLOCKED_PORTS_REF}[/green]")
+    console.print("[dim]Добавьте оттуда outbound и правила в профиль ноды — "
+                  "клиент будет получать отказ сразу, а попытка попадёт в "
+                  "error.log.[/dim]")
 
     run(["ufw", "logging", "low"])
     run(["ufw", "--force", "enable"])

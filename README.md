@@ -161,9 +161,30 @@ ZeroSSL или Google Trust Services. Последним двум нужны EAB
 правилами не ограничены.
 
 Это последний рубеж, а не единственный: он ловит всё, включая скомпрометированный
-контейнер или чужой cron. Дополнительно те же порты стоит закрыть правилом в
-конфиге ноды с `blackhole`-outbound — оно отказывает клиенту сразу, пишет
-попытку в `error.log` и позволяет ограничить не всех, а конкретный inbound.
+контейнер или чужой cron. Поэтому блок заодно кладёт
+`/opt/remnanode/panel-blocked-ports.json` — те же порты, оформленные как
+`blackhole`-outbound и правила маршрутизации для профиля ноды в панели:
+
+```json
+{
+  "outboundToAdd": { "tag": "block", "protocol": "blackhole" },
+  "routingRulesToAdd": [
+    { "type": "field", "outboundTag": "block", "network": "tcp",
+      "port": "25,111,135,139,445,11211" },
+    { "type": "field", "outboundTag": "block", "network": "udp",
+      "port": "17,19,111,137,138,389,445,1900,11211" }
+  ]
+}
+```
+
+Правила ставьте **первыми** в `routing.rules`: xray применяет первое совпавшее,
+и запрет ниже разрешающего правила не сработает. Если в профиле уже есть
+outbound с `protocol: blackhole`, новый не добавляйте — подставьте его тег.
+
+Дублирование намеренное, уровни разные. UFW ловит всё, что уходит с сервера.
+Правило в панели срабатывает раньше: клиент получает отказ сразу, попытка
+попадает в `error.log` с именем пользователя, и запрет можно сузить до одного
+inbound. Порознь каждый из двух оставляет дыру.
 
 ### Файлы, которые создаёт раздел
 
@@ -174,6 +195,7 @@ ZeroSSL или Google Trust Services. Последним двум нужны EAB
 - `/opt/remnanode/apply-torrent-egress-filter.sh`, `/opt/remnanode/panel-torrent-block-config.json`
 - `/opt/remnanode/panel-hysteria-inbound.json` — заготовка inbound'а Hysteria2
   с подставленным доменом, для вставки в конфиг ноды через панель
+- `/opt/remnanode/panel-blocked-ports.json` — при настройке UFW
 - `/opt/warp/docker-compose.yml` и `/opt/remnanode/panel-warp-outbound.json` —
   только при включении WARP
 - `/opt/psiphon/docker-compose.yml` и `/opt/remnanode/panel-psiphon-outbound.json` —
