@@ -1784,6 +1784,169 @@ def ask_hysteria_params() -> tuple[str, dict | None] | None:
 
 
 # ------------------------------------------------------------------ #
+# VLESS gRPC + Reality: второй TCP-транспорт рядом с основным
+# ------------------------------------------------------------------ #
+# На ноде работает один Xray, и сколько inbound'ов описано в профиле панели,
+# столько он и поднимет. Ограничение одно — свой порт у каждого. gRPC полезен
+# там, где основной 443/tcp деградирует: трафик выглядит как HTTP/2 к обычному
+# сайту и переживает провайдеров, ломающих длинные TCP-соединения.
+#
+# Серверная часть здесь тонкая: открыть порт и сгенерировать ключи. Сам inbound
+# живёт в конфиге ноды, а тот приходит из панели, поэтому блок кладёт готовую
+# заготовку — как это уже сделано для Hysteria2.
+GRPC_PORT = 8443
+GRPC_INBOUND_TAG = "VLESS_GRPC_REALITY"
+GRPC_REFERENCE = f"{INSTALL_DIR}/panel-grpc-inbound.json"
+
+# Маскировочный сайт для Reality. Требования: TLS 1.3, HTTP/2, зарубежный
+# хостинг и отсутствие в реестрах блокировок.
+GRPC_DEST_CHOICES = [
+    ("www.microsoft.com", "Microsoft"),
+    ("www.cloudflare.com", "Cloudflare"),
+    ("www.samsung.com", "Samsung"),
+    ("www.nvidia.com", "NVIDIA"),
+    ("www.lovelive-anime.jp", "Lovelive (частый выбор в гайдах)"),
+]
+
+
+def reality_keypair() -> tuple[str, str]:
+    """Пара ключей Reality от самого Xray внутри контейнера ноды.
+
+    Формат вывода `xray x25519` менялся: раньше «Private key»/«Public key»,
+    в свежих сборках «PrivateKey»/«Password». Разбираем оба, иначе на части
+    серверов ключи молча не находились бы."""
+    r = probe(["docker", "exec", "remnanode", "xray", "x25519"])
+    if r.returncode != 0 or not r.stdout:
+        return "", ""
+    priv = re.search(r"private\s*key\s*:\s*(\S+)", r.stdout, re.IGNORECASE)
+    pub = re.search(r"(?:public\s*key|password)\s*:\s*(\S+)", r.stdout,
+                    re.IGNORECASE)
+    return (priv.group(1) if priv else "", pub.group(1) if pub else "")
+
+
+def grpc_inbound_reference(port: int, dest: str, private_key: str,
+                           public_key: str, service_name: str,
+                           short_ids: list[str]) -> str:
+    """Готовый inbound для вставки в конфиг ноды через панель."""
+    return json.dumps({
+        "tag": GRPC_INBOUND_TAG,
+        "port": port,
+        "listen": "0.0.0.0",
+        "protocol": "vless",
+        "settings": {
+            "clients": [],
+            "decryption": "none",
+        },
+        # Без sniffing доменные правила маршрутизации на этом inbound'е не
+        # работают — трафик уходит по IP мимо них, — а в access.log не попадают
+        # домены, и tblocker не увидит торренты
+        "sniffing": {
+            "enabled": True,
+            "destOverride": ["http", "tls", "quic"],
+        },
+        "streamSettings": {
+            "network": "grpc",
+            "security": "reality",
+            "realitySettings": {
+                "show": False,
+                "dest": f"{dest}:443",
+                "xver": 0,
+                "serverNames": [dest],
+                "privateKey": private_key,
+                "shortIds": short_ids,
+            },
+            "grpcSettings": {
+                "serviceName": service_name,
+                "multiMode": False,
+            },
+        },
+        "_publicKey": public_key,
+        "_note": (
+            "publicKey нужен клиенту, в конфиг ноды его не кладут — поле "
+            "начинается с подчёркивания и его нужно удалить перед вставкой, "
+            "как и это примечание. В панели: добавьте объект в массив inbounds, "
+            f"заведите Host с тегом «{GRPC_INBOUND_TAG}», serviceName "
+            f"«{service_name}» и внесите inbound в Squad. Ключи Reality можно "
+            "было бы взять и от существующего inbound'а на 443 — здесь "
+            "сгенерирована новая пара, обе схемы рабочие."),
+    }, indent=2, ensure_ascii=False) + "\n"
+
+
+def block_grpc(params: tuple[int, str] | None = None) -> None:
+    step("VLESS gRPC + Reality: порт и заготовка inbound'а")
+    port, dest = params if params else (GRPC_PORT, GRPC_DEST_CHOICES[0][0])
+
+    if shutil.which("docker") is None:
+        raise RuntimeError("Docker не установлен — сначала установите ноду")
+    if probe(["docker", "inspect", "-f", "{{.State.Status}}",
+              "remnanode"]).returncode != 0:
+        raise RuntimeError("контейнер remnanode не найден — сначала установите ноду")
+
+    private_key, public_key = reality_keypair()
+    if not private_key:
+        console.print("[yellow]Не удалось получить ключи Reality от xray в "
+                      "контейнере — в заготовке останутся пустые поля. "
+                      "Подставьте туда ключи от существующего inbound'а на "
+                      "443 либо выполните: docker exec remnanode xray x25519"
+                      "[/yellow]")
+
+    # Короткий идентификатор Reality — чётное число hex-символов, до 16.
+    # Пустая строка в списке разрешает клиентов вовсе без shortId.
+    short_ids = ["", secrets.token_hex(4)]
+    service_name = secrets.token_hex(4)
+
+    if shutil.which("ufw") and probe(["ufw", "status"]).stdout.count("Status: active"):
+        run(["ufw", "allow", f"{port}/tcp"], check=False)
+        console.print(f"[green]✓ Открыт порт {port}/tcp[/green]")
+    else:
+        console.print(f"[yellow]UFW неактивен — откройте {port}/tcp "
+                      "самостоятельно.[/yellow]")
+
+    os.makedirs(INSTALL_DIR, exist_ok=True)
+    write_file(GRPC_REFERENCE,
+               grpc_inbound_reference(port, dest, private_key, public_key,
+                                      service_name, short_ids))
+    console.print(f"[green]✓ Заготовка inbound: {GRPC_REFERENCE}[/green]")
+    console.print(f"[dim]Маскировка: {dest}, serviceName: {service_name}[/dim]")
+    if public_key:
+        console.print(f"[dim]publicKey для клиентов: {public_key}[/dim]")
+
+    console.print(
+        "[bold yellow]Важно:[/bold yellow] перезапускать ноду не нужно — "
+        "конфиг она берёт из панели. Добавьте содержимое "
+        f"{GRPC_REFERENCE} в массив inbounds профиля (удалив поля с "
+        f"подчёркиванием), заведите Host с тегом «{GRPC_INBOUND_TAG}» и "
+        "внесите inbound в Squad.")
+
+
+def ask_grpc_params() -> tuple[int, str] | None:
+    dest = questionary.select(
+        "Маскировочный сайт для Reality (клиент будет выглядеть как гость "
+        "этого сайта):",
+        choices=[questionary.Choice(f"{host} — {title}", value=host)
+                 for host, title in GRPC_DEST_CHOICES],
+        style=CUSTOM_STYLE).ask()
+    if dest is None:
+        return None
+
+    raw = questionary.text(
+        f"Порт для gRPC (Enter — {GRPC_PORT}):",
+        default=str(GRPC_PORT), style=CUSTOM_STYLE).ask()
+    if raw is None:
+        return None
+    try:
+        port = int(raw.strip() or GRPC_PORT)
+    except ValueError:
+        console.print(f"[yellow]«{raw}» не число — беру {GRPC_PORT}.[/yellow]")
+        port = GRPC_PORT
+    if not 1 <= port <= 65535 or port == 443:
+        console.print(f"[yellow]Порт {port} не годится (443 занят основным "
+                      f"inbound'ом) — беру {GRPC_PORT}.[/yellow]")
+        port = GRPC_PORT
+    return port, dest
+
+
+# ------------------------------------------------------------------ #
 # WARP: чистый egress для сервисов, режущих IP дата-центров
 # ------------------------------------------------------------------ #
 # Нейросети, Spotify и часть стримингов блокируют адреса хостингов. WARP даёт
@@ -3014,6 +3177,7 @@ BLOCKS = [
     ("remnanode_logs", "Логи remnanode: каталог + logrotate + volume в docker-compose", block_remnanode_logs),
     ("node_update", "Обновление remnanode (docker compose pull + пересоздание)", block_node_update),
     ("hysteria", "Hysteria2 (QUIC): сертификаты в /dev/shm + 443/udp + автообновление", block_hysteria),
+    ("grpc", "VLESS gRPC + Reality: второй транспорт на отдельном порту", block_grpc),
     ("warp", "WARP: чистый egress для нейросетей (Gemini, ChatGPT) и стримингов", block_warp),
     ("psiphon", "Psiphon: альтернативный egress, если WARP не помог", block_psiphon),
     ("torrent", "Блокировка торрентов (tblocker + egress-фильтр + конфиг панели)", block_torrent),
@@ -3035,7 +3199,7 @@ INSTALLS_PACKAGES = {"packages", "node_install", "fail2ban", "ufw",
 # Блоки, которые по умолчанию идут БЕЗ галочки, даже если ещё не настроены.
 # Hysteria2 — дополнительный транспорт: он нужен не всем, требует сертификата
 # и ручной настройки inbound'а в панели, поэтому включается осознанно.
-DEFAULT_OFF = {"hysteria", "warp", "psiphon"}
+DEFAULT_OFF = {"hysteria", "grpc", "warp", "psiphon"}
 
 # Блоки, у которых при уже выполненной установке пункт меняет смысл на
 # противоположный: ставить нечего, а снять — единственное, что осталось.
@@ -3104,6 +3268,12 @@ def _detect_hysteria() -> bool:
     return cr.returncode == 0 and HYSTERIA_CERT in cr.stdout
 
 
+def _detect_grpc() -> bool:
+    # Судить можно только по заготовке: сам inbound живёт в панели, и с сервера
+    # его не видно. Пометка означает «блок уже отрабатывал здесь», не более.
+    return os.path.isfile(GRPC_REFERENCE)
+
+
 def _detect_warp() -> bool:
     r = probe(["docker", "inspect", "-f", "{{.State.Running}}", WARP_CONTAINER])
     return r.returncode == 0 and r.stdout.strip() == "true"
@@ -3131,6 +3301,7 @@ DETECTORS = {
     "time_cron":      _detect_time_cron,
     "remnanode_logs": _detect_remnanode_logs,
     "hysteria":       _detect_hysteria,
+    "grpc":           _detect_grpc,
     "warp":           _detect_warp,
     "psiphon":        _detect_psiphon,
     "torrent":        _detect_torrent,
@@ -3384,6 +3555,12 @@ def menu_remnawave_node() -> None:
     if "hysteria" in selected:
         hysteria_params = ask_hysteria_params()
 
+    grpc_params: tuple[int, str] | None = None
+    if "grpc" in selected:
+        grpc_params = ask_grpc_params()
+        if grpc_params is None:
+            selected = [k for k in selected if k != "grpc"]
+
     # 5. Расписание перезагрузки — только если выбран блок cron
     reboot_schedule = "daily"
     if "time_cron" in selected:
@@ -3497,6 +3674,8 @@ def menu_remnawave_node() -> None:
                 func(node_params)
             elif key == "hysteria":
                 func(hysteria_params)
+            elif key == "grpc":
+                func(grpc_params)
             elif egress_present.get(key):
                 EGRESS_REMOVERS[key][1]()
             elif key == "warp":
