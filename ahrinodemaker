@@ -1818,6 +1818,82 @@ GRPC_DEST_CHOICES = [
 ]
 
 
+# Доступность сайта из России проверяем чужими руками: с самой ноды этого не
+# увидеть, она стоит за границей и никаких ТСПУ на её пути нет. check-host.net
+# даёт бесплатный API с узлами в разных городах — Москва, Петербург, регионы,
+# плюс зарубежные для контроля.
+#
+# Реестр РКН намеренно не опрашиваем. Он отвечает на вопрос «числится ли домен
+# в списке», а нужен ответ «работает ли он по факту»: ТСПУ режут и то, чего в
+# реестре нет, а часть внесённого продолжает открываться. Живая проверка с
+# российских узлов отвечает ровно на нужный вопрос.
+CHECKHOST_API = "https://check-host.net"
+
+
+def _checkhost_json(url: str, timeout: int = 25) -> dict | None:
+    r = probe(["curl", "-sS", "--max-time", str(timeout),
+               "-H", "Accept: application/json", url])
+    if r.returncode != 0 or not r.stdout.strip():
+        return None
+    try:
+        data = json.loads(r.stdout)
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def checkhost_tcp(host: str, port: int = 443, max_nodes: int = 12,
+                  wait: int = 20) -> dict:
+    """Проверяет TCP-подключение к сайту с узлов check-host.net.
+
+    Возвращает счётчики по России и загранице и список (город, страна, ок, мс).
+    Пустой список узлов — сервис не ответил; это не приговор сайту."""
+    out: dict = {"ru": [], "foreign": [], "error": ""}
+    start = _checkhost_json(
+        f"{CHECKHOST_API}/check-tcp?host={host}:{port}&max_nodes={max_nodes}")
+    if not start or not start.get("request_id"):
+        out["error"] = "check-host.net не ответил"
+        return out
+
+    nodes = start.get("nodes") or {}
+    request_id = start["request_id"]
+
+    # Узлы отвечают не разом: результат наполняется по мере готовности, а до
+    # того на месте узла стоит null. Опрашиваем, пока не соберём всех или не
+    # выйдет время.
+    results: dict = {}
+    deadline = time.monotonic() + wait
+    while time.monotonic() < deadline:
+        time.sleep(3)
+        data = _checkhost_json(f"{CHECKHOST_API}/check-result/{request_id}")
+        if data:
+            results = data
+            if all(v is not None for v in results.values()) and results:
+                break
+
+    for node, value in results.items():
+        # null — узел не успел ответить за отведённое время. Считать это
+        # отказом нельзя: получился бы приговор сайту за медлительность
+        # проверялки, поэтому такой узел просто не учитываем.
+        if value is None:
+            continue
+        info = nodes.get(node) or []
+        country = (info[0] if len(info) > 0 else "").lower()
+        city = info[2] if len(info) > 2 else node.split(".")[0]
+        ok, ms = False, 0
+        # Значение узла — список с одним словарём: {"address","time"} при
+        # успехе, {"error": ...} при отказе. null означает «ещё считается».
+        if isinstance(value, list) and value and isinstance(value[0], dict):
+            entry = value[0]
+            if "time" in entry:
+                ok, ms = True, int(float(entry["time"]) * 1000)
+        out["ru" if country == "ru" else "foreign"].append((city, country, ok, ms))
+
+    if not out["ru"] and not out["foreign"]:
+        out["error"] = "узлы не ответили за отведённое время"
+    return out
+
+
 def check_reality_sni(host: str, timeout: int = 8) -> dict:
     """Проверяет, годится ли сайт как dest для Reality, с этого сервера.
 
@@ -1901,24 +1977,88 @@ def menu_reality_sni() -> None:
     console.print(table)
 
     good = [r for r in results if r["ok"]]
-    if good:
-        best = good[0]
-        console.print(f"\n[green]Лучший для этого сервера: "
-                      f"[bold]{best['host']}[/bold] ({best['ms']} мс)[/green]")
-        console.print("[dim]Впишите его в поле dest и serverNames своего "
-                      "inbound'а — или выберите в блоке «VLESS gRPC + "
-                      "Reality».[/dim]")
-    else:
+    if not good:
         console.print("\n[yellow]Ни один кандидат не подошёл. Так бывает, "
                       "когда исходящие с сервера фильтруются или openssl "
                       "слишком старый.[/yellow]")
+        return
+
+    # Вторая половина проверки: доступность из России. С самой ноды её не
+    # увидеть — она за границей, и ТСПУ на её пути нет.
+    console.print(f"\n[green]По требованиям Reality годятся: "
+                  f"{', '.join(r['host'] for r in good)}[/green]")
+    picked = questionary.checkbox(
+        "Проверить их доступность из городов РФ и из-за границы?\n"
+        "  Проверка идёт через check-host.net, около 20 секунд на домен.\n"
+        "  Enter без отметок — пропустить:",
+        choices=[questionary.Choice(f"{r['host']} ({r['ms']} мс)",
+                                    value=r["host"], checked=i < 3)
+                 for i, r in enumerate(good)],
+        style=CUSTOM_STYLE).ask()
+
+    if not picked:
+        console.print(f"[green]Лучший по локальным проверкам: "
+                      f"[bold]{good[0]['host']}[/bold][/green]")
+        return
+
+    remote = Table(box=box.ROUNDED, border_style="cyan", padding=(0, 1))
+    remote.add_column("Сайт")
+    remote.add_column("Россия", justify="center")
+    remote.add_column("Заграница", justify="center")
+    remote.add_column("Города РФ")
+    remote.add_column("Вердикт")
+
+    verdicts: list[tuple[str, int, int]] = []
+    for host in picked:
+        with console.status(f"[cyan]Проверяю {host} с узлов check-host.net…[/cyan]"):
+            res = checkhost_tcp(host)
+        if res["error"]:
+            remote.add_row(host, "—", "—", "—",
+                           f"[yellow]{res['error']}[/yellow]")
+            continue
+        ru_ok = sum(1 for _, _, ok, _ in res["ru"] if ok)
+        ru_total = len(res["ru"])
+        f_ok = sum(1 for _, _, ok, _ in res["foreign"] if ok)
+        f_total = len(res["foreign"])
+        cities = ", ".join(
+            f"[green]{city}[/green]" if ok else f"[red]{city}[/red]"
+            for city, _, ok, _ in res["ru"]) or "—"
+
+        # Один упавший узел — это обычно сам узел, а не блокировка. Приговор
+        # выносим, когда не отвечает большинство российских точек.
+        if ru_total and ru_ok == ru_total:
+            verdict = "[green]открыт отовсюду[/green]"
+        elif ru_total and ru_ok >= (ru_total + 1) // 2:
+            verdict = "[yellow]частично: не из всех городов[/yellow]"
+        elif ru_total:
+            verdict = "[red]из РФ не открывается[/red]"
+        else:
+            verdict = "[yellow]российских узлов не было[/yellow]"
+        if f_total and not f_ok:
+            verdict = "[red]сайт лежит и вне РФ[/red]"
+
+        remote.add_row(host, f"{ru_ok}/{ru_total}", f"{f_ok}/{f_total}",
+                       cities, verdict)
+        verdicts.append((host, ru_ok, ru_total))
+
+    console.print(remote)
+
+    clean = [h for h, ok, total in verdicts if total and ok == total]
+    if clean:
+        console.print(f"\n[green]Берите [bold]{clean[0]}[/bold]: проходит "
+                      "требования Reality и открывается из всех проверенных "
+                      "городов.[/green]")
+    else:
+        console.print("\n[yellow]Ни один из проверенных не открылся из всех "
+                      "городов РФ. Стоит прогнать остальных кандидатов или "
+                      "добавить свои домены.[/yellow]")
 
     console.print(
-        "\n[dim]Чего проверка не знает: заблокирован ли сайт у ваших "
-        "пользователей, и не стоит ли его CDN внутри их страны — тогда "
-        "рукопожатие будет выглядеть странно (адрес зарубежный, сайт "
-        "местный). Проверяйте выбранный домен ещё и со стороны клиента."
-        "[/dim]")
+        "\n[dim]Реестр РКН намеренно не опрашивается: он отвечает, числится ли "
+        "домен в списке, а нужен ответ «работает ли он по факту» — ТСПУ режут "
+        "и то, чего в реестре нет. Чего проверка всё же не видит: стоит ли CDN "
+        "сайта внутри РФ — тогда рукопожатие выглядит странно, адрес "
+        "зарубежный, а сайт местный.[/dim]")
 
 
 def reality_keypair() -> tuple[str, str]:
