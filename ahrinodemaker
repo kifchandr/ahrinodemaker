@@ -2082,22 +2082,17 @@ def _checkhost_json(url: str, timeout: int = 25) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
-def checkhost_tcp(host: str, port: int = 443, max_nodes: int = 12,
-                  wait: int = 20) -> dict:
-    """Проверяет TCP-подключение к сайту с узлов check-host.net.
-
-    Возвращает счётчики по России и загранице и список (город, страна, ок, мс).
-    Пустой список узлов — сервис не ответил; это не приговор сайту."""
-    out: dict = {"ru": [], "foreign": [], "error": ""}
+def _checkhost_run(kind: str, target: str, max_nodes: int,
+                   wait: int) -> tuple[dict, dict, str]:
+    """Запускает проверку и дожидается результатов. Возвращает (узлы, ответы,
+    ошибка). Общая часть для всех видов проверок check-host.net."""
     start = _checkhost_json(
-        f"{CHECKHOST_API}/check-tcp?host={host}:{port}&max_nodes={max_nodes}")
+        f"{CHECKHOST_API}/check-{kind}?host={target}&max_nodes={max_nodes}")
     if not start or not start.get("request_id"):
-        out["error"] = "check-host.net не ответил"
-        return out
+        return {}, {}, "check-host.net не ответил"
 
     nodes = start.get("nodes") or {}
     request_id = start["request_id"]
-
     # Узлы отвечают не разом: результат наполняется по мере готовности, а до
     # того на месте узла стоит null. Опрашиваем, пока не соберём всех или не
     # выйдет время.
@@ -2108,30 +2103,114 @@ def checkhost_tcp(host: str, port: int = 443, max_nodes: int = 12,
         data = _checkhost_json(f"{CHECKHOST_API}/check-result/{request_id}")
         if data:
             results = data
-            if all(v is not None for v in results.values()) and results:
+            if results and all(v is not None for v in results.values()):
                 break
+    return nodes, results, ""
 
+
+def _checkhost_split(nodes: dict, results: dict, verdict) -> dict:
+    """Раскладывает ответы узлов на российские и зарубежные.
+
+    verdict — функция от значения узла, возвращающая (ок, подробность).
+    Узел со значением null не успел ответить: считать это отказом нельзя,
+    получился бы приговор сайту за медлительность проверялки."""
+    out: dict = {"ru": [], "foreign": [], "error": ""}
     for node, value in results.items():
-        # null — узел не успел ответить за отведённое время. Считать это
-        # отказом нельзя: получился бы приговор сайту за медлительность
-        # проверялки, поэтому такой узел просто не учитываем.
         if value is None:
             continue
         info = nodes.get(node) or []
         country = (info[0] if len(info) > 0 else "").lower()
         city = info[2] if len(info) > 2 else node.split(".")[0]
-        ok, ms = False, 0
-        # Значение узла — список с одним словарём: {"address","time"} при
-        # успехе, {"error": ...} при отказе. null означает «ещё считается».
-        if isinstance(value, list) and value and isinstance(value[0], dict):
-            entry = value[0]
-            if "time" in entry:
-                ok, ms = True, int(float(entry["time"]) * 1000)
-        out["ru" if country == "ru" else "foreign"].append((city, country, ok, ms))
-
+        ok, detail = verdict(value)
+        out["ru" if country == "ru" else "foreign"].append(
+            (city, country, ok, detail))
     if not out["ru"] and not out["foreign"]:
         out["error"] = "узлы не ответили за отведённое время"
     return out
+
+
+def checkhost_tcp(host: str, port: int = 443, max_nodes: int = 20,
+                  wait: int = 25) -> dict:
+    """Дошёл ли TCP до порта 443. Ловит блокировку по адресу."""
+    nodes, results, err = _checkhost_run("tcp", f"{host}:{port}", max_nodes, wait)
+    if err:
+        return {"ru": [], "foreign": [], "error": err}
+
+    def verdict(value):
+        # {"address","time"} при успехе, {"error": ...} при отказе
+        if isinstance(value, list) and value and isinstance(value[0], dict):
+            entry = value[0]
+            if "time" in entry:
+                return True, int(float(entry["time"]) * 1000)
+        return False, 0
+
+    return _checkhost_split(nodes, results, verdict)
+
+
+def checkhost_https(host: str, max_nodes: int = 20, wait: int = 30) -> dict:
+    """Полный запрос по HTTPS. Главная проверка из трёх.
+
+    ТСПУ режут не адрес, а имя в SNI, и делают это ПОСЛЕ установки TCP:
+    соединение открывается, клиент отправляет ClientHello с доменом, и в ответ
+    прилетает RST. Проверка одним лишь TCP-коннектом такую блокировку не видит
+    и рапортует «открыт», хотя на деле сайт не работает."""
+    nodes, results, err = _checkhost_run("http", f"https://{host}/",
+                                         max_nodes, wait)
+    if err:
+        return {"ru": [], "foreign": [], "error": err}
+
+    def verdict(value):
+        # [ок(1/0), время, сообщение, код ответа, адрес]
+        if isinstance(value, list) and value:
+            entry = value[0] if isinstance(value[0], list) else value
+            if len(entry) >= 3:
+                ok = bool(entry[0])
+                note = str(entry[3]) if len(entry) > 3 and entry[3] else str(entry[2])
+                return ok, note
+        return False, "нет ответа"
+
+    return _checkhost_split(nodes, results, verdict)
+
+
+def checkhost_dns(host: str, max_nodes: int = 20, wait: int = 25) -> dict:
+    """Что отвечает DNS в разных странах.
+
+    Часть блокировок делается подменой ответа: российский резолвер отдаёт не
+    тот адрес, что весь остальной мир. Сравниваем множества адресов, а не
+    доступность."""
+    nodes, results, err = _checkhost_run("dns", host, max_nodes, wait)
+    if err:
+        return {"ru": [], "foreign": [], "error": err}
+
+    def verdict(value):
+        addrs: list[str] = []
+        if isinstance(value, dict):
+            for key in ("A", "AAAA"):
+                item = value.get(key)
+                if isinstance(item, list):
+                    addrs.extend(str(a) for a in item)
+        elif isinstance(value, list) and value and isinstance(value[0], dict):
+            for key in ("A", "AAAA"):
+                item = value[0].get(key)
+                if isinstance(item, list):
+                    addrs.extend(str(a) for a in item)
+        return bool(addrs), ",".join(sorted(addrs))
+
+    return _checkhost_split(nodes, results, verdict)
+
+
+def dns_answers_match(result: dict) -> bool | None:
+    """Совпадают ли адреса, которые видят в России и за границей.
+
+    None — сравнивать не с чем. Пересечение, а не равенство: у крупных сайтов
+    CDN честно отдаёт разные адреса в разных странах, и это норма. Тревожно,
+    когда общих адресов нет вовсе."""
+    ru = {a for _, _, ok, detail in result["ru"] if ok for a in detail.split(",")}
+    world = {a for _, _, ok, detail in result["foreign"] if ok
+             for a in detail.split(",")}
+    if not ru or not world:
+        return None
+    return bool(ru & world)
 
 
 def _probe_reality_sni(host: str, timeout: int, alpn: str) -> dict:
@@ -2372,47 +2451,74 @@ def menu_reality_sni() -> None:
 
     remote = Table(box=box.ROUNDED, border_style="cyan", padding=(0, 1))
     remote.add_column("Сайт")
-    remote.add_column("Россия", justify="center")
+    remote.add_column("TCP РФ", justify="center")
+    remote.add_column("HTTPS РФ", justify="center")
+    remote.add_column("DNS", justify="center")
     remote.add_column("Заграница", justify="center")
-    remote.add_column("Города РФ")
+    remote.add_column("Города, где HTTPS не прошёл")
     remote.add_column("Вердикт")
 
-    verdicts: list[tuple[str, int, int]] = []
+    def score(res: dict, side: str) -> tuple[int, int]:
+        return sum(1 for _, _, ok, _ in res[side] if ok), len(res[side])
+
+    verdicts: list[tuple[str, bool]] = []
     for host in picked:
-        with console.status(f"[cyan]Проверяю {host} с узлов check-host.net…[/cyan]"):
-            res = checkhost_tcp(host)
-        if res["error"]:
-            remote.add_row(host, "—", "—", "—",
-                           f"[yellow]{res['error']}[/yellow]")
+        with console.status(f"[cyan]Проверяю {host}: TCP, HTTPS и DNS с узлов "
+                            "check-host.net…[/cyan]"):
+            # Три проверки параллельно: они независимы, а последовательно это
+            # была бы минута на каждый домен
+            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+                f_tcp = pool.submit(checkhost_tcp, host)
+                f_web = pool.submit(checkhost_https, host)
+                f_dns = pool.submit(checkhost_dns, host)
+                tcp, web, dns = f_tcp.result(), f_web.result(), f_dns.result()
+
+        if tcp["error"] and web["error"]:
+            remote.add_row(host, "—", "—", "—", "—", "—",
+                           f"[yellow]{tcp['error']}[/yellow]")
             continue
-        ru_ok = sum(1 for _, _, ok, _ in res["ru"] if ok)
-        ru_total = len(res["ru"])
-        f_ok = sum(1 for _, _, ok, _ in res["foreign"] if ok)
-        f_total = len(res["foreign"])
-        cities = ", ".join(
-            f"[green]{city}[/green]" if ok else f"[red]{city}[/red]"
-            for city, _, ok, _ in res["ru"]) or "—"
 
-        # Один упавший узел — это обычно сам узел, а не блокировка. Приговор
-        # выносим, когда не отвечает большинство российских точек.
-        if ru_total and ru_ok == ru_total:
-            verdict = "[green]открыт отовсюду[/green]"
-        elif ru_total and ru_ok >= (ru_total + 1) // 2:
-            verdict = "[yellow]частично: не из всех городов[/yellow]"
-        elif ru_total:
-            verdict = "[red]из РФ не открывается[/red]"
-        else:
+        tcp_ok, tcp_total = score(tcp, "ru")
+        web_ok, web_total = score(web, "ru")
+        world_ok, world_total = score(web, "foreign") if web_total else score(tcp, "foreign")
+        failed = ", ".join(f"[red]{city}[/red]"
+                           for city, _, ok, _ in web["ru"] if not ok) or "—"
+
+        dns_same = dns_answers_match(dns)
+        dns_cell = ("[green]совпадает[/green]" if dns_same
+                    else "[red]подменён[/red]" if dns_same is False
+                    else "[dim]—[/dim]")
+
+        # Приговор по большинству: один упавший узел — это обычно сам узел.
+        # Судим по HTTPS, если он был: TCP проходит и там, где ТСПУ рвут
+        # соединение уже по имени в SNI.
+        ok_n, total_n = (web_ok, web_total) if web_total else (tcp_ok, tcp_total)
+        clean = bool(total_n) and ok_n == total_n
+        if not total_n:
             verdict = "[yellow]российских узлов не было[/yellow]"
-        if f_total and not f_ok:
+        elif clean:
+            verdict = "[green]открыт отовсюду[/green]"
+        elif ok_n >= (total_n + 1) // 2:
+            verdict = "[yellow]частично: не из всех городов[/yellow]"
+        else:
+            verdict = "[red]из РФ не открывается[/red]"
+        # TCP проходит, а HTTPS нет — характерный почерк фильтрации по SNI
+        if web_total and tcp_total and web_ok < tcp_ok and web_ok < web_total:
+            verdict = "[red]режут по SNI[/red]"
+        if world_total and not world_ok:
             verdict = "[red]сайт лежит и вне РФ[/red]"
+            clean = False
+        if dns_same is False and clean:
+            verdict = "[yellow]открыт, но DNS в РФ подменён[/yellow]"
+            clean = False
 
-        remote.add_row(host, f"{ru_ok}/{ru_total}", f"{f_ok}/{f_total}",
-                       cities, verdict)
-        verdicts.append((host, ru_ok, ru_total))
+        remote.add_row(host, f"{tcp_ok}/{tcp_total}", f"{web_ok}/{web_total}",
+                       dns_cell, f"{world_ok}/{world_total}", failed, verdict)
+        verdicts.append((host, clean))
 
     console.print(remote)
 
-    clean = [h for h, ok, total in verdicts if total and ok == total]
+    clean = [h for h, ok in verdicts if ok]
     if clean:
         console.print(f"\n[green]Берите [bold]{clean[0]}[/bold]: проходит "
                       "требования Reality и открывается из всех проверенных "
@@ -2423,11 +2529,17 @@ def menu_reality_sni() -> None:
                       "добавить свои домены.[/yellow]")
 
     console.print(
-        "\n[dim]Реестр РКН намеренно не опрашивается: он отвечает, числится ли "
-        "домен в списке, а нужен ответ «работает ли он по факту» — ТСПУ режут "
-        "и то, чего в реестре нет. Чего проверка всё же не видит: стоит ли CDN "
-        "сайта внутри РФ — тогда рукопожатие выглядит странно, адрес "
-        "зарубежный, а сайт местный.[/dim]")
+        "\n[dim]Три проверки отвечают на разные вопросы. TCP — дошло ли "
+        "соединение до 443, то есть не блокируется ли адрес. HTTPS — прошёл ли "
+        "полный запрос с этим именем в SNI: ТСПУ рвут соединение уже после "
+        "ClientHello, и одним TCP такую блокировку не увидеть. DNS — не "
+        "подменяют ли ответ резолвера; сравниваются множества адресов, а "
+        "разные адреса у CDN в разных странах это норма, тревожно отсутствие "
+        "общих.\n"
+        "Реестр РКН намеренно не опрашивается: он отвечает, числится ли домен "
+        "в списке, а нужен ответ «работает ли он по факту». Чего не видит и "
+        "это: стоит ли CDN сайта внутри РФ — тогда рукопожатие выглядит "
+        "странно, адрес зарубежный, а сайт местный.[/dim]")
 
 
 def reality_keypair() -> tuple[str, str]:
