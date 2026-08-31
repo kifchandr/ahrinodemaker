@@ -23,6 +23,7 @@ import secrets
 import ipaddress
 import shutil
 import subprocess
+import concurrent.futures
 import importlib
 import tempfile
 
@@ -1800,21 +1801,71 @@ GRPC_REFERENCE = f"{INSTALL_DIR}/panel-grpc-inbound.json"
 
 # Маскировочный сайт для Reality. Требования: TLS 1.3, HTTP/2, зарубежный
 # хостинг и отсутствие в реестрах блокировок.
-GRPC_DEST_CHOICES = [
-    ("www.microsoft.com", "Microsoft"),
-    ("www.samsung.com", "Samsung"),
-    ("www.nvidia.com", "NVIDIA"),
-    ("www.asus.com", "ASUS"),
-    ("www.amd.com", "AMD"),
-    ("www.tesla.com", "Tesla"),
-    ("www.swift.com", "SWIFT"),
-    ("www.icloud.com", "iCloud"),
-    ("www.bing.com", "Bing"),
-    ("www.python.org", "Python"),
-    ("www.cloudflare.com", "Cloudflare"),
-    ("www.lovelive-anime.jp", "Lovelive (частый выбор в гайдах)"),
-    ("yahoo.co.jp", "Yahoo Japan"),
-    ("www.iij.ad.jp", "IIJ (Япония)"),
+# Кандидаты в маскировочные сайты. Третье поле — где сайт живёт: dest стоит
+# выбирать в той же стране, что и нода. Наблюдателю виден адрес назначения и
+# заявленный в SNI домен; если нода в Москве прикидывается гостем сайта из
+# Калифорнии — или наоборот, — несостыковка вычисляется одним запросом к DNS.
+#
+# Все перечисленные проверены на TLS 1.3 + ALPN h2 + X25519; годность может
+# измениться, поэтому пункт «Подобрать SNI» перепроверяет их вживую.
+SNI_CANDIDATES: list[tuple[str, str, str]] = [
+    # --- Россия: крупные сайты, которые точно не заблокируют ---
+    ("yandex.ru", "Яндекс", "ru"),
+    ("ya.ru", "Яндекс (короткий)", "ru"),
+    ("market.yandex.ru", "Яндекс Маркет", "ru"),
+    ("dzen.ru", "Дзен", "ru"),
+    ("ozon.ru", "Ozon", "ru"),
+    ("www.ozon.ru", "Ozon (www)", "ru"),
+    ("wildberries.ru", "Wildberries", "ru"),
+    ("www.wildberries.ru", "Wildberries (www)", "ru"),
+    ("avito.ru", "Авито", "ru"),
+    ("www.avito.ru", "Авито (www)", "ru"),
+    ("m.avito.ru", "Авито (мобильный)", "ru"),
+    ("auto.ru", "Авто.ру", "ru"),
+    ("vk.ru", "ВКонтакте", "ru"),
+    ("vk.com", "ВКонтакте (.com)", "ru"),
+    ("ok.ru", "Одноклассники", "ru"),
+    ("max.ru", "MAX", "ru"),
+    ("x5.ru", "X5 Group", "ru"),
+    ("ads.x5.ru", "X5 — реклама", "ru"),
+    ("media.x5.ru", "X5 — медиа", "ru"),
+    ("mts.ru", "МТС", "ru"),
+    ("megafon.ru", "МегаФон", "ru"),
+    ("beeline.ru", "Билайн", "ru"),
+    ("sber.ru", "Сбер", "ru"),
+    ("rutube.ru", "RuTube", "ru"),
+    ("kinopoisk.ru", "Кинопоиск", "ru"),
+    ("hh.ru", "HeadHunter", "ru"),
+    ("dns-shop.ru", "DNS", "ru"),
+    ("lenta.ru", "Лента.ру", "ru"),
+    # --- Россия: хостеры, их сайты выглядят естественно рядом с сервером ---
+    ("selectel.ru", "Selectel", "ru"),
+    ("timeweb.com", "Timeweb", "ru"),
+    ("reg.ru", "REG.RU", "ru"),
+    ("cloud.ru", "Cloud.ru", "ru"),
+    ("hostkey.ru", "HOSTKEY", "ru"),
+    ("vdsina.ru", "VDSina", "ru"),
+    ("firstvds.ru", "FirstVDS", "ru"),
+    ("ruvds.com", "RUVDS", "ru"),
+    # --- Зарубежные ---
+    ("www.microsoft.com", "Microsoft", "world"),
+    ("www.samsung.com", "Samsung", "world"),
+    ("www.nvidia.com", "NVIDIA", "world"),
+    ("www.asus.com", "ASUS", "world"),
+    ("www.amd.com", "AMD", "world"),
+    ("www.tesla.com", "Tesla", "world"),
+    ("www.swift.com", "SWIFT", "world"),
+    ("www.icloud.com", "iCloud", "world"),
+    ("www.bing.com", "Bing", "world"),
+    ("www.python.org", "Python", "world"),
+    ("www.cloudflare.com", "Cloudflare", "world"),
+    ("www.lovelive-anime.jp", "Lovelive (частый выбор в гайдах)", "world"),
+    ("yahoo.co.jp", "Yahoo Japan", "world"),
+    ("www.iij.ad.jp", "IIJ (Япония)", "world"),
+    ("redswitches.com", "RedSwitches", "world"),
+    ("estoxy.com", "Estoxy", "world"),
+    ("servers.com", "Servers.com", "world"),
+    ("aeza.net", "Aeza", "world"),
 ]
 
 
@@ -1931,6 +1982,13 @@ def check_reality_sni(host: str, timeout: int = 8) -> dict:
     return result
 
 
+def server_country() -> str:
+    """Страна выходного адреса ноды по версии ipinfo.io. Пусто — не узнали."""
+    r = probe(["curl", "-s", "--max-time", "5", "https://ipinfo.io/country"])
+    code = (r.stdout or "").strip().upper()
+    return code if len(code) == 2 and code.isalpha() else ""
+
+
 def menu_reality_sni() -> None:
     """Подбирает маскировочный сайт для Reality под текущий сервер."""
     step("Подбор SNI для Reality")
@@ -1942,23 +2000,29 @@ def menu_reality_sni() -> None:
     extra = questionary.text(
         "Свои домены через запятую (Enter — только встроенный список):",
         default="", style=CUSTOM_STYLE).ask()
-    hosts = [h for h, _ in GRPC_DEST_CHOICES]
+    hosts = [h for h, _, _ in SNI_CANDIDATES]
     for item in (extra or "").split(","):
         item = item.strip().lower()
         if item and item not in hosts:
             hosts.append(item)
 
+    # Параллельно: кандидатов пятый десяток, а проверка — ожидание сети, на
+    # которой процесс всё равно простаивает. Последовательно это была бы минута.
     results = []
-    with console.status("[cyan]Проверяю…[/cyan]"):
-        for host in hosts:
-            results.append(check_reality_sni(host))
+    with console.status(f"[cyan]Проверяю {len(hosts)} кандидатов…[/cyan]"):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as pool:
+            results = list(pool.map(check_reality_sni, hosts))
 
     # Годные вперёд и по возрастанию задержки: при прочих равных выигрывает
     # тот, до кого ближе — рукопожатие делается на каждое подключение клиента
     results.sort(key=lambda x: (not x["ok"], x["ms"] or 10 ** 6))
 
+    where = {host: region for host, _, region in SNI_CANDIDATES}
+    region_label = {"ru": "РФ", "world": "мир"}
+
     table = Table(box=box.ROUNDED, border_style="cyan", padding=(0, 1))
     table.add_column("Сайт")
+    table.add_column("Где", justify="center")
     table.add_column("TLS 1.3", justify="center")
     table.add_column("h2", justify="center")
     table.add_column("X25519", justify="center")
@@ -1966,17 +2030,37 @@ def menu_reality_sni() -> None:
     table.add_column("Вердикт")
     mark = {True: "[green]✓[/green]", False: "[red]✗[/red]"}
     for res in results:
+        region = region_label.get(where.get(res["host"], ""), "?")
         if res["error"]:
-            table.add_row(res["host"], "—", "—", "—", "—",
+            table.add_row(res["host"], region, "—", "—", "—", "—",
                           f"[yellow]{res['error']}[/yellow]")
             continue
         table.add_row(
-            res["host"], mark[res["tls13"]], mark[res["h2"]],
+            res["host"], region, mark[res["tls13"]], mark[res["h2"]],
             mark[res["x25519"]], f"{res['ms']} мс",
             "[green]годится[/green]" if res["ok"] else "[red]не годится[/red]")
     console.print(table)
 
+    # Сайт стоит брать из той же страны, где стоит нода: наблюдателю видны и
+    # адрес назначения, и домен в SNI, а несостыковка между ними вычисляется
+    # одним запросом к DNS.
+    country = server_country()
+    # Страна неизвестна — не выдумываем предпочтение: пустая строка не совпадёт
+    # ни с одним регионом, и сортировка оставит порядок по задержке
+    prefer = "" if not country else ("ru" if country == "RU" else "world")
+    if country:
+        console.print(f"\n[bold]Сервер выглядит как {country}[/bold] — "
+                      + ("предпочтительны российские сайты."
+                         if prefer == "ru" else
+                         "предпочтительны зарубежные сайты."))
+    else:
+        console.print("\n[yellow]Страну сервера определить не удалось — "
+                      "порядок кандидатов только по задержке.[/yellow]")
+
     good = [r for r in results if r["ok"]]
+    # Стабильная сортировка: внутри подходящего региона порядок по задержке
+    # сохраняется, потому что results уже отсортированы
+    good.sort(key=lambda r: where.get(r["host"], "world") != prefer)
     if not good:
         console.print("\n[yellow]Ни один кандидат не подошёл. Так бывает, "
                       "когда исходящие с сервера фильтруются или openssl "
@@ -1985,8 +2069,10 @@ def menu_reality_sni() -> None:
 
     # Вторая половина проверки: доступность из России. С самой ноды её не
     # увидеть — она за границей, и ТСПУ на её пути нет.
-    console.print(f"\n[green]По требованиям Reality годятся: "
-                  f"{', '.join(r['host'] for r in good)}[/green]")
+    shown = ", ".join(r["host"] for r in good[:10])
+    if len(good) > 10:
+        shown += f" и ещё {len(good) - 10}"
+    console.print(f"\n[green]По требованиям Reality годятся: {shown}[/green]")
     picked = questionary.checkbox(
         "Проверить их доступность из городов РФ и из-за границы?\n"
         "  Проверка идёт через check-host.net, около 20 секунд на домен.\n"
@@ -2126,7 +2212,7 @@ def grpc_inbound_reference(port: int, dest: str, private_key: str,
 
 def block_grpc(params: tuple[int, str] | None = None) -> None:
     step("VLESS gRPC + Reality: порт и заготовка inbound'а")
-    port, dest = params if params else (GRPC_PORT, GRPC_DEST_CHOICES[0][0])
+    port, dest = params if params else (GRPC_PORT, SNI_CANDIDATES[0][0])
 
     if shutil.which("docker") is None:
         raise RuntimeError("Docker не установлен — сначала установите ноду")
@@ -2176,7 +2262,7 @@ def ask_grpc_params() -> tuple[int, str] | None:
         "Маскировочный сайт для Reality (клиент будет выглядеть как гость "
         "этого сайта):",
         choices=[questionary.Choice(f"{host} — {title}", value=host)
-                 for host, title in GRPC_DEST_CHOICES],
+                 for host, title, _ in SNI_CANDIDATES],
         style=CUSTOM_STYLE).ask()
     if dest is None:
         return None
