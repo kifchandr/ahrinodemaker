@@ -1939,23 +1939,19 @@ def checkhost_tcp(host: str, port: int = 443, max_nodes: int = 12,
     return out
 
 
-def check_reality_sni(host: str, timeout: int = 8) -> dict:
-    """Проверяет, годится ли сайт как dest для Reality, с этого сервера.
-
-    Reality выдаёт себя за гостя чужого сайта и повторяет его TLS-рукопожатие,
-    поэтому сайт обязан уметь ровно то, что умеет Reality: TLS 1.3, ALPN h2 и
-    обмен ключами X25519. Не выполнено хоть одно — маскировка получится
-    неправдоподобной, и это видно наблюдателю.
-
-    Проверяем именно с сервера: важна и задержка до сайта, потому что каждое
-    подключение клиента идёт через это рукопожатие."""
+def _probe_reality_sni(host: str, timeout: int) -> dict:
+    """Одно рукопожатие с сайтом. Отдельно от check_reality_sni, чтобы попытку
+    можно было повторить."""
     result = {"host": host, "ok": False, "tls13": False, "h2": False,
               "x25519": False, "ms": 0, "error": ""}
     started = time.monotonic()
     try:
+        # ALPN предлагаем оба протокола. С одним лишь h2 сайт, который его не
+        # умеет, обрывает рукопожатие алертом no_application_protocol — и тогда
+        # не видно ни версии TLS, ни обмена ключами, хотя с ними всё в порядке.
         r = subprocess.run(
             ["openssl", "s_client", "-connect", f"{host}:443",
-             "-servername", host, "-tls1_3", "-alpn", "h2"],
+             "-servername", host, "-tls1_3", "-alpn", "h2,http/1.1"],
             input="", capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
         result["error"] = "таймаут"
@@ -1966,13 +1962,47 @@ def check_reality_sni(host: str, timeout: int = 8) -> dict:
     result["ms"] = int((time.monotonic() - started) * 1000)
 
     out = r.stdout
-    result["tls13"] = "TLSv1.3" in out
-    result["h2"] = "ALPN protocol: h2" in out
-    # Свежий OpenSSL умеет гибриды вида X25519MLKEM768 — они тоже на X25519
-    result["x25519"] = re.search(r"Server Temp Key:\s*X25519", out) is not None
     if not out.strip():
         result["error"] = "нет соединения"
+        return result
+
+    # Server Temp Key печатается только после состоявшегося обмена ключами:
+    # это и есть признак, что рукопожатие дошло до конца. Без него судить о
+    # возможностях сайта нельзя — три прочерка означали бы «не умеет», хотя на
+    # деле соединение оборвали по дороге.
+    temp_key = re.search(r"Server Temp Key:\s*(\S+)", out)
+    if temp_key is None:
+        result["error"] = "рукопожатие оборвано"
+        return result
+
+    result["tls13"] = "TLSv1.3" in out
+    # Свежий OpenSSL умеет гибриды вида X25519MLKEM768 — они тоже на X25519
+    result["x25519"] = temp_key.group(1).startswith("X25519")
+    result["h2"] = "ALPN protocol: h2" in out
     result["ok"] = result["tls13"] and result["h2"] and result["x25519"]
+    return result
+
+
+def check_reality_sni(host: str, timeout: int = 8) -> dict:
+    """Проверяет, годится ли сайт как dest для Reality, с этого сервера.
+
+    Reality выдаёт себя за гостя чужого сайта и повторяет его TLS-рукопожатие,
+    поэтому сайт обязан уметь ровно то, что умеет Reality: TLS 1.3, ALPN h2 и
+    обмен ключами X25519. Не выполнено хоть одно — маскировка получится
+    неправдоподобной, и это видно наблюдателю.
+
+    Проверяем именно с сервера: важна и задержка до сайта, потому что каждое
+    подключение клиента идёт через это рукопожатие."""
+    result = _probe_reality_sni(host, timeout)
+    # Кандидатов проверяем пачкой и параллельно, а часть сайтов на всплеск
+    # рукопожатий с одного адреса отвечает отказом. Одна повторная попытка
+    # вразвалку отделяет такой отказ от настоящей неспособности сайта.
+    if result["error"]:
+        time.sleep(1.5)
+        retry = _probe_reality_sni(host, timeout)
+        if not retry["error"]:
+            return retry
+        result = retry
     return result
 
 
@@ -2039,6 +2069,15 @@ def menu_reality_sni() -> None:
             mark[res["x25519"]], f"{res['ms']} мс",
             "[green]годится[/green]" if res["ok"] else "[red]не годится[/red]")
     console.print(table)
+
+    aborted = [r["host"] for r in results if r["error"] == "рукопожатие оборвано"]
+    if aborted:
+        console.print(
+            f"\n[yellow]Оборвали рукопожатие: {', '.join(aborted)}.[/yellow]\n"
+            "[dim]Чаще всего это защита сайта, отсекающая адреса дата-центров "
+            "и чужих стран (Qrator, DDoS-Guard и подобные). Для dest такой сайт "
+            "не годится в любом случае: через это рукопожатие идёт каждое "
+            "подключение вашего клиента.[/dim]")
 
     # Сайт стоит брать из той же страны, где стоит нода: наблюдателю видны и
     # адрес назначения, и домен в SNI, а несостыковка между ними вычисляется
