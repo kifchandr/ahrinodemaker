@@ -14,14 +14,22 @@
 curl -fsSL https://raw.githubusercontent.com/kifchandr/ahrinodemaker/main/ahrinodemaker | sudo python3
 ```
 
-Либо в главном меню выбрать **«Установить короткие команды `ahri` и
-`ahrinode`»** — скрипт пропишется в `/usr/local/bin`, и дальше достаточно:
+При первом запуске скрипт сам прописывается в `/usr/local/bin`, поэтому дальше
+достаточно:
 
 ```bash
 sudo ahri          # или sudo ahrinode, или sudo ahrinodemaker
 ```
 
-Пункт показывается, только пока команда не установлена. То же самое вручную:
+Ничего для этого делать не нужно и никаких вопросов не задаётся — без команд
+скрипт после запуска через `curl` вовсе не остался бы на сервере. Если установка
+не удалась, работа продолжается без ярлыков.
+
+Убрать его обратно можно пунктом главного меню **«Удалить ahrinodemaker и
+команды ahri / ahrinode»** — он трогает только `/usr/local/bin`: нода,
+контейнеры, правила UFW и всё настроенное остаётся на месте.
+
+То же самое вручную:
 
 ```bash
 sudo curl -fsSL https://raw.githubusercontent.com/kifchandr/ahrinodemaker/main/ahrinodemaker \
@@ -100,6 +108,7 @@ curl -fsSL https://raw.githubusercontent.com/kifchandr/ahrinodemaker/main/ahrino
 │   ├── Проверка скорости — Европа (speedtest)
 │   ├── Проверка скорости — Россия (iperf3)
 │   └── Доступен ли Telegram
+├── Удалить ahrinodemaker и команды ahri / ahrinode
 └── Выход
 ```
 

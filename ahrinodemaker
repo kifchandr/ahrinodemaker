@@ -5370,6 +5370,30 @@ def self_update_and_restart() -> None:
                       "заново: [bold]sudo ahri[/bold][/yellow]")
 
 
+def remove_self() -> bool:
+    """Убирает сам скрипт и его короткие команды. True — если удалили.
+
+    Трогает только /usr/local/bin. Нода, контейнеры, правила UFW и всё
+    настроенное остаётся: это удаление инструмента, а не отмена его работы."""
+    step("Удаление ahrinodemaker")
+    console.print("[dim]Будут удалены только сам скрипт и команды. Нода, "
+                  "контейнеры, правила UFW и остальные настройки останутся "
+                  "на месте.[/dim]")
+    if not questionary.confirm("Удалить ahrinodemaker с сервера?",
+                               default=False, style=CUSTOM_STYLE).ask():
+        console.print("[dim]Отменено.[/dim]")
+        return False
+
+    for path in [*SELF_SHORTCUTS, SELF_PATH]:
+        if os.path.islink(path) or os.path.exists(path):
+            os.unlink(path)
+            console.print(f"[green]✓ Удалено: {path}[/green]")
+    console.print("[green]✓ ahrinodemaker удалён.[/green]")
+    console.print("[dim]Вернуть его можно той же командой, что и в первый раз: "
+                  f"curl -fsSL {REPO_RAW_BASE}/ahrinodemaker | sudo python3[/dim]")
+    return True
+
+
 def install_self(force_download: bool = False, quiet: bool = False) -> None:
     """Кладёт скрипт в /usr/local/bin и заводит короткое имя `ahri`.
 
@@ -5518,6 +5542,18 @@ def main() -> None:
     for line in egress_status_lines():
         console.print(line)
 
+    # Команды ставим сами: спрашивать про это нечего, а без них скрипт после
+    # запуска через curl не остаётся на сервере вовсе. Сбой не повод прерывать
+    # работу — меню полезно и без ярлыков.
+    if not _self_installed():
+        try:
+            install_self(quiet=True)
+            console.print("[dim]Установлены команды: sudo ahri, sudo ahrinode, "
+                          "sudo ahrinodemaker[/dim]")
+        except (subprocess.CalledProcessError, OSError, RuntimeError) as exc:
+            console.print(f"[yellow]Короткие команды поставить не удалось "
+                          f"({exc}) — работаю без них.[/yellow]")
+
     while True:
         console.print()
         choices = [
@@ -5526,12 +5562,10 @@ def main() -> None:
             questionary.Choice("Tools — вспомогательные утилиты", value="tools"),
             questionary.Choice("Тесты — диагностика сервера", value="tests"),
         ]
-        # Пункт показываем, только пока команда не установлена: дальше он
-        # превратился бы в постоянный шум в меню.
-        if not _self_installed():
+        if _self_installed():
             choices.append(questionary.Choice(
-                "Установить короткие команды «ahri» и «ahrinode»",
-                value="install_self"))
+                "Удалить ahrinodemaker и команды ahri / ahrinode",
+                value="remove_self"))
         choices.append(questionary.Choice("Выход", value="exit"))
 
         choice = questionary.select(
@@ -5546,11 +5580,12 @@ def main() -> None:
             menu_tools()
         elif choice == "tests":
             menu_tests()
-        elif choice == "install_self":
+        elif choice == "remove_self":
             try:
-                install_self()
+                if remove_self():
+                    return
             except (subprocess.CalledProcessError, OSError, RuntimeError) as exc:
-                console.print(f"[red]✗ Не удалось установить команду: {exc}[/red]")
+                console.print(f"[red]✗ Не удалось удалить: {exc}[/red]")
 
 
 if __name__ == "__main__":
