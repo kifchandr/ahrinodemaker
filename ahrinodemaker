@@ -2079,6 +2079,28 @@ def _probe_reality_sni(host: str, timeout: int, alpn: str) -> dict:
     return result
 
 
+def measure_reality_sni(result: dict, samples: int = 3, timeout: int = 8) -> dict:
+    """Уточняет задержку несколькими рукопожатиями.
+
+    Одно измерение шумное: в него входят DNS, выбор узла CDN и случайная
+    загрузка сети, и соседние кандидаты в таблице могли меняться местами от
+    запуска к запуску. Берём медиану — она устойчива к одному выбросу, в
+    отличие от среднего, и честнее минимума, который показывал бы лучший
+    случай вместо обычного."""
+    if result["error"]:
+        return result
+    times = [result["ms"]]
+    for _ in range(max(0, samples - 1)):
+        extra = _probe_reality_sni(result["host"], timeout, "h2")
+        if extra["error"]:
+            continue                  # разовый отказ не портит замер
+        times.append(extra["ms"])
+    times.sort()
+    result["ms"] = times[len(times) // 2]
+    result["spread"] = (times[-1] - times[0]) // 2
+    return result
+
+
 def check_reality_sni(host: str, timeout: int = 8) -> dict:
     """Проверяет, годится ли сайт как dest для Reality, с этого сервера.
 
@@ -2154,6 +2176,17 @@ def menu_reality_sni() -> None:
         with concurrent.futures.ThreadPoolExecutor(max_workers=10) as pool:
             results = list(pool.map(check_reality_sni, hosts))
 
+    # Уточняем задержку только у лидеров: выбирают из них, а остальным точная
+    # цифра не нужна. И потоков здесь мало — при десяти замеры конкурируют друг
+    # с другом за сеть, и разброс получался больше самой измеряемой величины.
+    leaders = sorted((r for r in results if r["ok"]),
+                     key=lambda r: r["ms"])[:15]
+    if leaders:
+        with console.status(f"[cyan]Уточняю задержку у {len(leaders)} "
+                            "лучших…[/cyan]"):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+                list(pool.map(measure_reality_sni, leaders))
+
     # Годные вперёд и по возрастанию задержки: при прочих равных выигрывает
     # тот, до кого ближе — рукопожатие делается на каждое подключение клиента
     results.sort(key=lambda x: (not x["ok"], x["ms"] or 10 ** 6))
@@ -2167,18 +2200,24 @@ def menu_reality_sni() -> None:
     table.add_column("h2", justify="center")
     table.add_column("X25519", justify="center")
     table.add_column("Рукопожатие", justify="right")
+    table.add_column("Разброс", justify="right")
     table.add_column("Вердикт")
     mark = {True: "[green]✓[/green]", False: "[red]✗[/red]"}
     for res in results:
         region = where.get(res["host"], "")
         region = "мир" if region == "global" else (region.upper() or "?")
         if res["error"]:
-            table.add_row(res["host"], region, "—", "—", "—", "—",
+            table.add_row(res["host"], region, "—", "—", "—", "—", "—",
                           f"[yellow]{res['error']}[/yellow]")
             continue
+        # Уточнённые показываем как есть, остальные — со знаком «примерно»:
+        # это один замер, и цена ему соответствующая
+        spread = res.get("spread")
         table.add_row(
             res["host"], region, mark[res["tls13"]], mark[res["h2"]],
-            mark[res["x25519"]], f"{res['ms']} мс",
+            mark[res["x25519"]],
+            f"{res['ms']} мс" if spread is not None else f"≈{res['ms']} мс",
+            f"±{spread}" if spread is not None else "[dim]—[/dim]",
             "[green]годится[/green]" if res["ok"] else "[red]не годится[/red]")
     console.print(table)
 
