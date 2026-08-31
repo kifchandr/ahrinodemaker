@@ -626,18 +626,14 @@ EGRESS_DENY_ALWAYS: list[str] = [
     "1900/udp", "11211/udp", "11211/tcp",
 ]
 
-# А эти спрашиваются: они тоже привлекают жалобы, но ломают легальные сценарии
-# у ваших же пользователей, поэтому решение за владельцем ноды.
-EGRESS_DENY_OPTIONAL: list[tuple[str, str, list[str]]] = [
-    ("submission",
-     "Отправка почты 465, 587, 2525, 26 — сломает почтовые клиенты",
-     ["465/tcp", "587/tcp", "2525/tcp", "26/tcp"]),
-    ("irc",
-     "IRC 6660–6669, 6697 — управление ботнетами, но и обычные чаты",
-     ["6660:6669/tcp", "6697/tcp"]),
-    ("sip",
-     "SIP 5060, 5061 — перебор VoIP-аккаунтов, но и софтфоны",
-     ["5060/tcp", "5060/udp", "5061/tcp", "5061/udp"]),
+# Эти закрываются тоже, но через reject, а не deny: за ними стоит живой человек
+# с почтовым клиентом, чатом или софтфоном, и мгновенный отказ он поймёт, а две
+# минуты тишины — нет. Побочный эффект осознанный: отправка почты из клиента
+# через VPN работать не будет.
+EGRESS_REJECT_ALWAYS: list[str] = [
+    "465/tcp", "587/tcp", "2525/tcp", "26/tcp",     # отправка почты
+    "6660:6669/tcp", "6697/tcp",                    # IRC
+    "5060/tcp", "5060/udp", "5061/tcp", "5061/udp",  # SIP
 ]
 
 
@@ -682,26 +678,7 @@ def blocked_ports_reference(specs: list[str]) -> str:
     }, ensure_ascii=False, indent=2)
 
 
-def ask_egress_denies() -> list[str]:
-    """Дополнительные исходящие порты. Пропуск — закрыть только обязательный
-    набор, который применяется в любом случае."""
-    choices = [questionary.Choice(title=title, value=key)
-               for key, title, _ in EGRESS_DENY_OPTIONAL]
-    picked = questionary.checkbox(
-        "Закрыть ещё исходящие порты? Всё перечисленное используется и "
-        "легально —\nEnter без отметок оставит их открытыми:",
-        choices=choices, style=CUSTOM_STYLE).ask()
-    if not picked:
-        return []
-    specs: list[str] = []
-    for key, _, ports in EGRESS_DENY_OPTIONAL:
-        if key in picked:
-            specs.extend(ports)
-    return specs
-
-
-def block_ufw(extra_ports: list[str], panel_ip: str | None = None,
-              egress_denies: list[str] | None = None) -> None:
+def block_ufw(extra_ports: list[str], panel_ip: str | None = None) -> None:
     step("Настройка UFW (firewall)")
     ensure_packages("ufw")
     run(["ufw", "default", "deny", "incoming"])
@@ -739,17 +716,16 @@ def block_ufw(extra_ports: list[str], panel_ip: str | None = None,
         run(["ufw", "deny", "out", spec])
     console.print("[green]✓ Закрыты исходящие порты (спам, SMB, усилители "
                   f"DDoS): {', '.join(EGRESS_DENY_ALWAYS)}[/green]")
-    for spec in (egress_denies or []):
+    for spec in EGRESS_REJECT_ALWAYS:
         run(["ufw", "reject", "out", spec])
-    if egress_denies:
-        console.print("[green]✓ Дополнительно закрыты: "
-                      f"{', '.join(egress_denies)}[/green]")
+    console.print("[green]✓ Закрыты с мгновенным отказом (почта, IRC, SIP): "
+                  f"{', '.join(EGRESS_REJECT_ALWAYS)}[/green]")
 
     # Те же порты — заготовкой для панели. Файл кладём всегда: нода может
     # стоять и не быть установленной этим скриптом, каталог создаём сами.
     os.makedirs(INSTALL_DIR, exist_ok=True)
     write_file(BLOCKED_PORTS_REF,
-               blocked_ports_reference(EGRESS_DENY_ALWAYS + (egress_denies or [])))
+               blocked_ports_reference(EGRESS_DENY_ALWAYS + EGRESS_REJECT_ALWAYS))
     console.print(f"[green]✓ Те же порты правилом для панели: "
                   f"{BLOCKED_PORTS_REF}[/green]")
     console.print("[dim]Добавьте оттуда outbound и правила в профиль ноды — "
@@ -2446,15 +2422,27 @@ def grpc_inbound_reference(port: int, dest: str, private_key: str,
     }, indent=2, ensure_ascii=False) + "\n"
 
 
-def block_grpc(params: tuple[int, str] | None = None) -> None:
+def block_grpc() -> None:
+    """Серверная часть gRPC: порт и заготовка inbound'а.
+
+    Ничего не спрашивает. Порт фиксированный — 8443/tcp его и так открывает
+    блок UFW. Маскировочный сайт на сервере не нужен вовсе: он живёт в конфиге
+    ноды, а тот приходит из панели, поэтому в заготовку подставляется разумный
+    кандидат для страны сервера, а окончательный выбор — в панели, по итогам
+    «Tools → Подобрать SNI»."""
     step("VLESS gRPC + Reality: порт и заготовка inbound'а")
-    port, dest = params if params else (GRPC_PORT, SNI_CANDIDATES[0][0])
+    port = GRPC_PORT
 
     if shutil.which("docker") is None:
         raise RuntimeError("Docker не установлен — сначала установите ноду")
     if probe(["docker", "inspect", "-f", "{{.State.Status}}",
               "remnanode"]).returncode != 0:
         raise RuntimeError("контейнер remnanode не найден — сначала установите ноду")
+
+    # Кандидат под страну ноды — как заполненное по умолчанию поле, не как
+    # решение: подбор с проверкой живёт в Tools отдельным пунктом.
+    country = server_country()
+    dest = sorted(SNI_CANDIDATES, key=lambda item: sni_rank(item[2], country))[0][0]
 
     private_key, public_key = reality_keypair()
     if not private_key:
@@ -2481,7 +2469,8 @@ def block_grpc(params: tuple[int, str] | None = None) -> None:
                grpc_inbound_reference(port, dest, private_key, public_key,
                                       service_name, short_ids))
     console.print(f"[green]✓ Заготовка inbound: {GRPC_REFERENCE}[/green]")
-    console.print(f"[dim]Маскировка: {dest}, serviceName: {service_name}[/dim]")
+    console.print(f"[dim]Маскировка (можно заменить в панели): {dest}, "
+                  f"serviceName: {service_name}[/dim]")
     if public_key:
         console.print(f"[dim]publicKey для клиентов: {public_key}[/dim]")
 
@@ -2490,45 +2479,9 @@ def block_grpc(params: tuple[int, str] | None = None) -> None:
         "конфиг она берёт из панели. Добавьте содержимое "
         f"{GRPC_REFERENCE} в массив inbounds профиля (удалив поля с "
         f"подчёркиванием), заведите Host с тегом «{GRPC_INBOUND_TAG}» и "
-        "внесите inbound в Squad.")
-
-
-def ask_grpc_params() -> tuple[int, str] | None:
-    # Кандидатов больше сотни, поэтому наверх поднимаем уместные рядом с этой
-    # нодой — иначе выбирать пришлось бы, листая весь список
-    country = server_country()
-    ordered = sorted(SNI_CANDIDATES,
-                     key=lambda item: sni_rank(item[2], country))
-    if country:
-        console.print(f"[dim]Сервер выглядит как {country}: сайты этой страны "
-                      "и соседних идут первыми.[/dim]")
-    dest = questionary.select(
-        "Маскировочный сайт для Reality (клиент будет выглядеть как гость "
-        "этого сайта):",
-        choices=[questionary.Choice(
-            f"{host} — {title}"
-            + (f"  [{region.upper()}]" if region != "global" else "  [мир]"),
-            value=host)
-            for host, title, region in ordered],
-        style=CUSTOM_STYLE).ask()
-    if dest is None:
-        return None
-
-    raw = questionary.text(
-        f"Порт для gRPC (Enter — {GRPC_PORT}):",
-        default=str(GRPC_PORT), style=CUSTOM_STYLE).ask()
-    if raw is None:
-        return None
-    try:
-        port = int(raw.strip() or GRPC_PORT)
-    except ValueError:
-        console.print(f"[yellow]«{raw}» не число — беру {GRPC_PORT}.[/yellow]")
-        port = GRPC_PORT
-    if not 1 <= port <= 65535 or port == 443:
-        console.print(f"[yellow]Порт {port} не годится (443 занят основным "
-                      f"inbound'ом) — беру {GRPC_PORT}.[/yellow]")
-        port = GRPC_PORT
-    return port, dest
+        "внесите inbound в Squad. Маскировочный сайт меняется там же, в "
+        "полях dest и serverNames; подобрать его помогает пункт "
+        "«Подобрать SNI для Reality» в Tools.")
 
 
 # ------------------------------------------------------------------ #
@@ -4140,12 +4093,6 @@ def menu_remnawave_node() -> None:
     if "hysteria" in selected:
         hysteria_params = ask_hysteria_params()
 
-    grpc_params: tuple[int, str] | None = None
-    if "grpc" in selected:
-        grpc_params = ask_grpc_params()
-        if grpc_params is None:
-            selected = [k for k in selected if k != "grpc"]
-
     # 5. Расписание перезагрузки — только если выбран блок cron
     reboot_schedule = "daily"
     if "time_cron" in selected:
@@ -4153,7 +4100,6 @@ def menu_remnawave_node() -> None:
 
     # 3. Доп. порты — только если выбран блок UFW
     extra_ports: list[str] = []
-    egress_denies: list[str] = []
     panel_ip = CLI.get("panel_ip")
     if "ufw" in selected:
         if panel_ip:
@@ -4162,7 +4108,6 @@ def menu_remnawave_node() -> None:
         else:
             panel_ip = ask_panel_ip()
         extra_ports = ask_extra_ports()
-        egress_denies = ask_egress_denies()
 
     # 4. Путь к docker-compose ноды — только если выбран блок логов remnanode
     compose_path: str | None = None
@@ -4203,9 +4148,7 @@ def menu_remnawave_node() -> None:
         console.print(f"[bold]Доп. порты UFW:[/bold] {', '.join(extra_ports)}")
     if "ufw" in selected:
         console.print("[bold]Закрыть исходящие:[/bold] "
-                      + ", ".join(EGRESS_DENY_ALWAYS)
-                      + (" + " + ", ".join(egress_denies) if egress_denies
-                         else ""))
+                      + ", ".join(EGRESS_DENY_ALWAYS + EGRESS_REJECT_ALWAYS))
     if node_params:
         # SECRET_KEY не печатаем целиком — он уходит в лог терминала и в скроллбек
         console.print(f"[bold]Установка ноды:[/bold] порт {node_params[1]}, "
@@ -4254,13 +4197,11 @@ def menu_remnawave_node() -> None:
             continue
         try:
             if key == "ufw":
-                func(extra_ports, panel_ip, egress_denies)
+                func(extra_ports, panel_ip)
             elif key == "node_install":
                 func(node_params)
             elif key == "hysteria":
                 func(hysteria_params)
-            elif key == "grpc":
-                func(grpc_params)
             elif egress_present.get(key):
                 EGRESS_REMOVERS[key][1]()
             elif key == "warp":
