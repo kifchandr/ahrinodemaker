@@ -1801,15 +1801,35 @@ GRPC_REFERENCE = f"{INSTALL_DIR}/panel-grpc-inbound.json"
 
 # Маскировочный сайт для Reality. Требования: TLS 1.3, HTTP/2, зарубежный
 # хостинг и отсутствие в реестрах блокировок.
-# Кандидаты в маскировочные сайты. Третье поле — где сайт живёт: dest стоит
-# выбирать в той же стране, что и нода. Наблюдателю виден адрес назначения и
-# заявленный в SNI домен; если нода в Москве прикидывается гостем сайта из
-# Калифорнии — или наоборот, — несостыковка вычисляется одним запросом к DNS.
+# Кандидаты в маскировочные сайты. Третье поле — страна сайта: dest стоит
+# выбирать там же, где стоит нода. Наблюдателю видны и адрес назначения, и
+# заявленный в SNI домен; если нода в Париже прикидывается гостем сайта из
+# Казахстана, несостыковка вычисляется одним запросом к DNS.
 #
-# Все перечисленные проверены на TLS 1.3 + ALPN h2 + X25519; годность может
-# измениться, поэтому пункт «Подобрать SNI» перепроверяет их вживую.
+# «global» — сайты с CDN по всему миру: у них нет одной страны, и они уместны
+# рядом с нодой где угодно. Все перечисленные проверены на TLS 1.3 + ALPN h2 +
+# X25519; годность зависит и от маршрута, поэтому пункт «Подобрать SNI»
+# перепроверяет их вживую с самого сервера.
+#
+# Заблокированного в России здесь нет намеренно: SNI видит ТСПУ, и домен из
+# реестра испортит соединение ещё до ноды.
 SNI_CANDIDATES: list[tuple[str, str, str]] = [
-    # --- Россия: крупные сайты, которые точно не заблокируют ---
+    # --- Всюду уместные: большие CDN без одной страны ---
+    ("www.microsoft.com", "Microsoft", "global"),
+    ("www.bing.com", "Bing", "global"),
+    ("www.apple.com", "Apple", "global"),
+    ("www.icloud.com", "iCloud", "global"),
+    ("www.samsung.com", "Samsung", "global"),
+    ("www.asus.com", "ASUS", "global"),
+    ("www.amd.com", "AMD", "global"),
+    ("www.nvidia.com", "NVIDIA", "global"),
+    ("www.tesla.com", "Tesla", "global"),
+    ("www.python.org", "Python", "global"),
+    ("www.cloudflare.com", "Cloudflare", "global"),
+    ("servers.com", "Servers.com", "global"),
+    ("redswitches.com", "RedSwitches", "global"),
+    ("estoxy.com", "Estoxy", "global"),
+    # --- Россия ---
     ("yandex.ru", "Яндекс", "ru"),
     ("ya.ru", "Яндекс (короткий)", "ru"),
     ("market.yandex.ru", "Яндекс Маркет", "ru"),
@@ -1832,7 +1852,6 @@ SNI_CANDIDATES: list[tuple[str, str, str]] = [
     ("hh.ru", "HeadHunter", "ru"),
     ("dns-shop.ru", "DNS", "ru"),
     ("lenta.ru", "Лента.ру", "ru"),
-    # --- Россия: хостеры, их сайты выглядят естественно рядом с сервером ---
     ("selectel.ru", "Selectel", "ru"),
     ("timeweb.com", "Timeweb", "ru"),
     ("reg.ru", "REG.RU", "ru"),
@@ -1841,26 +1860,106 @@ SNI_CANDIDATES: list[tuple[str, str, str]] = [
     ("vdsina.ru", "VDSina", "ru"),
     ("firstvds.ru", "FirstVDS", "ru"),
     ("ruvds.com", "RUVDS", "ru"),
-    # --- Зарубежные ---
-    ("www.microsoft.com", "Microsoft", "world"),
-    ("www.samsung.com", "Samsung", "world"),
-    ("www.nvidia.com", "NVIDIA", "world"),
-    ("www.asus.com", "ASUS", "world"),
-    ("www.amd.com", "AMD", "world"),
-    ("www.tesla.com", "Tesla", "world"),
-    ("www.swift.com", "SWIFT", "world"),
-    ("www.icloud.com", "iCloud", "world"),
-    ("www.bing.com", "Bing", "world"),
-    ("www.python.org", "Python", "world"),
-    ("www.cloudflare.com", "Cloudflare", "world"),
-    ("www.lovelive-anime.jp", "Lovelive (частый выбор в гайдах)", "world"),
-    ("yahoo.co.jp", "Yahoo Japan", "world"),
-    ("www.iij.ad.jp", "IIJ (Япония)", "world"),
-    ("redswitches.com", "RedSwitches", "world"),
-    ("estoxy.com", "Estoxy", "world"),
-    ("servers.com", "Servers.com", "world"),
-    ("aeza.net", "Aeza", "world"),
+    ("aeza.net", "Aeza", "ru"),
+    # --- США ---
+    ("www.walmart.com", "Walmart", "us"),
+    ("www.att.com", "AT&T", "us"),
+    ("www.verizon.com", "Verizon", "us"),
+    ("www.espn.com", "ESPN", "us"),
+    ("www.digitalocean.com", "DigitalOcean", "us"),
+    # --- Германия ---
+    ("www.telekom.de", "Deutsche Telekom", "de"),
+    ("www.hetzner.com", "Hetzner", "de"),
+    ("www.ionos.de", "IONOS", "de"),
+    ("web.de", "WEB.DE", "de"),
+    ("www.zalando.de", "Zalando", "de"),
+    ("www.sap.com", "SAP", "de"),
+    # --- Франция ---
+    ("www.orange.fr", "Orange", "fr"),
+    ("www.free.fr", "Free", "fr"),
+    ("www.sfr.fr", "SFR", "fr"),
+    ("www.leboncoin.fr", "Leboncoin", "fr"),
+    ("www.carrefour.fr", "Carrefour", "fr"),
+    ("www.ovh.com", "OVH", "fr"),
+    # --- Нидерланды ---
+    ("www.bol.com", "bol.com", "nl"),
+    ("www.kpn.com", "KPN", "nl"),
+    ("www.ing.nl", "ING", "nl"),
+    ("www.ah.nl", "Albert Heijn", "nl"),
+    ("www.transip.nl", "TransIP", "nl"),
+    ("www.leaseweb.com", "Leaseweb", "nl"),
+    # --- Италия ---
+    ("www.tim.it", "TIM", "it"),
+    ("www.aruba.it", "Aruba", "it"),
+    ("www.repubblica.it", "la Repubblica", "it"),
+    ("www.eni.com", "Eni", "it"),
+    # --- Финляндия ---
+    ("www.elisa.fi", "Elisa", "fi"),
+    ("telia.fi", "Telia", "fi"),
+    ("www.hs.fi", "Helsingin Sanomat", "fi"),
+    ("yle.fi", "Yle", "fi"),
+    ("www.nokia.com", "Nokia", "fi"),
+    # --- Польша ---
+    ("www.onet.pl", "Onet", "pl"),
+    ("www.wp.pl", "Wirtualna Polska", "pl"),
+    ("www.interia.pl", "Interia", "pl"),
+    ("allegro.pl", "Allegro", "pl"),
+    ("www.orange.pl", "Orange Polska", "pl"),
+    # --- Великобритания ---
+    ("www.bt.com", "BT", "gb"),
+    ("www.sky.com", "Sky", "gb"),
+    ("www.tesco.com", "Tesco", "gb"),
+    ("www.vodafone.co.uk", "Vodafone UK", "gb"),
+    ("www.arm.com", "Arm", "gb"),
+    # --- Эстония и Прибалтика ---
+    ("telia.ee", "Telia Eesti", "ee"),
+    ("bolt.eu", "Bolt", "ee"),
+    ("wise.com", "Wise", "ee"),
+    ("veriff.com", "Veriff", "ee"),
+    ("pipedrive.com", "Pipedrive", "ee"),
+    # --- Япония ---
+    ("yahoo.co.jp", "Yahoo Japan", "jp"),
+    ("www.rakuten.co.jp", "Rakuten", "jp"),
+    ("www.ntt.com", "NTT", "jp"),
+    ("www.sony.jp", "Sony", "jp"),
+    ("www.iij.ad.jp", "IIJ", "jp"),
+    ("www.lovelive-anime.jp", "Lovelive (частый выбор в гайдах)", "jp"),
+    # --- Казахстан ---
+    ("kaspi.kz", "Kaspi", "kz"),
+    ("kolesa.kz", "Kolesa", "kz"),
+    ("halykbank.kz", "Halyk Bank", "kz"),
+    ("beeline.kz", "Beeline KZ", "kz"),
+    # --- Бельгия ---
+    ("www.swift.com", "SWIFT", "be"),
 ]
+
+# Европа как единая группа: если своей страны в списке нет, соседняя европейская
+# всё равно правдоподобнее заокеанской.
+EUROPE_CODES = {
+    "ee", "fi", "lv", "lt", "pl", "de", "nl", "fr", "it", "gb", "se", "no",
+    "dk", "cz", "at", "ch", "es", "pt", "ie", "be", "ro", "bg", "hu", "sk",
+    "si", "hr", "gr", "ua", "md", "lu", "is", "rs", "al", "ba", "mk", "me",
+}
+
+# Страны, чьи сайты естественны и для соседа: там их читают, и обращение к ним
+# не выглядит странно.
+NEIGHBOUR_REGIONS = {"kz": ["ru"], "ru": ["kz"], "by": ["ru"], "ee": ["fi"]}
+
+
+def sni_rank(region: str, country: str) -> int:
+    """Насколько сайт уместен рядом с нодой в стране country. Меньше — лучше."""
+    code = (country or "").lower()
+    if not code:
+        return 1                      # страна неизвестна — не выделяем никого
+    if region == code:
+        return 0
+    if region in NEIGHBOUR_REGIONS.get(code, []):
+        return 1
+    if code in EUROPE_CODES and region in EUROPE_CODES:
+        return 2
+    if region == "global":
+        return 3
+    return 4
 
 
 # Доступность сайта из России проверяем чужими руками: с самой ноды этого не
@@ -2060,7 +2159,6 @@ def menu_reality_sni() -> None:
     results.sort(key=lambda x: (not x["ok"], x["ms"] or 10 ** 6))
 
     where = {host: region for host, _, region in SNI_CANDIDATES}
-    region_label = {"ru": "РФ", "world": "мир"}
 
     table = Table(box=box.ROUNDED, border_style="cyan", padding=(0, 1))
     table.add_column("Сайт")
@@ -2072,7 +2170,8 @@ def menu_reality_sni() -> None:
     table.add_column("Вердикт")
     mark = {True: "[green]✓[/green]", False: "[red]✗[/red]"}
     for res in results:
-        region = region_label.get(where.get(res["host"], ""), "?")
+        region = where.get(res["host"], "")
+        region = "мир" if region == "global" else (region.upper() or "?")
         if res["error"]:
             table.add_row(res["host"], region, "—", "—", "—", "—",
                           f"[yellow]{res['error']}[/yellow]")
@@ -2096,22 +2195,17 @@ def menu_reality_sni() -> None:
     # адрес назначения, и домен в SNI, а несостыковка между ними вычисляется
     # одним запросом к DNS.
     country = server_country()
-    # Страна неизвестна — не выдумываем предпочтение: пустая строка не совпадёт
-    # ни с одним регионом, и сортировка оставит порядок по задержке
-    prefer = "" if not country else ("ru" if country == "RU" else "world")
     if country:
-        console.print(f"\n[bold]Сервер выглядит как {country}[/bold] — "
-                      + ("предпочтительны российские сайты."
-                         if prefer == "ru" else
-                         "предпочтительны зарубежные сайты."))
+        console.print(f"\n[bold]Сервер выглядит как {country}[/bold] — наверх "
+                      "подняты сайты этой же страны, затем соседние и мировые.")
     else:
         console.print("\n[yellow]Страну сервера определить не удалось — "
                       "порядок кандидатов только по задержке.[/yellow]")
 
     good = [r for r in results if r["ok"]]
-    # Стабильная сортировка: внутри подходящего региона порядок по задержке
+    # Стабильная сортировка: внутри одного ранга порядок по задержке
     # сохраняется, потому что results уже отсортированы
-    good.sort(key=lambda r: where.get(r["host"], "world") != prefer)
+    good.sort(key=lambda r: sni_rank(where.get(r["host"], "global"), country))
     if not good:
         console.print("\n[yellow]Ни один кандидат не подошёл. Так бывает, "
                       "когда исходящие с сервера фильтруются или openssl "
@@ -2312,11 +2406,22 @@ def block_grpc(params: tuple[int, str] | None = None) -> None:
 
 
 def ask_grpc_params() -> tuple[int, str] | None:
+    # Кандидатов больше сотни, поэтому наверх поднимаем уместные рядом с этой
+    # нодой — иначе выбирать пришлось бы, листая весь список
+    country = server_country()
+    ordered = sorted(SNI_CANDIDATES,
+                     key=lambda item: sni_rank(item[2], country))
+    if country:
+        console.print(f"[dim]Сервер выглядит как {country}: сайты этой страны "
+                      "и соседних идут первыми.[/dim]")
     dest = questionary.select(
         "Маскировочный сайт для Reality (клиент будет выглядеть как гость "
         "этого сайта):",
-        choices=[questionary.Choice(f"{host} — {title}", value=host)
-                 for host, title, _ in SNI_CANDIDATES],
+        choices=[questionary.Choice(
+            f"{host} — {title}"
+            + (f"  [{region.upper()}]" if region != "global" else "  [мир]"),
+            value=host)
+            for host, title, region in ordered],
         style=CUSTOM_STYLE).ask()
     if dest is None:
         return None
