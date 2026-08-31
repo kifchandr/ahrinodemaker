@@ -1929,6 +1929,48 @@ SNI_CANDIDATES: list[tuple[str, str, str]] = [
     ("kolesa.kz", "Kolesa", "kz"),
     ("halykbank.kz", "Halyk Bank", "kz"),
     ("beeline.kz", "Beeline KZ", "kz"),
+    # --- Швеция ---
+    ("telia.se", "Telia Sverige", "se"),
+    ("www.ikea.com", "IKEA", "se"),
+    ("www.klarna.com", "Klarna", "se"),
+    ("www.ericsson.com", "Ericsson", "se"),
+    # --- Испания ---
+    ("www.telefonica.com", "Telefónica", "es"),
+    ("www.movistar.es", "Movistar", "es"),
+    ("www.elcorteingles.es", "El Corte Inglés", "es"),
+    # --- Чехия ---
+    ("www.seznam.cz", "Seznam", "cz"),
+    ("www.o2.cz", "O2", "cz"),
+    ("www.alza.cz", "Alza", "cz"),
+    # --- Австрия ---
+    ("www.a1.net", "A1", "at"),
+    ("www.willhaben.at", "willhaben", "at"),
+    ("www.orf.at", "ORF", "at"),
+    # --- Швейцария ---
+    ("www.swisscom.ch", "Swisscom", "ch"),
+    ("www.migros.ch", "Migros", "ch"),
+    ("www.ubs.com", "UBS", "ch"),
+    # --- Латвия и Литва ---
+    ("www.tet.lv", "Tet", "lv"),
+    ("www.ss.lv", "SS.LV", "lv"),
+    ("www.swedbank.lv", "Swedbank", "lv"),
+    ("www.telia.lt", "Telia Lietuva", "lt"),
+    ("www.15min.lt", "15min", "lt"),
+    # --- Румыния ---
+    ("www.emag.ro", "eMAG", "ro"),
+    ("www.orange.ro", "Orange România", "ro"),
+    ("www.digi.ro", "Digi", "ro"),
+    # --- Турция ---
+    ("www.turkcell.com.tr", "Turkcell", "tr"),
+    ("www.trendyol.com", "Trendyol", "tr"),
+    ("www.sahibinden.com", "sahibinden", "tr"),
+    ("www.hepsiburada.com", "Hepsiburada", "tr"),
+    # --- Норвегия, Дания, Португалия, Ирландия, Венгрия ---
+    ("www.telenor.no", "Telenor", "no"),
+    ("www.finn.no", "FINN", "no"),
+    ("www.sapo.pt", "SAPO", "pt"),
+    ("www.eir.ie", "eir", "ie"),
+    ("www.telekom.hu", "Magyar Telekom", "hu"),
     # --- Бельгия ---
     ("www.swift.com", "SWIFT", "be"),
 ]
@@ -1939,11 +1981,18 @@ EUROPE_CODES = {
     "ee", "fi", "lv", "lt", "pl", "de", "nl", "fr", "it", "gb", "se", "no",
     "dk", "cz", "at", "ch", "es", "pt", "ie", "be", "ro", "bg", "hu", "sk",
     "si", "hr", "gr", "ua", "md", "lu", "is", "rs", "al", "ba", "mk", "me",
+    "tr",
 }
 
 # Страны, чьи сайты естественны и для соседа: там их читают, и обращение к ним
 # не выглядит странно.
-NEIGHBOUR_REGIONS = {"kz": ["ru"], "ru": ["kz"], "by": ["ru"], "ee": ["fi"]}
+NEIGHBOUR_REGIONS = {
+    "kz": ["ru"], "ru": ["kz"], "by": ["ru"],
+    "ee": ["fi", "lv"], "lv": ["ee", "lt"], "lt": ["lv", "pl"],
+    "fi": ["se", "ee"], "se": ["no", "dk", "fi"], "no": ["se", "dk"],
+    "dk": ["se", "de"], "at": ["de", "ch"], "ch": ["at", "de"],
+    "cz": ["sk", "de"], "sk": ["cz", "hu"], "pt": ["es"], "es": ["pt"],
+}
 
 
 def sni_rank(region: str, country: str) -> int:
