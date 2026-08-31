@@ -489,13 +489,17 @@ def service_diagnostics(unit: str, lines: int = 25) -> str:
     return "\n".join(out).strip()
 
 
-def _fail2ban_jail(backend: str) -> str:
+def _fail2ban_jail(backend: str, ssh_ports: list[int]) -> str:
+    # port должен совпадать с реальным портом SSH: «ssh» разворачивается в 22 по
+    # /etc/services, и на нестандартном порту бан выписывался бы на порт, куда
+    # никто не стучится, — jail работал бы вхолостую.
+    ports = ",".join(str(p) for p in ssh_ports) or "ssh"
     return f"""[DEFAULT]
 backend = {backend}
 
 [sshd]
 enabled = true
-port = ssh
+port = {ports}
 filter = sshd
 maxretry = 5
 findtime = 600
@@ -520,7 +524,8 @@ def _fail2ban_try(backend: str) -> tuple[bool, str]:
         return False, ("пакет fail2ban не установлен и не смог установиться — "
                        "проверьте `apt-get install fail2ban` вручную")
 
-    write_file("/etc/fail2ban/jail.local", _fail2ban_jail(backend))
+    write_file("/etc/fail2ban/jail.local",
+               _fail2ban_jail(backend, detect_ssh_ports()))
 
     # fail2ban-client -t разбирает конфиг, не трогая службу: ошибку фильтра или
     # недоступный backend видно до попытки запуска.
@@ -540,7 +545,10 @@ def block_fail2ban() -> None:
     step("Настройка Fail2Ban")
     ensure_packages("fail2ban")
     backend = _fail2ban_backend()
-    console.print(f"[dim]backend для jail sshd: {backend}[/dim]")
+    ports = detect_ssh_ports()
+    console.print(f"[dim]backend для jail sshd: {backend}, порт SSH: "
+                  + (", ".join(str(p) for p in ports) if ports
+                     else "не определён, беру ssh (22)") + "[/dim]")
 
     # Для backend=systemd fail2ban читает журнал через python3-systemd. Пакет
     # идёт лишь в Recommends, и при установке с --no-install-recommends (или на
@@ -678,12 +686,75 @@ def blocked_ports_reference(specs: list[str]) -> str:
     }, ensure_ascii=False, indent=2)
 
 
+def parse_ssh_ports(sshd_config: str, socket_listen: str, sockets: str) -> list[int]:
+    """Собирает порты SSH из трёх источников. Вынесено отдельно ради проверки
+    на образцах вывода — на живом сервере такое не воспроизведёшь."""
+    ports: list[int] = []
+
+    def add(value: str) -> None:
+        try:
+            port = int(value)
+        except ValueError:
+            return
+        if 1 <= port <= 65535 and port not in ports:
+            ports.append(port)
+
+    # 1. systemd-сокет. На свежих Ubuntu ssh активируется через ssh.socket, и
+    #    порт задаётся там: Port в sshd_config при этом молча игнорируется.
+    #    Поэтому сокет идёт первым, а не последним.
+    for line in socket_listen.splitlines():
+        m = re.search(r"\[::\]:(\d+)|(?:\d+\.){3}\d+:(\d+)|\s(\d+)\s*$", line)
+        if m:
+            add(next(g for g in m.groups() if g))
+
+    # 2. Эффективная конфигурация sshd: она учитывает Include и умолчания,
+    #    в отличие от чтения sshd_config глазами.
+    for line in sshd_config.splitlines():
+        m = re.match(r"\s*port\s+(\d+)\s*$", line, re.IGNORECASE)
+        if m:
+            add(m.group(1))
+
+    # 3. Кто реально слушает. Последний рубеж: ловит и нештатный запуск, и
+    #    случай, когда конфиг правили, а службу не перезапускали.
+    for line in sockets.splitlines():
+        if "sshd" not in line:
+            continue
+        m = re.search(r":(\d+)\s+[\d.:*\[\]]+\s", line)
+        if m:
+            add(m.group(1))
+    return ports
+
+
+def detect_ssh_ports() -> list[int]:
+    """Порты, на которых сервер принимает SSH. Пустой список — не определили."""
+    socket_listen = ""
+    for unit in ("ssh.socket", "sshd.socket"):
+        r = probe(["systemctl", "show", unit, "-p", "ListenStream", "--value"])
+        if r.returncode == 0 and r.stdout.strip():
+            socket_listen += r.stdout
+    sshd_config = probe(["sshd", "-T"]).stdout
+    sockets = probe(["ss", "-lntpH"]).stdout
+    return parse_ssh_ports(sshd_config, socket_listen, sockets)
+
+
 def block_ufw(extra_ports: list[str], panel_ip: str | None = None) -> None:
     step("Настройка UFW (firewall)")
     ensure_packages("ufw")
     run(["ufw", "default", "deny", "incoming"])
     run(["ufw", "default", "allow", "outgoing"])
-    run(["ufw", "limit", "ssh"])
+    # Порт SSH определяем, а не берём 22 на веру: запереть себя снаружи —
+    # единственная по-настоящему необратимая ошибка этого блока. limit, а не
+    # allow: ufw придержит перебор паролей.
+    ssh_ports = detect_ssh_ports()
+    if not ssh_ports:
+        ssh_ports = [22]
+        console.print("[yellow]Порт SSH определить не удалось — открываю 22. "
+                      "Если у вас другой, добавьте его в «доп. порты», иначе "
+                      "потеряете доступ.[/yellow]")
+    for port in ssh_ports:
+        run(["ufw", "limit", f"{port}/tcp"])
+    console.print("[green]✓ SSH разрешён на порту "
+                  + ", ".join(str(p) for p in ssh_ports) + "[/green]")
     for port in ("80/tcp", "443/tcp", "8443/tcp", "9999/tcp"):
         run(["ufw", "allow", port])
 
