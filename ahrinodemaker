@@ -1939,19 +1939,16 @@ def checkhost_tcp(host: str, port: int = 443, max_nodes: int = 12,
     return out
 
 
-def _probe_reality_sni(host: str, timeout: int) -> dict:
+def _probe_reality_sni(host: str, timeout: int, alpn: str) -> dict:
     """Одно рукопожатие с сайтом. Отдельно от check_reality_sni, чтобы попытку
-    можно было повторить."""
+    можно было повторить и с другим набором ALPN."""
     result = {"host": host, "ok": False, "tls13": False, "h2": False,
               "x25519": False, "ms": 0, "error": ""}
     started = time.monotonic()
     try:
-        # ALPN предлагаем оба протокола. С одним лишь h2 сайт, который его не
-        # умеет, обрывает рукопожатие алертом no_application_protocol — и тогда
-        # не видно ни версии TLS, ни обмена ключами, хотя с ними всё в порядке.
         r = subprocess.run(
             ["openssl", "s_client", "-connect", f"{host}:443",
-             "-servername", host, "-tls1_3", "-alpn", "h2,http/1.1"],
+             "-servername", host, "-tls1_3", "-alpn", alpn],
             input="", capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
         result["error"] = "таймаут"
@@ -1968,8 +1965,8 @@ def _probe_reality_sni(host: str, timeout: int) -> dict:
 
     # Server Temp Key печатается только после состоявшегося обмена ключами:
     # это и есть признак, что рукопожатие дошло до конца. Без него судить о
-    # возможностях сайта нельзя — три прочерка означали бы «не умеет», хотя на
-    # деле соединение оборвали по дороге.
+    # возможностях сайта нельзя — прочерки означали бы «не умеет», хотя на деле
+    # соединение оборвали по дороге.
     temp_key = re.search(r"Server Temp Key:\s*(\S+)", out)
     if temp_key is None:
         result["error"] = "рукопожатие оборвано"
@@ -1993,16 +1990,32 @@ def check_reality_sni(host: str, timeout: int = 8) -> dict:
 
     Проверяем именно с сервера: важна и задержка до сайта, потому что каждое
     подключение клиента идёт через это рукопожатие."""
-    result = _probe_reality_sni(host, timeout)
+    # Предлагаем ровно тот ALPN, который предложит Reality, — один h2. Список
+    # из двух протоколов сюда не годится: выбор делает сервер, и умеющий оба
+    # может ответить http/1.1, а мы записали бы ему «не умеет h2».
+    result = _probe_reality_sni(host, timeout, "h2")
+    if not result["error"]:
+        return result
+
     # Кандидатов проверяем пачкой и параллельно, а часть сайтов на всплеск
     # рукопожатий с одного адреса отвечает отказом. Одна повторная попытка
     # вразвалку отделяет такой отказ от настоящей неспособности сайта.
-    if result["error"]:
+    if result["error"] == "рукопожатие оборвано":
         time.sleep(1.5)
-        retry = _probe_reality_sni(host, timeout)
-        if not retry["error"]:
-            return retry
-        result = retry
+        result = _probe_reality_sni(host, timeout, "h2")
+        if not result["error"]:
+            return result
+
+    # Рукопожатие оборвано — но по какой причине? Сайт без h2 отвечает алертом
+    # no_application_protocol, и это неотличимо от обрыва, пока не предложить
+    # ему запасной протокол. Если со списком он соединяется, значит жив, просто
+    # не умеет h2, — а это уже приговор кандидату, а не загадка.
+    if result["error"] == "рукопожатие оборвано":
+        fallback = _probe_reality_sni(host, timeout, "h2,http/1.1")
+        if not fallback["error"]:
+            fallback["h2"] = False
+            fallback["ok"] = False
+            return fallback
     return result
 
 
