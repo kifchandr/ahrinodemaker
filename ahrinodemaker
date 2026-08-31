@@ -2082,12 +2082,39 @@ def _checkhost_json(url: str, timeout: int = 25) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
+_CHECKHOST_NODES: dict | None = None
+
+
+def checkhost_pick_nodes(ru_wanted: int = 10, control: int = 4) -> list[str]:
+    """Выбирает узлы поимённо: российские плюс несколько зарубежных.
+
+    Без явного выбора check-host берёт узлы как придётся, и в выборку попадает
+    один-два российских на двадцать зарубежных — а весь смысл проверки именно
+    в российских. Список узлов запрашивается один раз за запуск."""
+    global _CHECKHOST_NODES
+    if _CHECKHOST_NODES is None:
+        data = _checkhost_json(f"{CHECKHOST_API}/nodes/hosts", timeout=15)
+        _CHECKHOST_NODES = (data or {}).get("nodes") or {}
+    ru, other = [], []
+    for name, info in _CHECKHOST_NODES.items():
+        location = (info or {}).get("location") or []
+        country = (location[0] if location else "").lower()
+        (ru if country == "ru" else other).append(name)
+    return sorted(ru)[:ru_wanted] + sorted(other)[:control]
+
+
 def _checkhost_run(kind: str, target: str, max_nodes: int,
                    wait: int) -> tuple[dict, dict, str]:
     """Запускает проверку и дожидается результатов. Возвращает (узлы, ответы,
     ошибка). Общая часть для всех видов проверок check-host.net."""
-    start = _checkhost_json(
-        f"{CHECKHOST_API}/check-{kind}?host={target}&max_nodes={max_nodes}")
+    picked = checkhost_pick_nodes()
+    if picked:
+        query = "&".join(f"node={n}" for n in picked)
+    else:
+        # Список узлов не отдали — работаем как раньше, но выборка будет
+        # случайной, и российских в ней может почти не оказаться
+        query = f"max_nodes={max_nodes}"
+    start = _checkhost_json(f"{CHECKHOST_API}/check-{kind}?host={target}&{query}")
     if not start or not start.get("request_id"):
         return {}, {}, "check-host.net не ответил"
 
@@ -2203,14 +2230,34 @@ def dns_answers_match(result: dict) -> bool | None:
     """Совпадают ли адреса, которые видят в России и за границей.
 
     None — сравнивать не с чем. Пересечение, а не равенство: у крупных сайтов
-    CDN честно отдаёт разные адреса в разных странах, и это норма. Тревожно,
-    когда общих адресов нет вовсе."""
+    CDN честно отдаёт разные адреса в разных странах."""
     ru = {a for _, _, ok, detail in result["ru"] if ok for a in detail.split(",")}
     world = {a for _, _, ok, detail in result["foreign"] if ok
              for a in detail.split(",")}
     if not ru or not world:
         return None
     return bool(ru & world)
+
+
+def dns_looks_blocked(result: dict) -> bool:
+    """Похож ли ответ российского резолвера на заглушку.
+
+    Одного лишь несовпадения адресов мало: Akamai и подобные CDN честно отдают
+    в России свои местные узлы, и общих адресов с заграницей может не быть
+    вовсе — это норма, а не подмена. А вот приватный или петлевой адрес в
+    ответе означает именно блокировку."""
+    for _, _, ok, detail in result["ru"]:
+        if not ok:
+            continue
+        for addr in detail.split(","):
+            try:
+                ip = ipaddress.ip_address(addr.strip())
+            except ValueError:
+                continue
+            if (ip.is_private or ip.is_loopback or ip.is_unspecified
+                    or ip.is_reserved):
+                return True
+    return False
 
 
 def _probe_reality_sni(host: str, timeout: int, alpn: str) -> dict:
@@ -2485,8 +2532,10 @@ def menu_reality_sni() -> None:
                            for city, _, ok, _ in web["ru"] if not ok) or "—"
 
         dns_same = dns_answers_match(dns)
-        dns_cell = ("[green]совпадает[/green]" if dns_same
-                    else "[red]подменён[/red]" if dns_same is False
+        dns_stub = dns_looks_blocked(dns)
+        dns_cell = ("[red]заглушка[/red]" if dns_stub
+                    else "[green]совпадает[/green]" if dns_same
+                    else "[yellow]адреса разные[/yellow]" if dns_same is False
                     else "[dim]—[/dim]")
 
         # Приговор по большинству: один упавший узел — это обычно сам узел.
@@ -2508,7 +2557,9 @@ def menu_reality_sni() -> None:
         if world_total and not world_ok:
             verdict = "[red]сайт лежит и вне РФ[/red]"
             clean = False
-        if dns_same is False and clean:
+        # Приговор выносим только по заглушке. «Адреса разные» само по себе
+        # ничего не значит: так выглядит обычный CDN с узлами в России.
+        if dns_stub and clean:
             verdict = "[yellow]открыт, но DNS в РФ подменён[/yellow]"
             clean = False
 
