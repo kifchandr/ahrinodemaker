@@ -1815,20 +1815,14 @@ SNI_CANDIDATES: list[tuple[str, str, str]] = [
     ("market.yandex.ru", "Яндекс Маркет", "ru"),
     ("dzen.ru", "Дзен", "ru"),
     ("ozon.ru", "Ozon", "ru"),
-    ("www.ozon.ru", "Ozon (www)", "ru"),
     ("wildberries.ru", "Wildberries", "ru"),
-    ("www.wildberries.ru", "Wildberries (www)", "ru"),
     ("avito.ru", "Авито", "ru"),
-    ("www.avito.ru", "Авито (www)", "ru"),
-    ("m.avito.ru", "Авито (мобильный)", "ru"),
     ("auto.ru", "Авто.ру", "ru"),
     ("vk.ru", "ВКонтакте", "ru"),
     ("vk.com", "ВКонтакте (.com)", "ru"),
     ("ok.ru", "Одноклассники", "ru"),
     ("max.ru", "MAX", "ru"),
     ("x5.ru", "X5 Group", "ru"),
-    ("ads.x5.ru", "X5 — реклама", "ru"),
-    ("media.x5.ru", "X5 — медиа", "ru"),
     ("mts.ru", "МТС", "ru"),
     ("megafon.ru", "МегаФон", "ru"),
     ("beeline.ru", "Билайн", "ru"),
@@ -2000,6 +1994,11 @@ def menu_reality_sni() -> None:
     extra = questionary.text(
         "Свои домены через запятую (Enter — только встроенный список):",
         default="", style=CUSTOM_STYLE).ask()
+    # None — это Ctrl+C, а не пустой ввод. Раньше оба случая сливались в «ничего
+    # не дописали», и отмена запускала полсотни проверок вместо выхода.
+    if extra is None:
+        console.print("[yellow]Отменено.[/yellow]")
+        return
     hosts = [h for h, _, _ in SNI_CANDIDATES]
     for item in (extra or "").split(","):
         item = item.strip().lower()
@@ -2082,6 +2081,9 @@ def menu_reality_sni() -> None:
                  for i, r in enumerate(good)],
         style=CUSTOM_STYLE).ask()
 
+    if picked is None:          # Ctrl+C — выходим, ничего не проверяя
+        console.print("[yellow]Отменено.[/yellow]")
+        return
     if not picked:
         console.print(f"[green]Лучший по локальным проверкам: "
                       f"[bold]{good[0]['host']}[/bold][/green]")
