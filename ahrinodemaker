@@ -820,13 +820,41 @@ def block_conntrack() -> None:
     console.print("[green]✓ Модуль conntrack настроен[/green]")
 
 
-def block_sysctl() -> None:
-    step("Настройка sysctl")
-    sysctl_conf = """# --- IPv6 / forwarding ---
-net.ipv6.conf.all.disable_ipv6 = 1
+# Что делать с IPv6. Раньше он выключался всегда, но это решение не за
+# скриптом: на части хостингов IPv6 — единственный способ выдать клиенту
+# честный адрес, а часть сервисов (тот же Google) по нему различает гео.
+IPV6_MODES = [
+    ("keep", "Не трогать — оставить как настроено сейчас"),
+    ("off", "Выключить IPv6"),
+    ("on", "Включить IPv6"),
+]
+
+IPV6_SYSCTL = {
+    "off": """net.ipv6.conf.all.disable_ipv6 = 1
 net.ipv6.conf.default.disable_ipv6 = 1
 net.ipv6.conf.lo.disable_ipv6 = 1
-net.ipv4.ip_forward = 1
+""",
+    "on": """net.ipv6.conf.all.disable_ipv6 = 0
+net.ipv6.conf.default.disable_ipv6 = 0
+net.ipv6.conf.lo.disable_ipv6 = 0
+""",
+    "keep": "",
+}
+
+
+def ipv6_disabled() -> bool:
+    """Выключен ли IPv6 прямо сейчас."""
+    try:
+        with open("/proc/sys/net/ipv6/conf/all/disable_ipv6", encoding="utf-8") as f:
+            return f.read().strip() == "1"
+    except OSError:
+        return False        # файла нет — ядро собрано без IPv6, трогать нечего
+
+
+def block_sysctl(ipv6: str = "keep") -> None:
+    step("Настройка sysctl")
+    sysctl_conf = """# --- IPv6 / forwarding ---
+""" + IPV6_SYSCTL.get(ipv6, "") + """net.ipv4.ip_forward = 1
 # --- TCP congestion control + qdisc ---
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
@@ -859,6 +887,10 @@ net.netfilter.nf_conntrack_tcp_timeout_close_wait = 30
 vm.swappiness = 10
 """
     write_file("/etc/sysctl.d/99-vpn.conf", sysctl_conf)
+    if ipv6 == "keep" and ipv6_disabled():
+        console.print("[yellow]IPv6 сейчас выключен — оставляю как есть. "
+                      "Включить можно, выбрав «Включить IPv6» при следующем "
+                      "прогоне этого блока.[/yellow]")
     # -e: не падать на ключах, которых нет в ядре. Параметры net.netfilter.*
     # существуют только при загруженном nf_conntrack, а в контейнерах его может
     # не быть — без -e команда вернёт ненулевой код и уронит весь блок.
@@ -3826,9 +3858,9 @@ def block_torrent() -> None:
 
 
 # --- Объединённые блоки ---
-def block_network() -> None:
+def block_network(ipv6: str = "keep") -> None:
     block_conntrack()
-    block_sysctl()
+    block_sysctl(ipv6)
 
 
 def block_system_upgrade() -> None:
@@ -4195,6 +4227,19 @@ def ask_panel_ip() -> str | None:
     return value if "/" in value else str(net.network_address)
 
 
+def ask_ipv6_mode() -> str:
+    """Что делать с IPv6. По умолчанию — ничего: это настройка хостинга, а не
+    скрипта, и молча отключать её неправильно."""
+    current = ("выключен" if ipv6_disabled() else "включён")
+    choice = questionary.select(
+        f"IPv6 (сейчас {current}):",
+        choices=[questionary.Choice(title, value=key)
+                 for key, title in IPV6_MODES],
+        # default сверяется со значением Choice, а не с заголовком
+        default=IPV6_MODES[0][0], style=CUSTOM_STYLE).ask()
+    return choice or "keep"
+
+
 def ask_extra_ports() -> list[str]:
     while True:
         raw = questionary.text(
@@ -4327,6 +4372,10 @@ def menu_remnawave_node() -> None:
     if "hysteria" in selected:
         hysteria_params = ask_hysteria_params()
 
+    ipv6_mode = "keep"
+    if "network" in selected:
+        ipv6_mode = ask_ipv6_mode()
+
     # 5. Расписание перезагрузки — только если выбран блок cron
     reboot_schedule = "daily"
     if "time_cron" in selected:
@@ -4374,6 +4423,9 @@ def menu_remnawave_node() -> None:
         console.print("[bold]Обновление пакетов:[/bold] да (apt update && upgrade)")
     if "time_cron" in selected:
         console.print(f"[bold]Перезагрузка:[/bold] {schedule_human} (МСК)")
+    if "network" in selected:
+        console.print("[bold]IPv6:[/bold] "
+                      + dict(IPV6_MODES)[ipv6_mode].lower())
     if "ufw" in selected:
         console.print(f"[bold]Порт {PANEL_PORT}:[/bold] "
                       + (f"только для {panel_ip}" if panel_ip
@@ -4446,6 +4498,8 @@ def menu_remnawave_node() -> None:
                 func(compose_path)
             elif key == "node_update":
                 func(node_path)
+            elif key == "network":
+                func(ipv6_mode)
             elif key == "time_cron":
                 func(reboot_schedule)
             else:
