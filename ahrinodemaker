@@ -2292,7 +2292,16 @@ def dns_looks_blocked(result: dict) -> bool:
     return False
 
 
-def _probe_reality_sni(host: str, timeout: int, alpn: str) -> dict:
+def _probe_reality_sni_at(connect: str, port: int, servername: str,
+                          timeout: int = 8) -> dict:
+    """Рукопожатие с конкретным адресом от чужого имени. Нужно для self-steal:
+    подключаемся к 127.0.0.1, а имя предъявляем доменное."""
+    return _probe_reality_sni(servername, timeout, "h2",
+                              connect=f"{connect}:{port}")
+
+
+def _probe_reality_sni(host: str, timeout: int, alpn: str,
+                       connect: str | None = None) -> dict:
     """Одно рукопожатие с сайтом. Отдельно от check_reality_sni, чтобы попытку
     можно было повторить и с другим набором ALPN."""
     result = {"host": host, "ok": False, "tls13": False, "h2": False,
@@ -2300,7 +2309,7 @@ def _probe_reality_sni(host: str, timeout: int, alpn: str) -> dict:
     started = time.monotonic()
     try:
         r = subprocess.run(
-            ["openssl", "s_client", "-connect", f"{host}:443",
+            ["openssl", "s_client", "-connect", connect or f"{host}:443",
              "-servername", host, "-tls1_3", "-alpn", alpn],
             input="", capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -2749,6 +2758,289 @@ def block_grpc() -> None:
         "полях dest и serverNames; подобрать его помогает пункт "
         "«Подобрать SNI для Reality» в Tools.")
 
+
+# ------------------------------------------------------------------ #
+# Self-steal: Reality маскируется под сайт, который стоит на этой же ноде
+# ------------------------------------------------------------------ #
+# Обычный Reality пересылает рукопожатие на чужой сайт, и это оставляет два
+# следа: задержку до него на каждом подключении и несостыковку «адрес одной
+# страны отдаёт сайт другой». Self-steal убирает оба: сайт поднимается локально
+# на том же сервере, домен указывает сюда же, сертификат настоящий. Наблюдатель
+# видит адрес, на котором действительно живёт сайт с этим именем.
+#
+# Цена — нужен свой домен с A-записью на ноду.
+SELFSTEAL_DIR = "/opt/selfsteal"
+SELFSTEAL_SITE = f"{SELFSTEAL_DIR}/site"
+# Только на localhost: наружу этот порт не публикуется, ходить в него должен
+# один лишь Xray. 9443 выбран, чтобы не столкнуться с 8443 у блока gRPC.
+SELFSTEAL_PORT = 9443
+SELFSTEAL_NGINX = "/etc/nginx/sites-available/selfsteal.conf"
+SELFSTEAL_NGINX_LINK = "/etc/nginx/sites-enabled/selfsteal.conf"
+SELFSTEAL_INBOUND_TAG = "VLESS_SELFSTEAL"
+SELFSTEAL_REFERENCE = f"{INSTALL_DIR}/panel-selfsteal-inbound.json"
+
+# Заготовки для случайного сайта. Пустая страница или одинаковый у всех шаблон
+# сам по себе примета, поэтому содержимое собирается из кусочков: у каждой ноды
+# получается свой сайт со своим названием, цветами и текстом.
+SITE_KINDS = [
+    ("studio", "{name} Studio", "Дизайн и разработка цифровых продуктов",
+     ["Услуги", "Работы", "О студии", "Контакты"]),
+    ("consulting", "{name} Consulting", "Консалтинг для растущих команд",
+     ["Направления", "Кейсы", "Команда", "Связаться"]),
+    ("labs", "{name} Labs", "Инженерные решения и исследования",
+     ["Проекты", "Технологии", "Публикации", "Контакты"]),
+    ("logistics", "{name} Logistics", "Перевозки и складская логистика",
+     ["Маршруты", "Тарифы", "Отслеживание", "Контакты"]),
+    ("clinic", "{name} Care", "Медицинский центр полного цикла",
+     ["Направления", "Врачи", "Цены", "Запись"]),
+]
+SITE_NAMES = ["Northwind", "Blueport", "Silverline", "Ironwood", "Brightfield",
+              "Cedarhill", "Redstone", "Lakeview", "Foxglove", "Highgate",
+              "Meridian", "Kingsway", "Oakridge", "Stonebridge", "Fairmont"]
+SITE_PALETTES = [("#0f172a", "#38bdf8"), ("#1f2937", "#f59e0b"),
+                 ("#14532d", "#86efac"), ("#3b0764", "#c4b5fd"),
+                 ("#7f1d1d", "#fca5a5"), ("#0c4a6e", "#7dd3fc")]
+
+
+def generate_site(domain: str) -> tuple[str, str]:
+    """Случайная одностраничка. Возвращает (заголовок, html)."""
+    _, title_tpl, tagline, sections = secrets.choice(SITE_KINDS)
+    title = title_tpl.format(name=secrets.choice(SITE_NAMES))
+    bg, accent = secrets.choice(SITE_PALETTES)
+    year = 2019 + secrets.randbelow(6)
+    nav = "\n".join(f'      <a href="#{i}">{s}</a>'
+                    for i, s in enumerate(sections, 1))
+    blocks = "\n".join(
+        f'    <section id="{i}">\n      <h2>{s}</h2>\n'
+        f'      <p>Раздел в работе. Напишите нам, и мы ответим в течение '
+        f'рабочего дня.</p>\n    </section>'
+        for i, s in enumerate(sections, 1))
+    html = f"""<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title}</title>
+<style>
+  :root {{ --bg: {bg}; --accent: {accent}; }}
+  * {{ box-sizing: border-box; }}
+  body {{ margin: 0; font: 16px/1.6 system-ui, sans-serif;
+         color: #e5e7eb; background: var(--bg); }}
+  header {{ padding: 64px 24px 32px; max-width: 900px; margin: 0 auto; }}
+  h1 {{ font-size: 2.2rem; margin: 0 0 8px; }}
+  .tagline {{ color: var(--accent); font-size: 1.1rem; }}
+  nav {{ display: flex; gap: 20px; flex-wrap: wrap; padding: 0 24px;
+         max-width: 900px; margin: 0 auto 32px; }}
+  nav a {{ color: #cbd5e1; text-decoration: none; border-bottom: 1px solid transparent; }}
+  nav a:hover {{ border-color: var(--accent); }}
+  main {{ max-width: 900px; margin: 0 auto; padding: 0 24px 64px; }}
+  section {{ padding: 24px 0; border-top: 1px solid rgba(255,255,255,.08); }}
+  h2 {{ font-size: 1.2rem; margin: 0 0 8px; color: var(--accent); }}
+  footer {{ padding: 24px; text-align: center; color: #94a3b8; font-size: .9rem; }}
+</style>
+</head>
+<body>
+  <header>
+    <h1>{title}</h1>
+    <div class="tagline">{tagline}</div>
+  </header>
+  <nav>
+{nav}
+  </nav>
+  <main>
+{blocks}
+  </main>
+  <footer>© {year}–2026 {title} · {domain}</footer>
+</body>
+</html>
+"""
+    return title, html
+
+
+def _nginx_http2_syntax() -> str:
+    """nginx до 1.25.1 знает только `listen … http2`, после — директиву `http2 on`.
+    Старый вид в новых версиях ещё работает, но пишет предупреждение, поэтому
+    выбираем по версии."""
+    out = probe(["nginx", "-v"]).stderr or probe(["nginx", "-v"]).stdout
+    m = re.search(r"nginx/(\d+)\.(\d+)\.(\d+)", out)
+    if m and (int(m.group(1)), int(m.group(2)), int(m.group(3))) >= (1, 25, 1):
+        return "modern"
+    return "legacy"
+
+
+def selfsteal_nginx_conf(domain: str, cert: str, key: str, syntax: str) -> str:
+    listen = (f"listen 127.0.0.1:{SELFSTEAL_PORT} ssl;\n    http2 on;"
+              if syntax == "modern"
+              else f"listen 127.0.0.1:{SELFSTEAL_PORT} ssl http2;")
+    return f"""# Локальный сайт для маскировки Reality (self-steal).
+# Слушает только петлю: снаружи в него ходит не клиент, а Xray, который
+# пересылает сюда рукопожатие тех, кто не знает ключа.
+server {{
+    {listen}
+    server_name {domain};
+
+    ssl_certificate     {cert};
+    ssl_certificate_key {key};
+    # TLS 1.3 обязателен: Reality повторяет рукопожатие этого сайта, а сам
+    # умеет только его. TLS 1.2 оставлен для честности картины при обращении
+    # старым клиентом напрямую.
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers off;
+
+    root {SELFSTEAL_SITE};
+    index index.html;
+
+    location / {{
+        try_files $uri $uri/ =404;
+    }}
+}}
+"""
+
+
+def selfsteal_inbound_reference(domain: str, private_key: str,
+                                public_key: str, short_ids: list[str]) -> str:
+    return json.dumps({
+        "tag": SELFSTEAL_INBOUND_TAG,
+        "port": 443,
+        "listen": "0.0.0.0",
+        "protocol": "vless",
+        "settings": {"clients": [], "decryption": "none"},
+        "sniffing": {"enabled": True,
+                     "destOverride": ["http", "tls", "quic"]},
+        "streamSettings": {
+            "network": "raw",
+            "security": "reality",
+            "realitySettings": {
+                "show": False,
+                "xver": 0,
+                # Сайт стоит здесь же: рукопожатие никуда не уходит с сервера,
+                # поэтому и задержки на него нет
+                "target": f"127.0.0.1:{SELFSTEAL_PORT}",
+                "serverNames": [domain],
+                "privateKey": private_key,
+                "shortIds": short_ids,
+            },
+        },
+        "_publicKey": public_key,
+        "_note": (
+            "Поля с подчёркиванием удалите перед вставкой: publicKey нужен "
+            "клиенту, а не ноде. Занять порт 443 может уже существующий "
+            f"inbound — тогда либо замените его, либо дайте этому другой порт. "
+            f"Host в панели: домен {domain}, SNI тот же. Сайт, за который "
+            "прячется нода, поднят локально на 127.0.0.1:"
+            f"{SELFSTEAL_PORT} и виден по этому же домену снаружи только через "
+            "Reality."),
+    }, indent=2, ensure_ascii=False) + "\n"
+
+
+def block_selfsteal(params: tuple[str, dict | None] | None = None) -> None:
+    step("Self-steal: локальный сайт + Reality на него")
+    domain, acme = params if params else (None, None)
+    if not domain:
+        console.print("[yellow]Домен не задан — блок пропущен.[/yellow]")
+        return
+
+    cert, key = _cert_paths(domain)
+    if not (os.path.isfile(cert) and os.path.isfile(key)):
+        # certbot в режиме standalone занимает 80-й порт, поэтому nginx на
+        # время выпуска надо убрать с дороги
+        if probe(["systemctl", "is-active", "--quiet", "nginx"]).returncode == 0:
+            run(["systemctl", "stop", "nginx"], check=False)
+        issue_certificate(domain, acme)
+        cert, key = _cert_paths(domain)
+
+    ensure_packages("nginx")
+
+    os.makedirs(SELFSTEAL_SITE, exist_ok=True)
+    title, html = generate_site(domain)
+    write_file(f"{SELFSTEAL_SITE}/index.html", html)
+    console.print(f"[green]✓ Сайт сгенерирован: «{title}» в {SELFSTEAL_SITE}"
+                  "[/green]")
+
+    write_file(SELFSTEAL_NGINX,
+               selfsteal_nginx_conf(domain, cert, key, _nginx_http2_syntax()))
+    if os.path.islink(SELFSTEAL_NGINX_LINK) or os.path.exists(SELFSTEAL_NGINX_LINK):
+        os.unlink(SELFSTEAL_NGINX_LINK)
+    os.symlink(SELFSTEAL_NGINX, SELFSTEAL_NGINX_LINK)
+
+    # Дефолтный сайт nginx слушает 80-й порт, а он нужен свободным: продление
+    # сертификата идёт тем же standalone-способом, что и выпуск. Наш server
+    # слушает только петлю, так что 80-й не занимает никто.
+    default_link = "/etc/nginx/sites-enabled/default"
+    if os.path.islink(default_link) or os.path.exists(default_link):
+        os.unlink(default_link)
+        console.print("[dim]Сайт nginx по умолчанию отключён — 80-й порт "
+                      "оставлен свободным для продления сертификата[/dim]")
+
+    test = probe(["nginx", "-t"])
+    if test.returncode != 0:
+        raise RuntimeError("nginx отверг конфигурацию:\n"
+                           + (test.stderr or test.stdout).strip())
+    run(["systemctl", "enable", "nginx"], check=False)
+    run(["systemctl", "restart", "nginx"])
+
+    # Проверяем то же, что проверяет Reality: TLS 1.3, h2 и X25519 у сайта,
+    # на который будет уходить рукопожатие
+    probe_result = _probe_reality_sni_at("127.0.0.1", SELFSTEAL_PORT, domain)
+    if probe_result["ok"]:
+        console.print("[green]✓ Локальный сайт отвечает: TLS 1.3, h2, X25519"
+                      "[/green]")
+    else:
+        console.print("[yellow]Локальный сайт поднялся, но проверка не прошла "
+                      f"({probe_result['error'] or 'нет h2/TLS 1.3'}). "
+                      "Reality будет работать хуже — посмотрите "
+                      "`nginx -t` и журнал nginx.[/yellow]")
+
+    private_key, public_key = reality_keypair()
+    if not private_key:
+        console.print("[yellow]Ключи Reality от xray получить не удалось — "
+                      "в заготовке останутся пустые поля. Выполните "
+                      "docker exec remnanode xray x25519 и подставьте.[/yellow]")
+    short_ids = ["", secrets.token_hex(4)]
+
+    os.makedirs(INSTALL_DIR, exist_ok=True)
+    write_file(SELFSTEAL_REFERENCE,
+               selfsteal_inbound_reference(domain, private_key, public_key,
+                                           short_ids))
+    console.print(f"[green]✓ Заготовка inbound: {SELFSTEAL_REFERENCE}[/green]")
+    if public_key:
+        console.print(f"[dim]publicKey для клиентов: {public_key}[/dim]")
+
+    console.print(
+        "[bold yellow]Важно:[/bold yellow] в панели добавьте inbound из "
+        f"{SELFSTEAL_REFERENCE} (удалив поля с подчёркиванием) и заведите Host "
+        f"с доменом {domain}. Порт 443 у ноды один: если там уже стоит другой "
+        "inbound с Reality, замените его или переведите этот на другой порт.")
+
+
+def ask_selfsteal_params() -> tuple[str, dict | None] | None:
+    """Домен для self-steal. Он же станет SNI, поэтому спрашивается заранее."""
+    console.print("[dim]Self-steal прячет ноду за сайтом, который стоит на ней "
+                  "же. Нужен свой домен с A-записью на этот сервер.[/dim]")
+    existing = letsencrypt_domains()
+    if existing:
+        choices = [*existing, "Другой домен"]
+        choice = questionary.select(
+            "Домен для self-steal (сертификат уже есть):",
+            choices=choices, style=CUSTOM_STYLE).ask()
+        if choice is None:
+            return None
+        if choice != "Другой домен":
+            return choice, None
+
+    raw = questionary.text(
+        "Домен для self-steal (A-запись должна указывать на этот сервер).\n"
+        "  Enter — пропустить блок.\n"
+        "  Домен:",
+        default="", style=CUSTOM_STYLE).ask()
+    if not raw:
+        return None
+    domain = normalize_domain(raw)
+    if domain is None:
+        console.print(f"[red]«{raw.strip()}» не похож на доменное имя.[/red]")
+        return None
+    acme = ask_acme_provider()
+    return None if acme is None else (domain, acme)
 
 # ------------------------------------------------------------------ #
 # WARP: чистый egress для сервисов, режущих IP дата-центров
@@ -3982,6 +4274,7 @@ BLOCKS = [
     ("node_update", "Обновление remnanode (docker compose pull + пересоздание)", block_node_update),
     ("hysteria", "Hysteria2 (QUIC): сертификаты в /dev/shm + 443/udp + автообновление", block_hysteria),
     ("grpc", "VLESS gRPC + Reality: второй транспорт на отдельном порту", block_grpc),
+    ("selfsteal", "Self-steal: сайт-маскировка на самой ноде + Reality", block_selfsteal),
     ("warp", "WARP: чистый egress для нейросетей (Gemini, ChatGPT) и стримингов", block_warp),
     ("psiphon", "Psiphon: альтернативный egress, если WARP не помог", block_psiphon),
     ("torrent", "Блокировка торрентов (tblocker + egress-фильтр + конфиг панели)", block_torrent),
@@ -4003,7 +4296,7 @@ INSTALLS_PACKAGES = {"packages", "node_install", "fail2ban", "ufw",
 # Блоки, которые по умолчанию идут БЕЗ галочки, даже если ещё не настроены.
 # Hysteria2 — дополнительный транспорт: он нужен не всем, требует сертификата
 # и ручной настройки inbound'а в панели, поэтому включается осознанно.
-DEFAULT_OFF = {"hysteria", "grpc", "warp", "psiphon"}
+DEFAULT_OFF = {"hysteria", "grpc", "selfsteal", "warp", "psiphon"}
 
 # Блоки, у которых при уже выполненной установке пункт меняет смысл на
 # противоположный: ставить нечего, а снять — единственное, что осталось.
@@ -4078,6 +4371,10 @@ def _detect_grpc() -> bool:
     return os.path.isfile(GRPC_REFERENCE)
 
 
+def _detect_selfsteal() -> bool:
+    return os.path.isfile(SELFSTEAL_NGINX) and os.path.isfile(SELFSTEAL_REFERENCE)
+
+
 def _detect_warp() -> bool:
     r = probe(["docker", "inspect", "-f", "{{.State.Running}}", WARP_CONTAINER])
     return r.returncode == 0 and r.stdout.strip() == "true"
@@ -4106,6 +4403,7 @@ DETECTORS = {
     "remnanode_logs": _detect_remnanode_logs,
     "hysteria":       _detect_hysteria,
     "grpc":           _detect_grpc,
+    "selfsteal":      _detect_selfsteal,
     "warp":           _detect_warp,
     "psiphon":        _detect_psiphon,
     "torrent":        _detect_torrent,
@@ -4371,6 +4669,12 @@ def menu_remnawave_node() -> None:
     hysteria_params: tuple[str, dict | None] | None = None
     if "hysteria" in selected:
         hysteria_params = ask_hysteria_params()
+
+    selfsteal_params: tuple[str, dict | None] | None = None
+    if "selfsteal" in selected:
+        selfsteal_params = ask_selfsteal_params()
+        if selfsteal_params is None:
+            selected = [k for k in selected if k != "selfsteal"]
 
     ipv6_mode = "keep"
     if "network" in selected:
