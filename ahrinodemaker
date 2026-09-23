@@ -3040,8 +3040,11 @@ def ask_selfsteal_params() -> tuple[str, dict | None] | None:
     if domain is None:
         console.print(f"[red]«{raw.strip()}» не похож на доменное имя.[/red]")
         return None
-    acme = ask_acme_provider()
-    return None if acme is None else (domain, acme)
+    # УЦ и почту здесь не спрашиваем. Self-steal прячет ноду за обычным с виду
+    # сайтом, и Let's Encrypt для этого подходит без оговорок: он не требует ни
+    # e-mail, ни EAB-ключей, ставится молча и продлевается сам. Выбор
+    # удостоверяющего центра остаётся в блоках, где он осмыслен.
+    return domain, None
 
 # ------------------------------------------------------------------ #
 # WARP: чистый egress для сервисов, режущих IP дата-центров
