@@ -2937,8 +2937,9 @@ def block_selfsteal(params: tuple[str, dict | None] | None = None) -> None:
     step("Self-steal: локальный сайт + Reality на него")
     domain, acme = params if params else (None, None)
     if not domain:
-        console.print("[yellow]Домен не задан — блок пропущен.[/yellow]")
-        return
+        # Пустой домен здесь означает сбой в передаче параметров, а не
+        # осознанный отказ: отказ от блока отсеивается ещё в меню.
+        raise RuntimeError("домен для self-steal не задан — блок не выполнен")
 
     cert, key = _cert_paths(domain)
     if not (os.path.isfile(cert) and os.path.isfile(key)):
@@ -4792,6 +4793,8 @@ def menu_remnawave_node() -> None:
                 func(node_params)
             elif key == "hysteria":
                 func(hysteria_params)
+            elif key == "selfsteal":
+                func(selfsteal_params)
             elif egress_present.get(key):
                 EGRESS_REMOVERS[key][1]()
             elif key == "warp":
