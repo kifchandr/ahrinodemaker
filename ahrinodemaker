@@ -2782,17 +2782,41 @@ SELFSTEAL_REFERENCE = f"{INSTALL_DIR}/panel-selfsteal-inbound.json"
 # Заготовки для случайного сайта. Пустая страница или одинаковый у всех шаблон
 # сам по себе примета, поэтому содержимое собирается из кусочков: у каждой ноды
 # получается свой сайт со своим названием, цветами и текстом.
+#
+# Разъезжаться при этом должны не столько названия, сколько то, что иначе
+# осталось бы общим у всех нод: разметка, стили и служебные фразы. Название и
+# палитра меняют несколько сотен байт, а одинаковый блок CSS или одна и та же
+# фраза «Раздел в работе» — это готовая сигнатура, по которой ищут не отдельный
+# сервер, а сразу всю сеть.
 SITE_KINDS = [
-    ("studio", "{name} Studio", "Дизайн и разработка цифровых продуктов",
-     ["Услуги", "Работы", "О студии", "Контакты"]),
-    ("consulting", "{name} Consulting", "Консалтинг для растущих команд",
-     ["Направления", "Кейсы", "Команда", "Связаться"]),
-    ("labs", "{name} Labs", "Инженерные решения и исследования",
-     ["Проекты", "Технологии", "Публикации", "Контакты"]),
-    ("logistics", "{name} Logistics", "Перевозки и складская логистика",
-     ["Маршруты", "Тарифы", "Отслеживание", "Контакты"]),
-    ("clinic", "{name} Care", "Медицинский центр полного цикла",
-     ["Направления", "Врачи", "Цены", "Запись"]),
+    ("studio", "{name} Studio",
+     ["Дизайн и разработка цифровых продуктов",
+      "Продуктовый дизайн, фронтенд и аналитика",
+      "Небольшая студия полного цикла"],
+     ["Услуги", "Работы", "Процесс", "О студии", "Команда", "Блог",
+      "Контакты"]),
+    ("consulting", "{name} Consulting",
+     ["Консалтинг для растущих команд",
+      "Управленческий консалтинг и аудит процессов",
+      "Помогаем выстроить операционную работу"],
+     ["Направления", "Кейсы", "Подход", "Команда", "Отрасли", "Связаться"]),
+    ("labs", "{name} Labs",
+     ["Инженерные решения и исследования",
+      "Прикладные исследования и прототипы",
+      "Лаборатория промышленной автоматизации"],
+     ["Проекты", "Технологии", "Публикации", "Лаборатория", "Партнёры",
+      "Контакты"]),
+    ("logistics", "{name} Logistics",
+     ["Перевозки и складская логистика",
+      "Доставка сборных грузов по Европе",
+      "Складские и транспортные услуги"],
+     ["Маршруты", "Тарифы", "Отслеживание", "Склады", "Документы",
+      "Контакты"]),
+    ("clinic", "{name} Care",
+     ["Медицинский центр полного цикла",
+      "Семейная клиника и диагностика",
+      "Амбулаторная помощь и профосмотры"],
+     ["Направления", "Врачи", "Цены", "Диагностика", "Отзывы", "Запись"]),
 ]
 SITE_NAMES = ["Northwind", "Blueport", "Silverline", "Ironwood", "Brightfield",
               "Cedarhill", "Redstone", "Lakeview", "Foxglove", "Highgate",
@@ -2800,61 +2824,182 @@ SITE_NAMES = ["Northwind", "Blueport", "Silverline", "Ironwood", "Brightfield",
 SITE_PALETTES = [("#0f172a", "#38bdf8"), ("#1f2937", "#f59e0b"),
                  ("#14532d", "#86efac"), ("#3b0764", "#c4b5fd"),
                  ("#7f1d1d", "#fca5a5"), ("#0c4a6e", "#7dd3fc")]
+SITE_FONTS = ["system-ui, sans-serif",
+              "'Segoe UI', Roboto, Helvetica, Arial, sans-serif",
+              "ui-sans-serif, system-ui, -apple-system, sans-serif",
+              "Inter, system-ui, Arial, sans-serif"]
+# Абзацы-заполнители. Их заметно больше, чем нужно одной странице: одинаковый
+# текст на каждой ноде ловится обычным поиском подстроки, без всякого анализа.
+SITE_PARAGRAPHS = [
+    "Раздел в работе. Напишите нам, и мы ответим в течение рабочего дня.",
+    "Мы обновляем эту страницу. Пока что о деталях проще спросить напрямую.",
+    "Подробности высылаем по запросу — оставьте контакты, и мы свяжемся.",
+    "Здесь скоро появится подробное описание. Вопросы принимаем по почте.",
+    "Материал готовится к публикации. Условия уточняйте у менеджера.",
+    "Работаем по будням с девяти до восемнадцати. Заявки принимаем и в выходные.",
+    "Каждый запрос разбираем отдельно: типовых решений у нас немного.",
+    "Сроки и стоимость зависят от объёма — посчитаем после короткого разговора.",
+    "Опыт команды — больше десяти лет в отрасли, рекомендации предоставим.",
+    "Договор, закрывающие документы и гарантия на работы обязательны.",
+    "Поддержку ведём и после сдачи проекта, отдельной строкой в смете.",
+    "Часть работ выполняем у себя, часть — на площадке заказчика.",
+]
 
 
-def generate_site(domain: str) -> tuple[str, str]:
-    """Случайная одностраничка. Возвращает (заголовок, html)."""
-    _, title_tpl, tagline, sections = secrets.choice(SITE_KINDS)
+def _rand_word(min_len: int = 3, max_len: int = 6) -> str:
+    """Короткое имя для класса или идентификатора: одинаковые селекторы у всех
+    нод читаются ровно так же легко, как одинаковый текст."""
+    letters = "abcdefghijklmnopqrstuvwxyz"
+    length = min_len + secrets.randbelow(max_len - min_len + 1)
+    return "".join(secrets.choice(letters) for _ in range(length))
+
+
+def _jitter(base: int, spread: int) -> int:
+    """Число около base. Нужно, чтобы у страниц не совпадали ни значения в
+    стилях, ни итоговая длина ответа."""
+    return base - spread + secrets.randbelow(spread * 2 + 1)
+
+
+def _pick(pool: list, count: int) -> list:
+    """Выборка без повторов. random.sample тянул бы глобальный ГПСЧ, а весь
+    остальной выбор здесь идёт через secrets."""
+    rest = list(pool)
+    picked = []
+    for _ in range(min(count, len(rest))):
+        picked.append(rest.pop(secrets.randbelow(len(rest))))
+    return picked
+
+
+def generate_site(domain: str) -> tuple[str, dict[str, str]]:
+    """Случайная одностраничка. Возвращает (заголовок, {имя файла: содержимое}).
+
+    Две ноды не должны совпасть ни хэшем страницы, ни её длиной, ни набором
+    строк, по которым её найдёт регулярка. Поэтому наугад выбирается не только
+    название с палитрой, но и число разделов, тексты, имена классов, числа в
+    стилях и даже способ их записи.
+    """
+    _, title_tpl, taglines, section_pool = secrets.choice(SITE_KINDS)
     title = title_tpl.format(name=secrets.choice(SITE_NAMES))
+    tagline = secrets.choice(taglines)
     bg, accent = secrets.choice(SITE_PALETTES)
-    year = 2019 + secrets.randbelow(6)
-    nav = "\n".join(f'      <a href="#{i}">{s}</a>'
+    now = int(time.strftime("%Y"))
+    year = now - 7 + secrets.randbelow(6)
+
+    # Порядок пунктов оставляем как в заготовке: перемешанное меню, где
+    # «Контакты» оказались посередине, выглядит страннее одинакового.
+    count = 3 + secrets.randbelow(4)
+    sections = [section_pool[i]
+                for i in sorted(_pick(list(range(len(section_pool))), count))]
+
+    tag_cls = _rand_word()
+    sec_id = _rand_word(2, 4)
+    ind = " " * (2 if secrets.randbelow(2) else 4)
+    width = _jitter(900, 120)
+    side = _jitter(24, 8)
+
+    css_rules = [
+        (":root", [f"--bg: {bg}", f"--accent: {accent}"]),
+        ("*", ["box-sizing: border-box"]),
+        ("body", ["margin: 0",
+                  f"font: {_jitter(16, 1)}px/1.{5 + secrets.randbelow(4)} "
+                  f"{secrets.choice(SITE_FONTS)}",
+                  "color: #e5e7eb", "background: var(--bg)"]),
+        ("header", [f"padding: {_jitter(64, 12)}px {side}px {_jitter(32, 8)}px",
+                    f"max-width: {width}px", "margin: 0 auto"]),
+        ("h1", [f"font-size: 2.{secrets.randbelow(6)}rem",
+                f"margin: 0 0 {_jitter(8, 3)}px"]),
+        (f".{tag_cls}", ["color: var(--accent)",
+                         f"font-size: 1.{secrets.randbelow(4)}rem"]),
+        ("nav", ["display: flex", f"gap: {_jitter(20, 6)}px", "flex-wrap: wrap",
+                 f"padding: 0 {side}px", f"max-width: {width}px",
+                 f"margin: 0 auto {_jitter(32, 8)}px"]),
+        ("nav a", ["color: #cbd5e1", "text-decoration: none",
+                   "border-bottom: 1px solid transparent"]),
+        ("nav a:hover", ["border-color: var(--accent)"]),
+        ("main", [f"max-width: {width}px", "margin: 0 auto",
+                  f"padding: 0 {side}px {_jitter(64, 16)}px"]),
+        ("section", [f"padding: {_jitter(24, 8)}px 0",
+                     "border-top: 1px solid "
+                     f"rgba(255,255,255,.0{1 + secrets.randbelow(9)})"]),
+        ("h2", [f"font-size: 1.{1 + secrets.randbelow(4)}rem",
+                f"margin: 0 0 {_jitter(8, 3)}px", "color: var(--accent)"]),
+        ("footer", [f"padding: {_jitter(24, 6)}px", "text-align: center",
+                    "color: #94a3b8", f"font-size: .{_jitter(90, 6)}rem"]),
+    ]
+    # Одни сайты пишут правило в строку, другие разбивают по объявлениям.
+    # Разный способ записи ломает сравнение по кускам текста надёжнее, чем
+    # разные числа внутри одинаковой болванки.
+    if secrets.randbelow(2):
+        css = "\n".join(ind + sel + " { " + "; ".join(decls) + "; }"
+                        for sel, decls in css_rules)
+    else:
+        css = "\n".join(
+            ind + sel + " {\n"
+            + "".join(f"{ind * 2}{d};\n" for d in decls)
+            + ind + "}"
+            for sel, decls in css_rules)
+
+    nav = "\n".join(f'{ind * 2}<a href="#{sec_id}{i}">{s}</a>'
                     for i, s in enumerate(sections, 1))
-    blocks = "\n".join(
-        f'    <section id="{i}">\n      <h2>{s}</h2>\n'
-        f'      <p>Раздел в работе. Напишите нам, и мы ответим в течение '
-        f'рабочего дня.</p>\n    </section>'
-        for i, s in enumerate(sections, 1))
-    html = f"""<!doctype html>
+    pool = _pick(SITE_PARAGRAPHS, len(sections) * 2)
+    blocks = []
+    for i, name in enumerate(sections, 1):
+        chunk = pool[(i - 1) * 2:(i - 1) * 2 + 1 + secrets.randbelow(2)]
+        body = "\n".join(f"{ind * 3}<p>{p}</p>" for p in chunk)
+        blocks.append(f'{ind * 2}<section id="{sec_id}{i}">\n'
+                      f"{ind * 3}<h2>{name}</h2>\n{body}\n{ind * 2}</section>")
+
+    doctype = secrets.choice(["<!doctype html>", "<!DOCTYPE html>"])
+    description = (f'\n<meta name="description" content="{tagline}">'
+                   if secrets.randbelow(2) else "")
+    footer = secrets.choice([f"© {year}–{now} {title} · {domain}",
+                             f"{title}, {year}–{now}. {domain}",
+                             f"© {title} · {domain}"])
+    body_html = "\n".join(blocks)
+    html = f"""{doctype}
 <html lang="ru">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1">{description}
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <title>{title}</title>
 <style>
-  :root {{ --bg: {bg}; --accent: {accent}; }}
-  * {{ box-sizing: border-box; }}
-  body {{ margin: 0; font: 16px/1.6 system-ui, sans-serif;
-         color: #e5e7eb; background: var(--bg); }}
-  header {{ padding: 64px 24px 32px; max-width: 900px; margin: 0 auto; }}
-  h1 {{ font-size: 2.2rem; margin: 0 0 8px; }}
-  .tagline {{ color: var(--accent); font-size: 1.1rem; }}
-  nav {{ display: flex; gap: 20px; flex-wrap: wrap; padding: 0 24px;
-         max-width: 900px; margin: 0 auto 32px; }}
-  nav a {{ color: #cbd5e1; text-decoration: none; border-bottom: 1px solid transparent; }}
-  nav a:hover {{ border-color: var(--accent); }}
-  main {{ max-width: 900px; margin: 0 auto; padding: 0 24px 64px; }}
-  section {{ padding: 24px 0; border-top: 1px solid rgba(255,255,255,.08); }}
-  h2 {{ font-size: 1.2rem; margin: 0 0 8px; color: var(--accent); }}
-  footer {{ padding: 24px; text-align: center; color: #94a3b8; font-size: .9rem; }}
+{css}
 </style>
 </head>
 <body>
-  <header>
-    <h1>{title}</h1>
-    <div class="tagline">{tagline}</div>
-  </header>
-  <nav>
+{ind}<header>
+{ind * 2}<h1>{title}</h1>
+{ind * 2}<div class="{tag_cls}">{tagline}</div>
+{ind}</header>
+{ind}<nav>
 {nav}
-  </nav>
-  <main>
-{blocks}
-  </main>
-  <footer>© {year}–2026 {title} · {domain}</footer>
+{ind}</nav>
+{ind}<main>
+{body_html}
+{ind}</main>
+{ind}<footer>{footer}</footer>
 </body>
 </html>
 """
-    return title, html
+
+    # Отсутствующие favicon и robots.txt — сами по себе мелкая странность:
+    # настоящий сайт отдаёт и то, и другое, а не пару 404 подряд.
+    box = _jitter(64, 16)
+    favicon = (f'<svg xmlns="http://www.w3.org/2000/svg" '
+               f'viewBox="0 0 {box} {box}">'
+               f'<rect width="{box}" height="{box}" '
+               f'rx="{_jitter(10, 6)}" fill="{bg}"/>'
+               f'<text x="50%" y="{_jitter(68, 4)}%" text-anchor="middle" '
+               f'font-family="sans-serif" font-size="{box // 2}" '
+               f'fill="{accent}">{title[0]}</text></svg>\n')
+    robots = secrets.choice([
+        "User-agent: *\nDisallow:\n",
+        "User-agent: *\nAllow: /\n",
+        f"User-agent: *\nDisallow:\nCrawl-delay: {1 + secrets.randbelow(9)}\n",
+    ])
+    return title, {"index.html": html, "favicon.svg": favicon,
+                   "robots.txt": robots}
 
 
 def _nginx_http2_syntax() -> str:
@@ -2953,8 +3098,9 @@ def block_selfsteal(params: tuple[str, dict | None] | None = None) -> None:
     ensure_packages("nginx")
 
     os.makedirs(SELFSTEAL_SITE, exist_ok=True)
-    title, html = generate_site(domain)
-    write_file(f"{SELFSTEAL_SITE}/index.html", html)
+    title, files = generate_site(domain)
+    for name, content in files.items():
+        write_file(f"{SELFSTEAL_SITE}/{name}", content)
     console.print(f"[green]✓ Сайт сгенерирован: «{title}» в {SELFSTEAL_SITE}"
                   "[/green]")
 
