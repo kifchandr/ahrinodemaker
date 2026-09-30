@@ -72,6 +72,9 @@ TIMEZONE = "Europe/Moscow"
 # не хранится: он спрашивается при настройке UFW либо передаётся аргументом
 # --panel-ip, чтобы скрипт не нёс в себе сведений о чужой инфраструктуре.
 PANEL_PORT = "2222"
+# Дефолт агента сменился на 3000; держим оба, чтобы файрвол не отрезал панель
+# от ноды, поставленной на новый порт (см. detect_node_port).
+NODE_ALT_PORT = "3000"
 
 # ------------------------------------------------------------------ #
 # Сторонние скрипты: зафиксированные копии (vendoring)
@@ -511,6 +514,7 @@ BIN_PACKAGES = {
     "ss": ("iproute2",),
     "ip": ("iproute2",),
     "iperf3": ("iperf3",),
+    "logrotate": ("logrotate",),
 }
 
 
@@ -812,6 +816,56 @@ def detect_ssh_ports() -> list[int]:
     return parse_ssh_ports(sshd_config, socket_listen, sockets)
 
 
+def detect_node_port() -> list[str]:
+    """Порты, на которых слушает агент ноды. Пустой список — не определили.
+
+    Константе здесь доверять нельзя: дефолтный порт агента у Remnawave
+    сменился с 2222 на 3000, и нода, поставленная на новый порт, при старых
+    правилах файрвола просто исчезает из панели — без ошибки, без записи в
+    журнале. Поэтому спрашиваем саму ноду, по убыванию достоверности:
+    переменная запущенного контейнера, затем compose (работает и при
+    остановленном контейнере), затем живые сокеты."""
+    ports: list[str] = []
+
+    def add(value: str) -> None:
+        value = value.strip().strip('"').strip("'")
+        if value.isdigit() and value not in ports:
+            ports.append(value)
+
+    # 1. Запущенный контейнер — источник правды: агент поднят именно с этим
+    #    значением, что бы ни лежало в файлах.
+    if shutil.which("docker"):
+        r = probe(["docker", "inspect", "-f",
+                   "{{range .Config.Env}}{{println .}}{{end}}", "remnanode"])
+        if r.returncode == 0:
+            for line in r.stdout.splitlines():
+                if line.startswith("NODE_PORT="):
+                    add(line.split("=", 1)[1])
+
+    # 2. compose: контейнер мог быть остановлен или пересоздаваться прямо сейчас
+    if not ports:
+        for path in find_compose_candidates():
+            try:
+                with open(path, encoding="utf-8", errors="replace") as f:
+                    text = f.read()
+            except OSError:
+                continue
+            for m in re.finditer(r"NODE_PORT\s*[=:]\s*[\"']?(\d+)", text):
+                add(m.group(1))
+            if ports:
+                break
+
+    # 3. Живые сокеты. Имя процесса агента — rw-node; сверяемся по нему, иначе
+    #    в выборку попадёт любой слушатель на похожем порту.
+    if not ports:
+        for line in probe(["ss", "-lntpH"]).stdout.splitlines():
+            if "rw-node" in line:
+                m = re.search(r":(\d+)\s", line)
+                if m:
+                    add(m.group(1))
+    return ports
+
+
 def block_ufw(extra_ports: list[str], panel_ip: str | None = None) -> None:
     step("Настройка UFW (firewall)")
     ensure_packages("ufw")
@@ -833,16 +887,39 @@ def block_ufw(extra_ports: list[str], panel_ip: str | None = None) -> None:
     for port in ("80/tcp", "443/tcp", "8443/tcp", "9999/tcp"):
         run(["ufw", "allow", port])
 
-    # Порт, по которому панель управляет нодой. Адрес панели в коде не зашит:
-    # он спрашивается при настройке или передаётся аргументом --panel-ip.
+    # Порт, по которому панель управляет нодой, берём по факту, а не из
+    # константы. Дефолт агента у Remnawave сменился с 2222 на 3000, и открытый
+    # «не тот» порт — это не отказ, а тишина: панель просто перестаёт видеть
+    # ноду, а причину ищут в панели, а не в файрволе.
+    node_ports = detect_node_port()
+    if node_ports:
+        console.print("[green]Порт агента ноды определён: "
+                      + ", ".join(node_ports) + "[/green]")
+        if PANEL_PORT not in node_ports:
+            console.print(
+                f"[yellow]Ожидался {PANEL_PORT}, а агент слушает "
+                + ", ".join(node_ports) + " — открываю фактический. Убедитесь, "
+                "что в панели у этой ноды указан он же.[/yellow]")
+    else:
+        # Контейнер может быть остановлен, а compose — лежать не там, где ищем.
+        # Открыть лишний порт дешевле, чем отрезать панель от ноды.
+        node_ports = [PANEL_PORT, NODE_ALT_PORT]
+        console.print(
+            "[yellow]Порт агента определить не удалось (контейнер остановлен?) "
+            "— открываю оба известных дефолта: "
+            + ", ".join(node_ports) + ".[/yellow]")
+    for port in node_ports:
+        if panel_ip:
+            run(["ufw", "allow", "from", panel_ip, "to", "any",
+                 "port", port, "proto", "tcp"])
+        else:
+            run(["ufw", "allow", f"{port}/tcp"])
+    listed = ", ".join(node_ports)
     if panel_ip:
-        run(["ufw", "allow", "from", panel_ip, "to", "any",
-             "port", PANEL_PORT, "proto", "tcp"])
-        console.print(f"[green]✓ Порт {PANEL_PORT} открыт только для "
+        console.print(f"[green]✓ Порт {listed} открыт только для "
                       f"{panel_ip}[/green]")
     else:
-        run(["ufw", "allow", f"{PANEL_PORT}/tcp"])
-        console.print(f"[yellow]Порт {PANEL_PORT} открыт для всех адресов. "
+        console.print(f"[yellow]Порт {listed} открыт для всех адресов. "
                       "Ограничить его адресом панели можно, прогнав блок "
                       "заново или запустив скрипт с --panel-ip.[/yellow]")
     # Дополнительные порты, введённые пользователем
@@ -883,12 +960,51 @@ def block_ufw(extra_ports: list[str], panel_ip: str | None = None) -> None:
     console.print("[green]✓ UFW настроен[/green]")
 
 
-def block_conntrack() -> None:
+def _mem_total_mb() -> int:
+    """Оперативная память в МБ. 0 — прочитать не удалось."""
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    return int(line.split()[1]) // 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0
+
+
+# Потолки, масштабируемые от памяти: (тир, буфер сокета, дефолт буфера,
+# conntrack_max, buckets). Фиксированные значения — ошибка в обе стороны:
+# 64 МБ на сокет, помноженные на сотни сокетов, уводят мелкую VPS в OOM, а на
+# машине с 16 ГБ те же 64 МБ оставляют пропускную способность недобранной.
+# Миллион записей conntrack — это ещё около 300 МБ памяти ядра, которые на
+# одногигабайтной ноде под флудом кончатся раньше, чем заполнится таблица.
+RAM_TIERS = (
+    (1200, 1, 16 * 1024 * 1024, 512 * 1024, 262144, 65536),
+    (2500, 2, 32 * 1024 * 1024, 1024 * 1024, 524288, 131072),
+    (8500, 3, 64 * 1024 * 1024, 2 * 1024 * 1024, 1048576, 262144),
+)
+RAM_TIER_TOP = (4, 128 * 1024 * 1024, 2 * 1024 * 1024, 2097152, 524288)
+
+
+def ram_tier() -> tuple[int, int, int, int, int]:
+    """(тир, потолок буфера сокета, дефолт буфера, conntrack_max, buckets)."""
+    mb = _mem_total_mb() or 1024
+    for limit, *values in RAM_TIERS:
+        if mb <= limit:
+            return tuple(values)  # type: ignore[return-value]
+    return RAM_TIER_TOP
+
+
+def block_conntrack(ct_buckets: int = 0) -> None:
     step("Загрузка модуля conntrack")
     run(["modprobe", "nf_conntrack"], check=False)
     write_file("/etc/modules-load.d/nf_conntrack.conf", "nf_conntrack\n")
+    # hashsize задаётся модулю при загрузке и должен соответствовать ёмкости
+    # таблицы из sysctl: мелкая хеш-таблица превращает поиск в обход длинных
+    # цепочек, крупная — зря занимает память ядра на маленькой ноде.
+    ct_buckets = ct_buckets or ram_tier()[4]
     write_file("/etc/modprobe.d/nf_conntrack.conf",
-               "options nf_conntrack hashsize=262144\n")
+               f"options nf_conntrack hashsize={ct_buckets}\n")
     if not os.path.isdir("/proc/sys/net/netfilter"):
         console.print("[yellow]Модуль nf_conntrack не загружен (частая ситуация "
                       "в LXC/OpenVZ) — параметры conntrack будут пропущены.[/yellow]")
@@ -926,19 +1042,37 @@ def ipv6_disabled() -> bool:
         return False        # файла нет — ядро собрано без IPv6, трогать нечего
 
 
-def block_sysctl(ipv6: str = "keep") -> None:
+def block_sysctl(ipv6: str = "keep", sock_max: int = 0, sock_def: int = 0,
+                 ct_max: int = 0, ct_buckets: int = 0) -> None:
     step("Настройка sysctl")
+    tier_sock_max, tier_sock_def, tier_ct_max, tier_ct_buckets = ram_tier()[1:]
+    sock_max = sock_max or tier_sock_max
+    sock_def = sock_def or tier_sock_def
+    ct_max = ct_max or tier_ct_max
+    ct_buckets = ct_buckets or tier_ct_buckets
     sysctl_conf = """# --- IPv6 / forwarding ---
-""" + IPV6_SYSCTL.get(ipv6, "") + """net.ipv4.ip_forward = 1
+""" + IPV6_SYSCTL.get(ipv6, "") + f"""net.ipv4.ip_forward = 1
 # --- TCP congestion control + qdisc ---
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 net.ipv4.tcp_fastopen = 3
-# --- Буферы сокетов (большие — для высокой пропускной способности VPN) ---
-net.core.rmem_max = 67108864
-net.core.wmem_max = 67108864
-net.ipv4.tcp_rmem = 4096 1048576 33554432
-net.ipv4.tcp_wmem = 4096 1048576 33554432
+# После простоя не начинать заново с медленного старта: у прокси потоки
+# паузятся постоянно, и каждый раз заново разгоняться незачем.
+net.ipv4.tcp_slow_start_after_idle = 0
+# --- Буферы сокетов (потолки масштабированы по объёму памяти) ---
+net.core.rmem_default = {sock_def}
+net.core.wmem_default = {sock_def}
+net.core.rmem_max = {sock_max}
+net.core.wmem_max = {sock_max}
+net.core.optmem_max = 65536
+net.ipv4.tcp_rmem = 4096 1048576 {sock_max}
+net.ipv4.tcp_wmem = 4096 1048576 {sock_max}
+# --- UDP: QUIC-транспорты (Hysteria2, TUIC) ---
+# Потолок берётся из rmem_max выше, здесь — нижняя граница на сокет. На
+# дефолтах ядра объёмный UDP-поток теряет пакеты в приёмной очереди, и
+# видно это только по счётчику RcvbufErrors в /proc/net/snmp.
+net.ipv4.udp_rmem_min = 16384
+net.ipv4.udp_wmem_min = 16384
 # --- Keepalive ---
 net.ipv4.tcp_keepalive_time = 300
 net.ipv4.tcp_keepalive_intvl = 15
@@ -949,12 +1083,27 @@ net.core.netdev_max_backlog = 16384
 net.core.somaxconn = 65535
 net.ipv4.tcp_max_syn_backlog = 8192
 net.ipv4.tcp_notsent_lowat = 16384
+# Сколько пакетов softirq разбирает за один проход (дефолт 300). На высоком
+# PPS бюджет упирается в потолок раньше, чем в процессор, и пакеты копятся
+# в очереди устройства.
+net.core.netdev_budget = 600
+net.core.netdev_budget_usecs = 8000
+# Таблица flow-привязок для RPS; per-queue маски ставит отдельный юнит.
+net.core.rps_sock_flow_entries = 32768
+# --- Исходящие соединения ---
+# Нода сама открывает наружу много коннектов; стандартные ~28 тысяч
+# эфемерных портов на загруженном сервере кончаются.
+net.ipv4.ip_local_port_range = 10000 65535
 # --- Защита и переиспользование TCP ---
 net.ipv4.tcp_syncookies = 1
 net.ipv4.tcp_tw_reuse = 1
+# rp_filter=2 (loose), а не strict: у ноды в network_mode host маршрутизация
+# часто асимметричная, и strict отбрасывает законный трафик.
+net.ipv4.conf.all.rp_filter = 2
+net.ipv4.conf.default.rp_filter = 2
 # --- Conntrack (требует загруженного модуля nf_conntrack) ---
-net.netfilter.nf_conntrack_max = 1048576
-net.netfilter.nf_conntrack_buckets = 262144
+net.netfilter.nf_conntrack_max = {ct_max}
+net.netfilter.nf_conntrack_buckets = {ct_buckets}
 net.netfilter.nf_conntrack_tcp_timeout_established = 600
 net.netfilter.nf_conntrack_tcp_timeout_time_wait = 30
 net.netfilter.nf_conntrack_tcp_timeout_close_wait = 30
@@ -1185,6 +1334,47 @@ NODE_LOGROTATE_CONF = """/var/log/remnanode/*.log {
 """
 
 
+
+# Ротация по расписанию дистрибутива запускается раз в сутки, а `maxsize`
+# проверяется только в момент запуска. То есть кап в 300 МБ — это не потолок
+# файла, а потолок на момент проверки: между прогонами access.log на живой
+# ноде успевает вырасти кратно больше и лимит просто проскакивает. Отдельный
+# часовой таймер закрывает именно этот зазор.
+#
+# Гоняем системный конфиг целиком и с его же файлом состояния: остальные
+# стансы привязаны ко времени (daily/weekly), поэтому для них часовой прогон —
+# пустая работа, а стансы с maxsize ротируются досрочно, как и задумано.
+# Свой файл состояния здесь означал бы двойной учёт одних и тех же логов.
+LOGROTATE_SERVICE_PATH = "/etc/systemd/system/ahrinode-logrotate.service"
+LOGROTATE_TIMER_PATH = "/etc/systemd/system/ahrinode-logrotate.timer"
+
+LOGROTATE_SERVICE = """[Unit]
+Description=Hourly logrotate pass (ahrinodemaker)
+Documentation=man:logrotate(8)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/logrotate /etc/logrotate.conf
+"""
+
+LOGROTATE_TIMER = """[Unit]
+Description=Hourly logrotate pass (ahrinodemaker)
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=1h
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target
+"""
+
+# Журнал systemd на дефолтах занимает до 10% раздела. На небольшом диске это
+# и есть та самая нехватка места, которая ломает не журнал, а всё остальное:
+# контейнеры перестают писать логи, а certbot не может обновить сертификат.
+JOURNALD_CONF_PATH = "/etc/systemd/journald.conf.d/99-ahrinode.conf"
+
+
 def write_logrotate_config() -> None:
     """Настраивает ротацию логов ноды.
 
@@ -1192,17 +1382,45 @@ def write_logrotate_config() -> None:
     то есть гарантированно порождает растущие логи. Оставлять их без уборки
     в другом блоке значило бы отдавать сервер с миной замедленного действия —
     на заметном трафике access.log забивает диск."""
+    # На минимальных образах logrotate не установлен, и станса лежала бы
+    # мёртвым грузом: файл есть, ротации нет.
+    ensure_tools("logrotate")
     write_file(NODE_LOGROTATE_PATH, NODE_LOGROTATE_CONF)
     console.print(f"[green]✓ Ротация логов настроена: {NODE_LOGROTATE_PATH}[/green]")
 
+    write_file(LOGROTATE_SERVICE_PATH, LOGROTATE_SERVICE)
+    write_file(LOGROTATE_TIMER_PATH, LOGROTATE_TIMER)
+    run(["systemctl", "daemon-reload"], check=False)
+    if run(["systemctl", "enable", "--now", "ahrinode-logrotate.timer"],
+           check=False).returncode == 0:
+        console.print("[green]✓ Часовая проверка размера логов включена "
+                      "(ahrinode-logrotate.timer)[/green]")
+    else:
+        console.print("[yellow]Таймер ротации включить не удалось — кап "
+                      "maxsize будет проверяться только раз в сутки.[/yellow]")
+
+
+def cap_journald() -> None:
+    """Ограничивает размер журнала systemd."""
+    # Мелкой ноде обычно достаётся и мелкий диск, поэтому кап меньше.
+    cap_mb = 256 if ram_tier()[0] <= 2 else 512
+    write_file(JOURNALD_CONF_PATH, f"""[Journal]
+SystemMaxUse={cap_mb}M
+SystemMaxFileSize={cap_mb // 8}M
+""")
+    run(["systemctl", "restart", "systemd-journald"], check=False)
+    console.print(f"[green]✓ Журнал systemd ограничен {cap_mb} МБ[/green]")
+
 
 def block_remnanode_logs(compose_path: str | None) -> None:
-    step("Логи remnanode: каталог + logrotate + docker volume")
+    step("Логи remnanode: каталог, ротация с часовым таймером, кап журнала, volume")
     # 1. Каталог и файлы логов (та же подготовка, что и при установке ноды)
     prepare_node_logs()
     # 2. logrotate
     write_logrotate_config()
-    # 3. Volume в docker-compose.yml ноды
+    # 3. Кап журнала systemd — та же нехватка места, только с другой стороны
+    cap_journald()
+    # 4. Volume в docker-compose.yml ноды
     if not compose_path:
         # Путь спрашивается до выполнения блоков, а нода могла быть установлена
         # только что блоком node_install — тогда compose появился уже после.
@@ -4380,9 +4598,153 @@ def block_torrent() -> None:
 
 
 # --- Объединённые блоки ---
+# ------------------------------------------------------------------ #
+# RPS/RFS/XPS: приём пакетов раскидывается по всем ядрам
+# ------------------------------------------------------------------ #
+# На virtio-сетевке с одной очередью весь RX-softirq обрабатывает cpu0. Сколько
+# бы ядер ни было у машины, потолок по пакетам в секунду определяет именно это
+# одно ядро, и упирается в него нода задолго до того, как кончится полоса.
+#
+# Разложено в отдельный юнит, а не в sysctl: маски пишутся в
+# /sys/class/net/<nic>/queues/*, то есть их надо ставить заново после каждой
+# загрузки и после переименования интерфейса.
+#
+# Логика ожидания маршрута взята из node-accelerator (MIT, jestivald) — там она
+# появилась после того, как обнаружилось, что юнит молча оставался
+# «active (exited)» с ненастроенным RPS.
+RPS_SETUP_PATH = "/usr/local/sbin/ahrinode-rps"
+RPS_UNIT_PATH = "/etc/systemd/system/ahrinode-rps.service"
+
+RPS_SETUP_SCRIPT = r"""#!/bin/sh
+# Включает Receive/Transmit Packet Steering на основном интерфейсе.
+# Ставится скриптом ahrinodemaker; правится он, а не этот файл.
+set -u
+want="${1:-}"
+sysdir=/sys/class/net
+nics=""
+
+# 1. Имя, определённое при установке. После смены ядра интерфейс мог
+#    переименоваться (eth0 -> ens18), и тогда в /sys его уже нет.
+if [ -n "$want" ] && [ -d "$sysdir/$want" ]; then
+    nics="$want"
+else
+    [ -n "$want" ] && echo "ahrinode-rps: интерфейса '$want' нет, ищу сам" >&2
+    # 2. Ждём маршрут по умолчанию: network-online.target считается
+    #    достигнутым раньше, чем маршрут появляется в таблице, и автодетект
+    #    в этот момент возвращает пустоту.
+    i=0
+    while [ "$i" -lt 20 ]; do
+        nics=$(ip -o -4 route show default 2>/dev/null | awk '{print $5; exit}')
+        [ -n "$nics" ] && break
+        i=$((i + 1))
+        sleep 1
+    done
+    # 3. Маршрута нет и через 20 секунд (IPv6-only, бридж без default) —
+    #    берём все физические интерфейсы: лишний RPS безвреден, а его
+    #    отсутствие стоит половины пропускной способности.
+    if [ -z "$nics" ]; then
+        for d in "$sysdir"/*/device; do
+            [ -e "$d" ] || continue
+            n=${d%/device}
+            n=${n##*/}
+            case "$n" in lo|veth*|docker*|br-*|tun*|wg*) continue ;; esac
+            nics="${nics:+$nics }$n"
+        done
+        [ -n "$nics" ] && echo "ahrinode-rps: маршрута нет, беру: $nics" >&2
+    fi
+fi
+
+ncpu=$(nproc)
+# Маска всех ядер в формате rps_cpus: группы по 32 бита, старшая первой.
+mask=$(awk -v n="$ncpu" 'BEGIN {
+    s = ""
+    while (n > 0) {
+        b = (n >= 32 ? 32 : n); n -= 32
+        v = (b >= 32 ? 4294967295 : (2 ^ b) - 1)
+        s = (s == "" ? sprintf("%x", v) : sprintf("%x,%s", v, s))
+    }
+    print (s == "" ? "0" : s)
+}')
+
+applied=0
+for nic in $nics; do
+    [ -d "$sysdir/$nic" ] || continue
+    for q in "$sysdir/$nic"/queues/rx-*; do
+        [ -e "$q/rps_cpus" ] || continue
+        echo "$mask" > "$q/rps_cpus" 2>/dev/null || true
+        [ -e "$q/rps_flow_cnt" ] && echo 4096 > "$q/rps_flow_cnt" 2>/dev/null || true
+        applied=1
+    done
+    for q in "$sysdir/$nic"/queues/tx-*; do
+        [ -e "$q/xps_cpus" ] && echo "$mask" > "$q/xps_cpus" 2>/dev/null || true
+    done
+done
+
+# Эта строка — признак успеха в журнале. Её отсутствие в
+# `journalctl -u ahrinode-rps` означает, что RPS не применён.
+if [ "$applied" = 1 ]; then
+    echo "ahrinode-rps: интерфейсы='$nics' маска=$mask ядер=$ncpu"
+    exit 0
+fi
+echo "ahrinode-rps: подходящего интерфейса нет — RPS не настроен" >&2
+exit 1
+"""
+
+
+def default_iface() -> str:
+    """Интерфейс маршрута по умолчанию. Пусто — не определили."""
+    out = probe(["ip", "-o", "-4", "route", "show", "default"]).stdout
+    m = re.search(r"\sdev\s+(\S+)", out)
+    return m.group(1) if m else ""
+
+
+def block_rps() -> None:
+    step("RPS/RFS/XPS: распределение приёма пакетов по ядрам")
+    if not os.path.isdir("/sys/class/net"):
+        console.print("[yellow]/sys/class/net недоступен — блок пропущен."
+                      "[/yellow]")
+        return
+    nic = default_iface()
+    write_file(RPS_SETUP_PATH, RPS_SETUP_SCRIPT, mode=0o755)
+    # Имя интерфейса вшиваем в юнит: на загрузке автодетект ещё пуст, а
+    # сохранённое имя даёт правильный ответ сразу. Если интерфейс
+    # переименуется, скрипт это заметит и определит его сам.
+    write_file(RPS_UNIT_PATH, f"""[Unit]
+Description=RPS/RFS/XPS tuning (ahrinodemaker)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart={RPS_SETUP_PATH} {nic}
+
+[Install]
+WantedBy=multi-user.target
+""")
+    run(["systemctl", "daemon-reload"], check=False)
+    run(["systemctl", "enable", "ahrinode-rps.service"], check=False)
+    # restart, а не start: при повторном прогоне юнит уже active (exited), и
+    # start ничего бы не сделал — маски остались бы прежними.
+    if run(["systemctl", "restart", "ahrinode-rps.service"],
+           check=False).returncode == 0:
+        cpus = os.cpu_count() or 1
+        console.print(f"[green]✓ RPS/RFS/XPS включён на {cpus} ядрах"
+                      + (f" (интерфейс {nic})" if nic else "") + "[/green]")
+    else:
+        console.print("[yellow]RPS применить не удалось — смотрите "
+                      "journalctl -u ahrinode-rps.service[/yellow]")
+
+
 def block_network(ipv6: str = "keep") -> None:
-    block_conntrack()
-    block_sysctl(ipv6)
+    tier, sock_max, sock_def, ct_max, ct_buckets = ram_tier()
+    mb = _mem_total_mb()
+    console.print(f"[dim]Память {mb or '?'} МБ — тир {tier}: буфер сокета до "
+                  f"{sock_max // (1024 * 1024)} МБ, conntrack до {ct_max} "
+                  f"записей[/dim]")
+    block_conntrack(ct_buckets)
+    block_sysctl(ipv6, sock_max, sock_def, ct_max, ct_buckets)
+    block_rps()
 
 
 def block_system_upgrade() -> None:
@@ -4499,8 +4861,8 @@ BLOCKS = [
     ("time_cron", f"Часовой пояс {TIMEZONE} + cron (перезагрузка по расписанию)", block_time_cron),
     ("fail2ban", "Настройка Fail2Ban", block_fail2ban),
     ("ufw", "Настройка UFW (firewall)", block_ufw),
-    ("network", "Сеть: conntrack + sysctl (BBR, буферы, очереди)", block_network),
-    ("remnanode_logs", "Логи remnanode: каталог + logrotate + volume в docker-compose", block_remnanode_logs),
+    ("network", "Сеть: conntrack + sysctl (BBR, буферы по RAM) + RPS по ядрам", block_network),
+    ("remnanode_logs", "Логи remnanode: ротация с часовым таймером, кап журнала, volume", block_remnanode_logs),
     ("node_update", "Обновление remnanode (docker compose pull + пересоздание)", block_node_update),
     ("hysteria", "Hysteria2 (QUIC): сертификаты в /dev/shm + 443/udp + автообновление", block_hysteria),
     ("grpc", "VLESS gRPC + Reality: второй транспорт на отдельном порту", block_grpc),
