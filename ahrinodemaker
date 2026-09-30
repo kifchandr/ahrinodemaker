@@ -372,7 +372,9 @@ def _sha256_bytes(data: bytes) -> str:
 
 
 def _download(url: str, dest: str, *, timeout: int = 60) -> None:
-    """Скачивает файл через curl (он уже есть в системе и умеет в прокси)."""
+    """Скачивает файл через curl: он умеет в прокси, но на голой системе его
+    может не быть, поэтому доустанавливаем перед первым же обращением."""
+    ensure_tools("curl")
     r = subprocess.run(["curl", "-fsSL", "--max-time", str(timeout), "-o", dest, url],
                        capture_output=True, text=True)
     if r.returncode != 0:
@@ -444,14 +446,15 @@ def apt_update(*, force: bool = False, max_age: int = 600) -> None:
     _apt_updated_at = time.monotonic()
 
 
-def ensure_packages(*pkgs: str) -> None:
+def ensure_packages(*pkgs: str, force: bool = False) -> None:
     """Доустанавливает недостающие пакеты.
 
     Блоки не должны полагаться на то, что пользователь отметил «Установку
     пакетов»: любой блок можно выбрать отдельно, и тогда его зависимости
     отсутствуют. Раньше это давало «systemctl enable --now fail2ban returned
     non-zero exit status 1» — юнита просто не существовало."""
-    missing = [p for p in pkgs if not _pkg_installed(p)]
+    missing = (list(pkgs) if force
+               else [p for p in pkgs if not _pkg_installed(p)])
     if not missing:
         return
     console.print(f"[dim]Доустанавливаю недостающие пакеты: "
@@ -463,6 +466,52 @@ def ensure_packages(*pkgs: str) -> None:
         # раз установка уже не прошла, кеш свежести доверия не заслуживает.
         apt_update(force=True)
         run(["apt-get", "install", "-y", *missing])
+
+
+# Бинарник → пакеты, которые его приносят. Имена расходятся (fuser живёт в
+# psmisc, ss — в iproute2), поэтому сопоставление задаётся явно, а не
+# угадывается по имени. ca-certificates идёт вместе с curl: без него любой
+# https-запрос падает на проверке цепочки, а выглядит это как недоступный
+# репозиторий — причину потом искать долго.
+BIN_PACKAGES = {
+    "curl": ("curl", "ca-certificates"),
+    "jq": ("jq",),
+    "gpg": ("gnupg",),
+    "openssl": ("openssl",),
+    "certbot": ("certbot",),
+    "nginx": ("nginx",),
+    "crontab": ("cron",),
+    "fuser": ("psmisc",),
+    "ss": ("iproute2",),
+    "ip": ("iproute2",),
+    "iperf3": ("iperf3",),
+}
+
+
+def ensure_tools(*bins: str) -> None:
+    """Доустанавливает утилиты, которых нет в PATH.
+
+    ensure_packages() смотрит на статус пакета, а здесь важно другое: можно ли
+    вызвать сам бинарник. Разница не теоретическая — пакет бывает помечен
+    установленным, когда файла уже нет, и тогда блок падает на первом вызове
+    с «command not found» вместо внятного сообщения.
+
+    Вызывать стоит прямо перед использованием, а не заранее для всех блоков:
+    на голой системе нет ни curl, ни gnupg, но ставить их тем, кому они не
+    нужны, незачем. Когда утилита на месте, это один shutil.which() и ни
+    одного обращения к apt."""
+    need: list[str] = []
+    for name in bins:
+        if shutil.which(name):
+            continue
+        pkgs = BIN_PACKAGES.get(name)
+        if not pkgs:
+            raise RuntimeError(f"утилита «{name}» не найдена, и в какой пакет "
+                               "за ней идти — неизвестно")
+        need += [p for p in pkgs if p not in need]
+    if need:
+        # force: раз бинарника в PATH нет, статус пакета уже соврал
+        ensure_packages(*need, force=True)
 
 
 def block_packages() -> None:
@@ -2103,6 +2152,7 @@ CHECKHOST_API = "https://check-host.net"
 
 
 def _checkhost_json(url: str, timeout: int = 25) -> dict | None:
+    ensure_tools("curl")
     r = probe(["curl", "-sS", "--max-time", str(timeout),
                "-H", "Accept: application/json", url])
     if r.returncode != 0 or not r.stdout.strip():
@@ -2405,6 +2455,7 @@ def check_reality_sni(host: str, timeout: int = 8) -> dict:
 
 def server_country() -> str:
     """Страна выходного адреса ноды по версии ipinfo.io. Пусто — не узнали."""
+    ensure_tools("curl")
     r = probe(["curl", "-s", "--max-time", "5", "https://ipinfo.io/country"])
     code = (r.stdout or "").strip().upper()
     return code if len(code) == 2 and code.isalpha() else ""
@@ -3353,6 +3404,7 @@ def warp_outbound_reference(socks_address: str) -> str:
 
 def _warp_check() -> tuple[bool, str]:
     """Проверяет, что через SOCKS виден чистый адрес Cloudflare."""
+    ensure_tools("curl")
     r = probe(["curl", "-x", f"socks5://127.0.0.1:{WARP_SOCKS_PORT}", "-s",
                "--max-time", "10", "https://www.cloudflare.com/cdn-cgi/trace"])
     if r.returncode != 0 or not r.stdout:
@@ -3810,6 +3862,7 @@ def psiphon_outbound_reference(socks_address: str) -> str:
 
 
 def _psiphon_check() -> tuple[bool, str]:
+    ensure_tools("curl")
     r = probe(["curl", "-x", f"socks5h://127.0.0.1:{PSIPHON_SOCKS_PORT}", "-s",
                "--max-time", "15", "https://ipinfo.io/json"])
     if r.returncode != 0 or not r.stdout.strip():
@@ -4125,6 +4178,7 @@ def _install_repo_key(url: str, keyring: str) -> None:
     причины отказа: gpg возвращает 2 и когда вход пустой (curl не скачал), и
     когда содержимое не является ключом (например, страница с ошибкой). Здесь
     шаги разделены, поэтому в сообщение попадает настоящая причина."""
+    ensure_tools("gpg")
     with tempfile.TemporaryDirectory(prefix="repokey-") as tmpdir:
         raw = os.path.join(tmpdir, "key")
         _download(url, raw, timeout=30)   # ошибка curl всплывёт как есть
@@ -4343,8 +4397,8 @@ def _trafficguard_preflight() -> str | None:
 def block_trafficguard() -> None:
     step("TrafficGuard-auto: защита от сканеров и ботов")
     # curl нужен для загрузки установщика (пакеты установщик доставит сам)
-    if shutil.which("curl") is None:
-        run(["apt-get", "install", "-y", "curl"])
+    # curl нужен для загрузки установщика (пакеты установщик доставит сам)
+    ensure_tools("curl")
 
     problem = _trafficguard_preflight()
     if problem:
@@ -4993,9 +5047,7 @@ def tool_backup_restore() -> None:
     if os.path.isfile(BACKUP_RESTORE_CMD) or os.path.isfile(
             f"{BACKUP_RESTORE_DIR}/backup-restore.sh"):
         console.print("[green]✓ Скрипт уже установлен[/green]")
-    for pkg, cmd in (("curl", "curl"), ("jq", "jq")):
-        if shutil.which(cmd) is None:
-            run(["apt-get", "install", "-y", pkg])
+    ensure_tools("curl", "jq")
 
     console.print("[cyan]Открываю меню backup-restore. Это интерактивный скрипт: "
                   "выйдите из него, чтобы вернуться сюда.[/cyan]")
@@ -5192,9 +5244,7 @@ main "$@"
 
 def _gdrive_install(folder_id: str, days: str) -> None:
     """Кладёт скрипт очистки рядом с backup-restore и ставит зависимости."""
-    for cmd, pkg in (("curl", "curl"), ("jq", "jq")):
-        if shutil.which(cmd) is None:
-            run(["apt-get", "install", "-y", pkg])
+    ensure_tools("curl", "jq")
     body = (GDRIVE_CLEANUP_SCRIPT
             .replace("__FOLDER_ID__", folder_id)
             .replace("__DAYS_OLD__", days))
@@ -6064,6 +6114,7 @@ def self_update_state() -> tuple[str, str]:
     local = _self_source_path()
     if local is None:
         return "unknown", "скрипт запущен из потока, сравнивать не с чем"
+    ensure_tools("curl")
     r = probe(["curl", "-fsSL", "--max-time", "6",
                f"{REPO_RAW_BASE}/ahrinodemaker"])
     if r.returncode != 0 or not r.stdout:
@@ -6212,6 +6263,7 @@ def google_locale(socks_port: int | None, timeout: int = 5) -> str:
     разметке её нет.
 
     socks_port=None — запрос напрямую с сервера."""
+    ensure_tools("curl")
     proxy = ["-x", f"socks5h://127.0.0.1:{socks_port}"] if socks_port else []
     r = probe(["curl", "-s", "-4", "--max-time", str(timeout), *proxy,
                "-A", "Mozilla/5.0", "https://www.google.com/"])
