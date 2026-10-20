@@ -3874,6 +3874,17 @@ check_google() {
   lang=$(cut -d- -f1 <<<"$LAST_LOCALE" | cut -d_ -f1 | tr 'A-Z' 'a-z')
   grep -qE "^($BAD_LANGS)$" <<<"$lang" && return 1
 
+  # Язык страницы может быть нормальным, а страна выхода — неподходящей для
+  # Gemini: например, австрийский адрес Psiphon Google счёл иранским (en-IR),
+  # и Gemini отвечал 403. Поэтому проверяем и сам Gemini: на его странице
+  # есть флаг "ARR9x" — true значит «в вашей стране недоступно».
+  local gflag
+  gflag=$(curl -s -4 -x "socks5h://127.0.0.1:$PORT" --max-time 40 -A "$UA" -H 'Accept-Language: en-US,en;q=0.9' https://gemini.google.com/app 2>/dev/null | grep -oE '"ARR9x":(true|false)' | head -n1)
+  if [ "$gflag" != '"ARR9x":false' ]; then
+    LAST_LOCALE="$LAST_LOCALE; Gemini: ${gflag:-нет ответа}"
+    return 1
+  fi
+
   # Скорость считаем только на осмысленном объёме: на крошечном ответе
   # speed_download отражает задержку, а не пропускную способность
   if [ ${#body} -gt 50000 ]; then
@@ -3974,7 +3985,7 @@ while true; do
 
   fails=$((fails + 1))
   case $rc in
-    1) reason="Google считает адрес российским (локаль $LAST_LOCALE)"; need=2 ;;
+    1) reason="Gemini недоступен в стране выхода (локаль $LAST_LOCALE)"; need=2 ;;
     4) reason="локаль в ответе Google не найдена — проверьте вручную"; need=99 ;;
     3) reason="медленно: $(human_speed), страница за ${LAST_TIME}с"; need=$SLOW_STRIKES ;;
     *) reason="туннель недоступен"; need=2 ;;
