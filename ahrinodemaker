@@ -3752,6 +3752,21 @@ PSIPHON_REGIONS = [
     ("US", "США"),
 ]
 
+# Порядок стран в меню и в списке сторожа. Быстрые — первыми: замер Psiphon с
+# ноды Германии 26.10.2026 дал FR 82 Мбит/с, CH 71, GB 35, AT 35, FI 18, NL 14,
+# US 5. В конце — DE, SE и PL: в тот же день все три давали меньше 0,5 Мбит/с.
+# Остальные страны не мерились и стоят между ними по алфавиту.
+PSIPHON_PREFERRED = ["FR", "CH", "GB", "AT", "FI", "NL", "US"]
+PSIPHON_LAST = ["DE", "SE", "PL"]
+
+
+def psiphon_region_order(codes: list[str]) -> list[str]:
+    """Коды стран: сначала быстрые, потом остальные по алфавиту, медленные в конце."""
+    first = [c for c in PSIPHON_PREFERRED if c in codes]
+    last = [c for c in PSIPHON_LAST if c in codes]
+    rest = [c for c in codes if c not in first and c not in last]
+    return first + rest + last
+
 
 def psiphon_compose(egress_region: str, device_region: str) -> str:
     """docker-compose для контейнера Psiphon.
@@ -4047,8 +4062,8 @@ def _setup_psiphon_watchdog(current: str) -> None:
     """Сторож: проверяет Gemini и подбирает страну, если он недоступен."""
     # Кандидаты — страны, где Gemini работает; текущая идёт первой строкой,
     # чтобы после перебора сторож вернулся к ней при следующей проверке
-    candidates = [c for c, _ in PSIPHON_REGIONS
-                  if c not in ("RS", "UA", "IN")]
+    candidates = psiphon_region_order([c for c, _ in PSIPHON_REGIONS
+                                       if c not in ("RS", "UA", "IN")])
     ordered = [current] + [c for c in candidates if c != current]
     write_file(PSIPHON_COUNTRIES_FILE, "\n".join(ordered) + "\n")
 
@@ -4309,10 +4324,11 @@ def remove_psiphon() -> None:
 
 
 def ask_psiphon_params() -> tuple[str, str, bool] | None:
+    names = dict(PSIPHON_REGIONS)
     egress = questionary.select(
         "Страна выхода Psiphon (через неё сервисы увидят ваш трафик):",
-        choices=[*[questionary.Choice(f"{code} ({name})", value=code)
-                   for code, name in PSIPHON_REGIONS],
+        choices=[*[questionary.Choice(f"{code} ({names[code]})", value=code)
+                   for code in psiphon_region_order(list(names))],
                  questionary.Choice("Другая — ввести код страны", value="__other__")],
         style=CUSTOM_STYLE).ask()
     if egress is None:
