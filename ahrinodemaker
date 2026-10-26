@@ -3752,12 +3752,17 @@ PSIPHON_REGIONS = [
     ("US", "США"),
 ]
 
-# Порядок стран в меню и в списке сторожа. Быстрые — первыми: замер Psiphon с
-# ноды Германии 26.10.2026 дал FR 82 Мбит/с, CH 71, GB 35, AT 35, FI 18, NL 14,
-# US 5. В конце — DE, SE и PL: в тот же день все три давали меньше 0,5 Мбит/с.
-# Остальные страны не мерились и стоят между ними по алфавиту.
-PSIPHON_PREFERRED = ["FR", "CH", "GB", "AT", "FI", "NL", "US"]
-PSIPHON_LAST = ["DE", "SE", "PL"]
+# Порядок стран в меню и в списке сторожа. Быстрые — первыми. Замеры свежих
+# контейнеров Psiphon 26.10.2026, Мбит/с:
+#   с ноды в Германии:        FR 82, CH 71, GB 35, AT 35, FI 18, NL 14, US 5;
+#   с ноды в Великобритании:  GB 115, NL 65, FR 58, IE 42, DE 39, CH 29, FI 15,
+#                             AT 9, US 8.
+# Сервер внутри страны каждый раз свой, так что цифры — ориентир, а не рейтинг:
+# у тех же GB и CH с британской ноды Gemini оказался закрыт, а у рабочего GB —
+# открыт. В конце — SE и PL: меньше 0,5 Мбит/с. Остальные страны не мерились и
+# стоят между ними по алфавиту.
+PSIPHON_PREFERRED = ["FR", "NL", "GB", "CH", "IE", "DE", "AT", "FI", "US"]
+PSIPHON_LAST = ["SE", "PL"]
 
 
 def psiphon_region_order(codes: list[str]) -> list[str]:
@@ -3823,6 +3828,9 @@ LOG=__LOG__
 COUNTRIES=__COUNTRIES__
 BAD_LANGS=__BAD_LANGS__
 COMPOSE="$DIR/docker-compose.yml"
+# База клиента Psiphon: списки серверов и сервер, к которому он подключался
+# в прошлый раз
+DATASTORE="$DIR/config/ca.psiphon.PsiphonTunnel.tunnel-core"
 UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0 Safari/537.36"
 
 # Интервалы, секунды. Обычная пауза случайная, чтобы запросы не уходили
@@ -3834,10 +3842,19 @@ FULL_EVERY=900
 
 # Порог «слишком медленно». Скорость берётся из той же загрузки страницы, что и
 # проверка доступности, — отдельного замера, а значит и лишнего трафика, нет.
-# Медленно ≠ сломано, поэтому страна меняется только после SLOW_STRIKES подряд.
-SLOW_SPEED=30000      # байт/с
-SLOW_SECS=15          # секунд на страницу
+# Главная Google весит около 300 КБ: исправный туннель отдаёт её от 300 КБ/с
+# даже через США, застрявший — на 10–50 КБ/с. Порог 100 КБ/с лежит между ними
+# с запасом в обе стороны.
+# Медленно ≠ сломано, поэтому меры принимаются только после SLOW_STRIKES подряд.
+SLOW_SPEED=102400     # байт/с
+SLOW_SECS=10          # секунд на страницу
 SLOW_STRIKES=3
+
+# Перебор стран: сколько пробовать за заход и сколько ждать, если ни одна не
+# подошла. Каждая попытка перезапускает контейнер и рвёт соединения, а повтор
+# через пару минут дал бы тот же результат.
+MAX_TRIES=4
+HOLD_SECS=3600
 
 log() { echo "[$(date '+%F %T')] $*" >> "$LOG"; }
 rnd() { echo $(( RANDOM % ($2 - $1 + 1) + $1 )); }
@@ -3845,9 +3862,18 @@ rnd() { echo $(( RANDOM % ($2 - $1 + 1) + $1 )); }
 # Дешёвая проверка: две буквы кода страны вместо целой страницы.
 # Блокировка Gemini географическая, а Psiphon сам перебирает серверы, поэтому
 # смена страны — главный повод для полной проверки.
+# Код берём у Cloudflare: у его служебной страницы нет лимита запросов. ipinfo
+# только запасной — адрес выхода Psiphon делят тысячи людей, и ipinfo часто
+# отвечает ему 429 или 403. Всё, что не похоже на код страны, отбрасываем.
 exit_country() {
-  curl -s -x "socks5h://127.0.0.1:$PORT" --max-time 15 \
-       https://ipinfo.io/country 2>/dev/null | tr -d '[:space:]'
+  local c
+  c=$(curl -s -x "socks5h://127.0.0.1:$PORT" --max-time 15 \
+        https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null \
+        | grep -oE '^loc=[A-Z]{2}' | cut -d= -f2)
+  [ -z "$c" ] && c=$(curl -s -x "socks5h://127.0.0.1:$PORT" --max-time 15 \
+                       https://ipinfo.io/country 2>/dev/null \
+                       | tr -d '[:space:]' | grep -xE '[A-Z]{2}')
+  echo "$c"
 }
 
 # 0 — работает, 1 — Google считает адрес российским, 2 — сеть/туннель,
@@ -3926,16 +3952,19 @@ current_region() {
   grep -oE 'EGRESS_REGION=[A-Z]{2}' "$COMPOSE" | head -n1 | cut -d= -f2
 }
 
-switch_region() {
-  local region=$1
-  log "переключаю страну выхода на $region"
-  sed -i "s/EGRESS_REGION=.*/EGRESS_REGION=$region/" "$COMPOSE"
-  sed -i "s/DEVICE_REGION=.*/DEVICE_REGION=$region/" "$COMPOSE"
+# Перезапуск Psiphon с чистого листа. Клиент помнит сервер, к которому
+# подключался в прошлый раз, и после перезапуска возвращается к нему же, даже
+# если тот перегружен: так туннель неделями отдаёт 10–50 КБ/с, хотя свежий в
+# той же стране даёт 50–100 Мбит/с. Без базы клиент заново скачивает список
+# серверов и выбирает из него. Прежняя база лежит в .prev до следующего сброса.
+restart_fresh() {
+  (cd "$DIR" && docker compose stop) </dev/null >/dev/null 2>&1
   # Переменные окружения читаются только при первом запуске: без удаления
   # конфига контейнер поднимется со старой страной
   rm -f "$DIR/config/psiphon.config"
-  echo "$region" > "$DIR/.egress-region"
-  (cd "$DIR" && docker compose up -d --force-recreate) >/dev/null 2>&1
+  rm -rf "$DATASTORE.prev"
+  [ -d "$DATASTORE" ] && mv "$DATASTORE" "$DATASTORE.prev"
+  (cd "$DIR" && docker compose up -d --force-recreate) </dev/null >/dev/null 2>&1
   for _ in $(seq 1 24); do
     sleep 5
     [ -n "$(exit_country)" ] && return 0
@@ -3943,65 +3972,120 @@ switch_region() {
   return 1
 }
 
+switch_region() {
+  local region=$1
+  log "переключаю страну выхода на $region"
+  sed -i "s/EGRESS_REGION=.*/EGRESS_REGION=$region/" "$COMPOSE"
+  sed -i "s/DEVICE_REGION=.*/DEVICE_REGION=$region/" "$COMPOSE"
+  echo "$region" > "$DIR/.egress-region"
+  restart_fresh
+}
+
+# Проверка сразу после перезапуска. Свежий туннель иногда роняет первые
+# запросы — страница Gemini приходит пустой, — поэтому сбой перепроверяем,
+# иначе сторож уйдёт из рабочей страны. Медленно — не повод: скорость
+# повтор не исправит.
+check_fresh() {
+  local rc
+  check_google; rc=$?
+  if [ $rc -ne 0 ] && [ $rc -ne 3 ]; then
+    sleep 10
+    check_google; rc=$?
+  fi
+  return $rc
+}
+
+# Медленно или туннель не отвечает в прежней стране — почти всегда виноват
+# сервер, к которому прилип клиент, а не страна: сначала тот же выход с
+# чистой базой, перебор стран — только если не помогло
+refresh() {
+  log "сбрасываю базу Psiphon, страна прежняя ($(current_region))"
+  restart_fresh || { log "после сброса туннель не построился"; return 1; }
+  check_fresh
+  case $? in
+    0) log "после сброса: локаль $LAST_LOCALE, $(human_speed) — помогло"; return 0 ;;
+    1) log "после сброса Gemini не пускает (локаль $LAST_LOCALE)" ;;
+    3) log "после сброса всё ещё медленно ($(human_speed))" ;;
+    *) log "после сброса проверка не прошла" ;;
+  esac
+  return 1
+}
+
 rotate() {
-  local now tried=0
+  local now region tried=0 best="" best_speed=0
   now=$(current_region)
   log "текущая страна $now — подбираю замену"
   while read -r region; do
     [ -z "$region" ] && continue
     [ "$region" = "$now" ] && continue
     tried=$((tried + 1))
-    [ "$tried" -gt 4 ] && { log "перебрано 4 страны, ни одна не подошла"; return 1; }
+    [ "$tried" -gt "$MAX_TRIES" ] && break
     switch_region "$region" || { log "$region: туннель не построился"; continue; }
-    check_google
+    check_fresh
     case $? in
       0) log "$region: локаль $LAST_LOCALE, $(human_speed) — страна закреплена"; return 0 ;;
       1) log "$region: локаль $LAST_LOCALE — Gemini не пустит, пробую дальше" ;;
       4) log "$region: локаль не определилась, пробую дальше" ;;
-      3) log "$region: открывается, но медленно ($(human_speed)), пробую дальше" ;;
+      3) log "$region: открывается, но медленно ($(human_speed)), пробую дальше"
+         if [ "$LAST_SPEED" -gt "$best_speed" ]; then best=$region; best_speed=$LAST_SPEED; fi ;;
       *) log "$region: туннель не отвечает, пробую дальше" ;;
     esac
   done < "$COUNTRIES"
-  log "подходящая страна не найдена"
+  # Хорошей страны нет. Медленный, но рабочий туннель лучше никакого: берём
+  # самую быструю из рабочих, а если рабочих не было — возвращаем исходную
+  region=${best:-$now}
+  log "подходящая страна не найдена — возвращаю ${region:-прежнюю}"
+  if [ -n "$region" ] && [ "$(current_region)" != "$region" ]; then
+    switch_region "$region" || log "$region: туннель не построился"
+  fi
   return 1
 }
 
 [ -f "$COMPOSE" ] || { log "нет $COMPOSE — сторож остановлен"; exit 1; }
-log "сторож запущен: обычная пауза ${OK_MIN}-${OK_MAX}с, после сбоя ${FAIL_MIN}-${FAIL_MAX}с"
+log "сторож запущен: обычная пауза ${OK_MIN}-${OK_MAX}с, после сбоя ${FAIL_MIN}-${FAIL_MAX}с, медленно — меньше $((SLOW_SPEED / 1024)) КБ/с"
 
 fails=0
 last_country=""
 last_full=0
+hold_until=0
 
 while true; do
   now=$(date +%s)
   country=$(exit_country)
-  rc=0
 
   if [ -z "$country" ]; then
     rc=2                                  # туннель не отвечает
-  elif [ "$country" != "$last_country" ]; then
-    [ -n "$last_country" ] && log "страна выхода сменилась: $last_country -> $country"
-    check_google; rc=$?
-    last_full=$now
-    [ $rc -eq 0 ] && last_country=$country
-  elif [ $((now - last_full)) -ge $FULL_EVERY ]; then
+  elif [ "$country" = "$last_country" ] && [ $fails -eq 0 ] && [ $((now - last_full)) -lt $FULL_EVERY ]; then
+    # Страна прежняя, прошлая полная проверка прошла и была недавно
+    sleep "$(rnd $OK_MIN $OK_MAX)"
+    continue
+  else
+    # Полная проверка — в том числе после любого сбоя: его надо подтвердить
+    # новым замером. Иначе следующий круг пройдёт по дешёвой ветке, сочтёт
+    # туннель исправным по старым цифрам и обнулит счётчик — и до SLOW_STRIKES
+    # медленных проверок подряд дело не дойдёт никогда
+    if [ -n "$last_country" ] && [ "$country" != "$last_country" ]; then
+      log "страна выхода сменилась: $last_country -> $country"
+    fi
     check_google; rc=$?
     last_full=$now
   fi
-  # Иначе страна прежняя и полная проверка недавняя — считаем, что всё в порядке
 
   if [ $rc -eq 0 ]; then
     [ $fails -gt 0 ] && log "снова работает (страна $country, локаль $LAST_LOCALE, $(human_speed))"
     fails=0
+    last_country=$country
     sleep "$(rnd $OK_MIN $OK_MAX)"
     continue
   fi
 
   fails=$((fails + 1))
+  pause=$(rnd $FAIL_MIN $FAIL_MAX)
   case $rc in
     1) reason="Gemini недоступен в стране выхода (локаль $LAST_LOCALE)"; need=2 ;;
-    4) reason="локаль в ответе Google не найдена — проверьте вручную"; need=99 ;;
+    # Скорее всего, Google поменял разметку: частые повторы ничего не дадут
+    4) reason="локаль в ответе Google не найдена — проверьте вручную"; need=99
+       pause=$(rnd $OK_MIN $OK_MAX) ;;
     3) reason="медленно: $(human_speed), страница за ${LAST_TIME}с"; need=$SLOW_STRIKES ;;
     *) reason="туннель недоступен"; need=2 ;;
   esac
@@ -4009,17 +4093,26 @@ while true; do
 
   # Одиночный сбой не повод дёргать контейнер: сеть моргает, Psiphon
   # переподключается. Медленно — сигнал ещё более шумный, поэтому порог выше.
+  # Закрытый Gemini лечится сменой страны, с неё и начинаем; в остальных
+  # случаях сначала сброс базы в той же стране.
   if [ $fails -ge $need ]; then
-    if rotate; then
+    if [ "$(date +%s)" -lt $hold_until ]; then
+      # Недавний перебор ничего не дал — ждём его окончания и проверяем реже
+      pause=$(rnd $OK_MIN $OK_MAX)
+    elif { [ $rc -ne 1 ] && refresh; } || rotate; then
       fails=0
       last_country=$(exit_country)
       last_full=$(date +%s)
       sleep "$(rnd $OK_MIN $OK_MAX)"
       continue
+    else
+      hold_until=$(( $(date +%s) + HOLD_SECS ))
+      log "следующий перебор — не раньше чем через $((HOLD_SECS / 60)) мин"
+      pause=$(rnd $OK_MIN $OK_MAX)
     fi
   fi
 
-  sleep "$(rnd $FAIL_MIN $FAIL_MAX)"
+  sleep "$pause"
 done
 """
 
