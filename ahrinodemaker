@@ -26,6 +26,7 @@ import subprocess
 import concurrent.futures
 import importlib
 import tempfile
+from typing import NamedTuple
 
 # ------------------------------------------------------------------ #
 # Кодировка вывода — до первой печати
@@ -3737,6 +3738,99 @@ PSIPHON_DIR = "/opt/psiphon"
 PSIPHON_SOCKS_PORT = 41080
 PSIPHON_CONTAINER = "psiphon"
 
+# Туннель Psiphon один на всех пользователей ноды: один клиент, одно соединение
+# к одному серверу Psiphon, и его скорость (50–150 Мбит/с) делят все. Когда её
+# перестаёт хватать, поднимают несколько туннелей, каждый к своему серверу, и
+# делят между ними пользователей.
+PSIPHON_MAX_TUNNELS = 4
+
+
+class PsiphonTunnel(NamedTuple):
+    """Один туннель: свой контейнер, порт SOCKS, каталог и сторож."""
+    n: int
+    dir: str
+    port: int
+    container: str
+    service: str
+    logrotate: str
+    tag: str
+
+    @property
+    def watchdog(self) -> str:
+        return f"{self.dir}/watchdog.sh"
+
+    @property
+    def log(self) -> str:
+        return f"{self.dir}/watchdog.log"
+
+    @property
+    def countries(self) -> str:
+        return f"{self.dir}/watchdog.countries"
+
+
+def psiphon_tunnel(n: int) -> PsiphonTunnel:
+    """Первый туннель живёт по прежним путям — ноды, где Psiphon уже стоит,
+    остаются первым туннелем без переезда. Остальные — с номером: каталог
+    /opt/psiphon-2, порт 41081 и так далее.
+
+    Теги psiphon-out, psiphon2-out… выбраны так, чтобы ни один не был началом
+    другого: селектор балансировщика xray сравнивает теги по префиксу, и
+    «psiphon-out» в нём не должен захватывать «psiphon-out2»."""
+    if n == 1:
+        return PsiphonTunnel(1, PSIPHON_DIR, PSIPHON_SOCKS_PORT, PSIPHON_CONTAINER,
+                             "psiphon-watchdog.service",
+                             "/etc/logrotate.d/psiphon-watchdog", "psiphon-out")
+    return PsiphonTunnel(n, f"{PSIPHON_DIR}-{n}", PSIPHON_SOCKS_PORT + n - 1,
+                         f"{PSIPHON_CONTAINER}-{n}", f"psiphon-watchdog-{n}.service",
+                         f"/etc/logrotate.d/psiphon-watchdog-{n}", f"psiphon{n}-out")
+
+
+# Как делить пользователей между туннелями: по адресу клиента, чтобы каждый
+# всегда выходил через один и тот же туннель. Раскидывать соединения одного
+# человека по разным туннелям нельзя: Google увидел бы в одной сессии разные
+# адреса, а у части серверов Psiphon Gemini закрыт — и он работал бы через раз.
+#
+# Границы подобраны по журналу ноды в Великобритании 26.10.2026: запросы в
+# Psiphon и число клиентов по первому байту адреса. Российские адреса лежат
+# неравномерно — около трети приходится на 88–95.x, — и деление адресного
+# пространства поровну дало бы 66 на 34. Эти границы дают доли 48–52% для
+# двух туннелей, 33–34% для трёх и 24–28% для четырёх.
+#
+# Для каждого числа туннелей — адреса всех групп, кроме последней: последняя
+# забирает остальных, в том числе IPv6 за пределами ::/1.
+PSIPHON_SPLITS = {
+    2: [["0.0.0.0/2", "64.0.0.0/4", "80.0.0.0/5", "88.0.0.0/6", "::/1"]],
+    3: [["0.0.0.0/2", "64.0.0.0/4", "80.0.0.0/5", "88.0.0.0/7", "90.0.0.0/8",
+         "::/1"],
+        ["91.0.0.0/8", "92.0.0.0/6", "96.0.0.0/5", "104.0.0.0/6", "108.0.0.0/7"]],
+    4: [["0.0.0.0/2", "64.0.0.0/4", "80.0.0.0/6", "::/1"],
+        ["84.0.0.0/6", "88.0.0.0/6"],
+        ["92.0.0.0/6", "96.0.0.0/3", "128.0.0.0/3", "160.0.0.0/4", "176.0.0.0/8"]],
+}
+
+
+def psiphon_tunnels_present() -> list[PsiphonTunnel]:
+    """Туннели, от которых на сервере что-то есть: каталог, юнит или контейнер."""
+    found = []
+    for n in range(1, PSIPHON_MAX_TUNNELS + 1):
+        t = psiphon_tunnel(n)
+        if (os.path.isdir(t.dir)
+                or os.path.isfile(f"/etc/systemd/system/{t.service}")
+                or probe(["docker", "inspect", "-f", "{{.Name}}",
+                          t.container]).returncode == 0):
+            found.append(t)
+    return found
+
+
+def psiphon_tunnels_running() -> list[PsiphonTunnel]:
+    running = []
+    for n in range(1, PSIPHON_MAX_TUNNELS + 1):
+        t = psiphon_tunnel(n)
+        r = probe(["docker", "inspect", "-f", "{{.State.Running}}", t.container])
+        if r.returncode == 0 and r.stdout.strip() == "true":
+            running.append(t)
+    return running
+
 # Страны выхода. Для Gemini годится любая, где он доступен.
 PSIPHON_REGIONS = [
     ("AT", "Австрия"),       ("AU", "Австралия"),    ("BE", "Бельгия"),
@@ -3773,7 +3867,8 @@ def psiphon_region_order(codes: list[str]) -> list[str]:
     return first + rest + last
 
 
-def psiphon_compose(egress_region: str, device_region: str) -> str:
+def psiphon_compose(egress_region: str, device_region: str,
+                    tunnel: PsiphonTunnel | None = None) -> str:
     """docker-compose для контейнера Psiphon.
 
     Порт публикуется только на localhost: SOCKS без авторизации, открывать его
@@ -3783,10 +3878,11 @@ def psiphon_compose(egress_region: str, device_region: str) -> str:
     занимает несколько десятков мегабайт, и 256 МБ он не выберет никогда. Но
     если клиент Psiphon однажды потечёт, ядро убьёт его контейнер, а не xray;
     restart: unless-stopped поднимет туннель обратно."""
+    t = tunnel or psiphon_tunnel(1)
     return f"""services:
   psiphon:
     image: swarupsengupta2007/psiphon:latest
-    container_name: {PSIPHON_CONTAINER}
+    container_name: {t.container}
     restart: unless-stopped
     mem_limit: 256m
     environment:
@@ -3799,13 +3895,9 @@ def psiphon_compose(egress_region: str, device_region: str) -> str:
     volumes:
       - ./config:/config
     ports:
-      - "127.0.0.1:{PSIPHON_SOCKS_PORT}:1080"
+      - "127.0.0.1:{t.port}:1080"
 """
 
-
-PSIPHON_WATCHDOG = f"{PSIPHON_DIR}/watchdog.sh"
-PSIPHON_WATCHDOG_LOG = f"{PSIPHON_DIR}/watchdog.log"
-PSIPHON_COUNTRIES_FILE = f"{PSIPHON_DIR}/watchdog.countries"
 
 # Google определяет гео не по стране сервера и не по RIPE, а по собственным
 # данным — и адреса, купленные у российских реселлеров, клеит к RU независимо
@@ -4137,8 +4229,10 @@ while true; do
 done
 """
 
-PSIPHON_WATCHDOG_SERVICE = f"""[Unit]
-Description=Проверка доступности Gemini через Psiphon
+def psiphon_watchdog_service(t: PsiphonTunnel) -> str:
+    which = "" if t.n == 1 else f" (туннель {t.n})"
+    return f"""[Unit]
+Description=Проверка доступности Gemini через Psiphon{which}
 After=docker.service
 Wants=network-online.target
 
@@ -4146,7 +4240,7 @@ Wants=network-online.target
 # Не таймер, а постоянный процесс: пауза между проверками случайная и зависит
 # от исхода предыдущей, а такое расписание таймером не выразить.
 Type=simple
-ExecStart={PSIPHON_WATCHDOG}
+ExecStart={t.watchdog}
 Restart=always
 RestartSec=30
 
@@ -4154,12 +4248,13 @@ RestartSec=30
 WantedBy=multi-user.target
 """
 
+
 # Сторож пишет в лог круглые сутки и сам его не подрезает. Строк в день немного,
 # но роста без границы достаточно, чтобы за годы упереться в диск.
 # copytruncate не нужен: каждая запись открывает файл заново (echo >>), поэтому
 # переименование ничего не ломает — сторож откроет уже новый файл.
-PSIPHON_LOGROTATE_PATH = "/etc/logrotate.d/psiphon-watchdog"
-PSIPHON_LOGROTATE_CONF = f"""{PSIPHON_WATCHDOG_LOG} {{
+def psiphon_logrotate_conf(t: PsiphonTunnel) -> str:
+    return f"""{t.log} {{
     su root root
     weekly
     rotate 8
@@ -4172,44 +4267,52 @@ PSIPHON_LOGROTATE_CONF = f"""{PSIPHON_WATCHDOG_LOG} {{
 """
 
 
-def _setup_psiphon_watchdog(current: str) -> None:
-    """Сторож: проверяет Gemini и подбирает страну, если он недоступен."""
-    # Кандидаты — страны, где Gemini работает; текущая идёт первой строкой,
-    # чтобы после перебора сторож вернулся к ней при следующей проверке
+def psiphon_watchdog_countries(current: str) -> list[str]:
+    """Кандидаты — страны, где Gemini работает; текущая идёт первой строкой,
+    чтобы после перебора сторож вернулся к ней при следующей проверке."""
     candidates = psiphon_region_order([c for c, _ in PSIPHON_REGIONS
                                        if c not in ("RS", "UA", "IN")])
-    ordered = [current] + [c for c in candidates if c != current]
-    write_file(PSIPHON_COUNTRIES_FILE, "\n".join(ordered) + "\n")
+    return [current] + [c for c in candidates if c != current]
+
+
+def _setup_psiphon_watchdog(current: str,
+                            t: PsiphonTunnel | None = None) -> None:
+    """Сторож: проверяет Gemini и подбирает страну, если он недоступен.
+
+    У каждого туннеля свой сторож: он проверяет свой порт, и закрытый Gemini
+    или застрявший сервер в одном туннеле не прячется за исправным соседом."""
+    t = t or psiphon_tunnel(1)
+    write_file(t.countries, "\n".join(psiphon_watchdog_countries(current)) + "\n")
 
     body = (PSIPHON_WATCHDOG_BODY
-            .replace("__DIR__", shlex.quote(PSIPHON_DIR))
-            .replace("__PORT__", str(PSIPHON_SOCKS_PORT))
-            .replace("__LOG__", shlex.quote(PSIPHON_WATCHDOG_LOG))
-            .replace("__COUNTRIES__", shlex.quote(PSIPHON_COUNTRIES_FILE))
+            .replace("__DIR__", shlex.quote(t.dir))
+            .replace("__PORT__", str(t.port))
+            .replace("__LOG__", shlex.quote(t.log))
+            .replace("__COUNTRIES__", shlex.quote(t.countries))
             .replace("__BAD_LANGS__", shlex.quote(BAD_LANGS)))
-    write_file(PSIPHON_WATCHDOG, body, mode=0o755)
+    write_file(t.watchdog, body, mode=0o755)
 
-    write_file("/etc/systemd/system/psiphon-watchdog.service",
-               PSIPHON_WATCHDOG_SERVICE)
-    write_file(PSIPHON_LOGROTATE_PATH, PSIPHON_LOGROTATE_CONF)
+    write_file(f"/etc/systemd/system/{t.service}", psiphon_watchdog_service(t))
+    write_file(t.logrotate, psiphon_logrotate_conf(t))
     # В прежней версии сторож запускался таймером — убираем его, иначе рядом
     # со службой останется вторая копия проверок
     old_timer = "/etc/systemd/system/psiphon-watchdog.timer"
-    if os.path.isfile(old_timer):
+    if t.n == 1 and os.path.isfile(old_timer):
         run(["systemctl", "disable", "--now", "psiphon-watchdog.timer"],
             check=False)
         os.unlink(old_timer)
     run(["systemctl", "daemon-reload"], check=False)
-    run(["systemctl", "enable", "--now", "psiphon-watchdog.service"], check=False)
+    run(["systemctl", "enable", "--now", t.service], check=False)
 
-    console.print("[green]✓ Сторож включён: проверка каждые 5–15 минут, "
-                  "после сбоя — через 30–120 секунд[/green]")
-    console.print(f"[dim]Журнал: {PSIPHON_WATCHDOG_LOG} "
-                  f"(ротация: {PSIPHON_LOGROTATE_PATH}), "
-                  f"список стран: {PSIPHON_COUNTRIES_FILE}[/dim]")
+    console.print(f"[green]✓ Сторож туннеля {t.n} включён: проверка каждые "
+                  "5–15 минут, после сбоя — через 30–120 секунд[/green]")
+    console.print(f"[dim]Журнал: {t.log} (ротация: {t.logrotate}), "
+                  f"список стран: {t.countries}[/dim]")
 
 
-def psiphon_outbound_reference(socks_address: str) -> str:
+def psiphon_outbound_reference(socks_address: str, count: int = 1) -> str:
+    if count > 1:
+        return psiphon_multi_reference(socks_address, count)
     return json.dumps({
         "outboundToAdd": {
             "tag": "psiphon-out",
@@ -4245,9 +4348,64 @@ def psiphon_outbound_reference(socks_address: str) -> str:
     }, indent=2, ensure_ascii=False) + "\n"
 
 
-def _psiphon_check() -> tuple[bool, str]:
+def psiphon_multi_reference(socks_address: str, count: int) -> str:
+    """Заготовка для нескольких туннелей.
+
+    Каждой группе пользователей — свой балансировщик из одного туннеля, а
+    запасным — следующий туннель: пока свой жив, пользователь выходит только
+    через него, а если тот упал, observatory за полминуты это заметит, и группа
+    уйдёт в соседний. leastPing выбирает только среди живых по данным
+    observatory — без этого запасной туннель не включился бы."""
+    tunnels = [psiphon_tunnel(n) for n in range(1, count + 1)]
+    groups = PSIPHON_SPLITS[count]
+    rules: list[dict] = [{
+        "type": "field",
+        "outboundTag": "DIRECT",
+        "domain": WARP_DIRECT_DOMAINS,
+        "_comment": "мимо туннеля: видео, бинарники, реклама — ставить ПЕРВЫМ",
+    }]
+    for i, t in enumerate(tunnels):
+        rule = {"type": "field", "ruleTag": f"PSIPHON_SPLIT_{t.n}",
+                "domain": WARP_DOMAINS, "balancerTag": f"psiphon-lb{t.n}"}
+        if i < len(groups):
+            rule["sourceIP"] = groups[i]
+        else:
+            rule["_comment"] = "все остальные адреса — ставить последним из этих"
+        rules.append(rule)
+    return json.dumps({
+        "outboundsToAdd": [
+            {"tag": t.tag, "protocol": "socks",
+             "settings": {"servers": [{"address": socks_address, "port": t.port}]}}
+            for t in tunnels],
+        "observatory": {
+            "subjectSelector": [t.tag for t in tunnels],
+            "probeUrl": "https://www.google.com/generate_204",
+            "probeInterval": "30s",
+            "enableConcurrency": True,
+        },
+        "balancersToAdd": [
+            {"tag": f"psiphon-lb{t.n}", "selector": [t.tag],
+             "fallbackTag": tunnels[t.n % count].tag,
+             "strategy": {"type": "leastPing"}}
+            for t in tunnels],
+        # Порядок обязателен: Xray применяет первое совпавшее правило
+        "routingRulesToAdd": rules,
+        "_note": (
+            "Все правила ставьте ВЫШЕ правила с DIRECT по inboundTag, порядок "
+            "сохраните. observatory в профиле может быть только один: если он "
+            "уже есть, добавьте теги туннелей в его subjectSelector. Пользователи "
+            "делятся по адресу клиента, чтобы каждый всегда выходил через один "
+            "туннель; через релей все его клиенты приходят с адреса релея и "
+            "попадут в одну группу. Остальное — как для одного туннеля: Google "
+            "заворачивается целиком, на inbound'ах нужен sniffing с destOverride "
+            "[http, tls, quic]."
+        ),
+    }, indent=2, ensure_ascii=False) + "\n"
+
+
+def _psiphon_check(port: int = PSIPHON_SOCKS_PORT) -> tuple[bool, str]:
     ensure_tools("curl")
-    r = probe(["curl", "-x", f"socks5h://127.0.0.1:{PSIPHON_SOCKS_PORT}", "-s",
+    r = probe(["curl", "-x", f"socks5h://127.0.0.1:{port}", "-s",
                "--max-time", "15", "https://ipinfo.io/json"])
     if r.returncode != 0 or not r.stdout.strip():
         return False, ""
@@ -4258,39 +4416,42 @@ def _psiphon_check() -> tuple[bool, str]:
     return True, f"{data.get('ip', '?')} ({data.get('country', '?')})"
 
 
-def block_psiphon(params: tuple[str, str, bool] | None = None) -> None:
-    step("Psiphon: альтернативный egress для нейросетей")
+def psiphon_tunnel_regions(egress: str, count: int) -> list[str]:
+    """Страна для каждого туннеля: первый — выбранная, остальные — следующие
+    по скорости. Страны разные, чтобы туннели гарантированно легли на разные
+    серверы Psiphon: в одной стране свежие клиенты часто выбирают один и тот же."""
+    rest = [c for c in psiphon_watchdog_countries(egress) if c != egress]
+    return [egress] + rest[:count - 1]
 
-    if shutil.which("docker") is None:
-        raise RuntimeError("Docker не установлен — сначала установите ноду")
-    ensure_packages("curl")
 
-    egress, device, watchdog = params if params else ("US", "US", False)
-
-    os.makedirs(f"{PSIPHON_DIR}/config", exist_ok=True)
-    compose_path = f"{PSIPHON_DIR}/docker-compose.yml"
+def _install_psiphon_tunnel(t: PsiphonTunnel, egress: str, device: str) -> str:
+    """Поднимает один туннель и ждёт, пока он построится. Возвращает адрес выхода."""
+    os.makedirs(f"{t.dir}/config", exist_ok=True)
+    # Клиент в контейнере работает от uid 1000 и сам создаёт базу в /config
+    os.chown(f"{t.dir}/config", 1000, 1000)
+    compose_path = f"{t.dir}/docker-compose.yml"
 
     # Переменные окружения контейнер читает ТОЛЬКО при первом запуске: дальше
     # он берёт параметры из config/psiphon.config. Без этой очистки смена
     # страны выхода в compose молча не применялась бы, и трафик продолжал бы
     # выходить через прежнюю страну.
-    region_marker = f"{PSIPHON_DIR}/.egress-region"
+    region_marker = f"{t.dir}/.egress-region"
     previous = ""
     try:
         with open(region_marker, encoding="utf-8") as f:
             previous = f.read().strip()
     except OSError:
         pass
-    generated = f"{PSIPHON_DIR}/config/psiphon.config"
+    generated = f"{t.dir}/config/psiphon.config"
     if previous and previous != egress and os.path.isfile(generated):
         os.unlink(generated)
         console.print(f"[cyan]Страна выхода меняется {previous} → {egress}: "
                       "прежний psiphon.config удалён, иначе он бы победил.[/cyan]")
 
-    write_file(compose_path, psiphon_compose(egress, device))
+    write_file(compose_path, psiphon_compose(egress, device, t))
     write_file(region_marker, egress + "\n")
-    console.print(f"[green]✓ Конфигурация записана: {compose_path} "
-                  f"(страна выхода {egress})[/green]")
+    console.print(f"[green]✓ Туннель {t.n}: конфигурация записана в {compose_path} "
+                  f"(страна выхода {egress}, порт {t.port})[/green]")
 
     base = compose_base(compose_path)
     if base is None:
@@ -4298,41 +4459,72 @@ def block_psiphon(params: tuple[str, str, bool] | None = None) -> None:
     run(base + ["pull"], check=False)
     run(base + ["up", "-d"])
 
-    console.print("[cyan]Жду, пока Psiphon подберёт сервер…[/cyan]")
+    console.print(f"[cyan]Жду, пока туннель {t.n} подберёт сервер…[/cyan]")
     ok, ip = False, ""
     for _ in range(24):          # до двух минут
-        ok, ip = _psiphon_check()
+        ok, ip = _psiphon_check(t.port)
         if ok:
             break
         time.sleep(5)
 
     if not ok:
-        logs = probe(["docker", "logs", "--tail", "20", PSIPHON_CONTAINER]).stdout
+        logs = probe(["docker", "logs", "--tail", "20", t.container]).stdout
         raise RuntimeError(
-            "Psiphon не построил туннель за две минуты.\n"
+            f"Psiphon (туннель {t.n}) не построил туннель за две минуты.\n"
             f"  Последние строки журнала:\n{logs.strip() or '  (пусто)'}")
 
-    console.print(f"[green]✓ Psiphon работает, внешний адрес: {ip}[/green]")
+    console.print(f"[green]✓ Туннель {t.n} работает, внешний адрес: {ip}[/green]")
+    return ip
+
+
+def block_psiphon(params: tuple[str, str, bool, int] | None = None) -> None:
+    step("Psiphon: альтернативный egress для нейросетей")
+
+    if shutil.which("docker") is None:
+        raise RuntimeError("Docker не установлен — сначала установите ноду")
+    ensure_packages("curl")
+
+    egress, device, watchdog, count = params if params else ("US", "US", False, 1)
+    count = max(1, min(count, PSIPHON_MAX_TUNNELS))
+    tunnels = [psiphon_tunnel(n) for n in range(1, count + 1)]
+    regions = psiphon_tunnel_regions(egress, count)
+
+    for t, region in zip(tunnels, regions):
+        # DEVICE_REGION выбран пользователем только для первого туннеля; у
+        # остальных он, как и там, совпадает со страной выхода
+        _install_psiphon_tunnel(t, region, device if t.n == 1 else region)
 
     socks_address = _warp_socks_address()   # логика та же: host или шлюз docker0
     ref_path = f"{INSTALL_DIR}/panel-psiphon-outbound.json"
     os.makedirs(INSTALL_DIR, exist_ok=True)
-    write_file(ref_path, psiphon_outbound_reference(socks_address))
+    write_file(ref_path, psiphon_outbound_reference(socks_address, count))
     console.print(f"[green]✓ Заготовка для панели: {ref_path}[/green]")
     if watchdog:
-        _setup_psiphon_watchdog(egress)
+        for t, region in zip(tunnels, regions):
+            _setup_psiphon_watchdog(region, t)
     else:
         # Сторож мог остаться от прежней настройки — выключаем, иначе он
         # продолжит менять страну вопреки только что сделанному выбору
-        for unit in ("psiphon-watchdog.service", "psiphon-watchdog.timer"):
-            if os.path.isfile(f"/etc/systemd/system/{unit}"):
-                run(["systemctl", "disable", "--now", unit], check=False)
-                console.print("[dim]Автоподбор страны выключен[/dim]")
+        for t in tunnels:
+            units = [t.service] + (["psiphon-watchdog.timer"] if t.n == 1 else [])
+            for unit in units:
+                if os.path.isfile(f"/etc/systemd/system/{unit}"):
+                    run(["systemctl", "disable", "--now", unit], check=False)
+                    console.print(f"[dim]Автоподбор страны туннеля {t.n} "
+                                  "выключен[/dim]")
 
-    console.print(
-        "[bold yellow]Важно:[/bold yellow] в панели Remnawave добавьте outbound "
-        f"и правило из {ref_path}, поставив правило ВЫШЕ правила с DIRECT. "
-        "Если те же домены уже уходят в WARP — оставьте что-то одно.")
+    if count == 1:
+        console.print(
+            "[bold yellow]Важно:[/bold yellow] в панели Remnawave добавьте outbound "
+            f"и правило из {ref_path}, поставив правило ВЫШЕ правила с DIRECT. "
+            "Если те же домены уже уходят в WARP — оставьте что-то одно.")
+    else:
+        console.print(
+            "[bold yellow]Важно:[/bold yellow] в панели Remnawave добавьте в профиль "
+            f"ноды из {ref_path} outbound'ы, observatory, балансировщики и правила, "
+            "поставив правила ВЫШЕ правила с DIRECT. Пользователи разделятся между "
+            f"{count} туннелями по адресу клиента, и каждый туннель подстрахует "
+            "соседний.")
 
 
 def warp_present() -> bool:
@@ -4378,11 +4570,8 @@ def remove_warp() -> None:
 
 
 def psiphon_present() -> bool:
-    """Есть ли что удалять: контейнер, каталог или юнит сторожа."""
-    return (os.path.isdir(PSIPHON_DIR)
-            or os.path.isfile("/etc/systemd/system/psiphon-watchdog.service")
-            or probe(["docker", "inspect", "-f", "{{.Name}}",
-                      PSIPHON_CONTAINER]).returncode == 0)
+    """Есть ли что удалять: контейнер, каталог или юнит сторожа любого туннеля."""
+    return bool(psiphon_tunnels_present())
 
 
 def remove_psiphon() -> None:
@@ -4391,53 +4580,58 @@ def remove_psiphon() -> None:
     Порядок обратный установке: сначала сторож, иначе он успеет пересоздать
     контейнер между `down` и удалением каталога."""
     step("Удаление Psiphon")
+    tunnels = psiphon_tunnels_present() or [psiphon_tunnel(1)]
+    tags = ", ".join(f"«{t.tag}»" for t in tunnels)
 
     # Правила в панели живут отдельно от сервера, и снять их отсюда нельзя.
     # Если оставить их и убрать контейнер, домены не уйдут напрямую — xray
     # продолжит слать их в мёртвый SOCKS, и сервисы просто перестанут
     # открываться. Поэтому спрашиваем до, а не рассказываем после.
     console.print(
-        "[yellow]Сначала уберите из профиля ноды в панели outbound "
-        "«psiphon-out» и правило, которое на него ссылается.[/yellow]\n"
+        f"[yellow]Сначала уберите из профиля ноды в панели outbound {tags} и "
+        "правила, которые на них ссылаются (и балансировщики, если туннелей "
+        "несколько).[/yellow]\n"
         "[dim]Если правило останется, xray продолжит слать домены в уже "
         "несуществующий SOCKS, и они перестанут открываться вовсе.[/dim]")
     if not questionary.confirm(
-            "В панели правил с psiphon-out больше нет — удалять?",
+            "В панели правил с Psiphon больше нет — удалять?",
             default=False, style=CUSTOM_STYLE).ask():
         console.print("[dim]Отменено.[/dim]")
         return
 
-    for unit in ("psiphon-watchdog.service", "psiphon-watchdog.timer"):
-        path = f"/etc/systemd/system/{unit}"
-        if os.path.isfile(path):
-            run(["systemctl", "disable", "--now", unit], check=False)
-            os.unlink(path)
+    for t in tunnels:
+        units = [t.service] + (["psiphon-watchdog.timer"] if t.n == 1 else [])
+        for unit in units:
+            path = f"/etc/systemd/system/{unit}"
+            if os.path.isfile(path):
+                run(["systemctl", "disable", "--now", unit], check=False)
+                os.unlink(path)
+        if os.path.isfile(t.logrotate):
+            os.unlink(t.logrotate)
     run(["systemctl", "daemon-reload"], check=False)
-    for path in (PSIPHON_LOGROTATE_PATH,):
-        if os.path.isfile(path):
-            os.unlink(path)
-    console.print("[green]✓ Сторож и ротация логов убраны[/green]")
+    console.print("[green]✓ Сторожа и ротация логов убраны[/green]")
 
-    compose_path = f"{PSIPHON_DIR}/docker-compose.yml"
-    base = compose_base(compose_path) if os.path.isfile(compose_path) else None
-    if base is not None:
-        run(base + ["down"], check=False)
-    # Контейнер мог остаться и без compose — например, после ручной правки
-    probe(["docker", "rm", "-f", PSIPHON_CONTAINER])
+    for t in tunnels:
+        compose_path = f"{t.dir}/docker-compose.yml"
+        base = compose_base(compose_path) if os.path.isfile(compose_path) else None
+        if base is not None:
+            run(base + ["down"], check=False)
+        # Контейнер мог остаться и без compose — например, после ручной правки
+        probe(["docker", "rm", "-f", t.container])
+        if os.path.isdir(t.dir):
+            shutil.rmtree(t.dir, ignore_errors=True)
     probe(["docker", "image", "rm", "swarupsengupta2007/psiphon:latest"])
-    console.print("[green]✓ Контейнер и образ удалены[/green]")
+    console.print("[green]✓ Контейнеры и образ удалены[/green]")
 
-    if os.path.isdir(PSIPHON_DIR):
-        shutil.rmtree(PSIPHON_DIR, ignore_errors=True)
     ref = f"{INSTALL_DIR}/panel-psiphon-outbound.json"
     if os.path.isfile(ref):
         os.unlink(ref)
-    console.print(f"[green]✓ Каталог {PSIPHON_DIR} и заготовка для панели "
-                  "удалены[/green]")
+    dirs = ", ".join(t.dir for t in tunnels)
+    console.print(f"[green]✓ Каталоги {dirs} и заготовка для панели удалены[/green]")
     console.print("[green]✓ Psiphon удалён[/green]")
 
 
-def ask_psiphon_params() -> tuple[str, str, bool] | None:
+def ask_psiphon_params() -> tuple[str, str, bool, int] | None:
     names = dict(PSIPHON_REGIONS)
     egress = questionary.select(
         "Страна выхода Psiphon (через неё сервисы увидят ваш трафик):",
@@ -4460,9 +4654,20 @@ def ask_psiphon_params() -> tuple[str, str, bool] | None:
     if watchdog is None:
         return None
 
+    count = questionary.select(
+        "Сколько туннелей поднять? Туннель один на всех пользователей ноды и "
+        "держит 50–150 Мбит/с; с несколькими пользователи делятся между ними:",
+        choices=[questionary.Choice("1 — один туннель", value=1),
+                 *[questionary.Choice(
+                     f"{n} — страны {', '.join(psiphon_tunnel_regions(egress, n))}",
+                     value=n) for n in range(2, PSIPHON_MAX_TUNNELS + 1)]],
+        style=CUSTOM_STYLE).ask()
+    if count is None:
+        return None
+
     # DEVICE_REGION описывает «откуда» клиент: оставляем совпадающим с выходом,
     # чтобы Psiphon не подбирал маршрут под другую страну.
-    return (egress, egress, bool(watchdog))
+    return (egress, egress, bool(watchdog), count)
 
 
 # ------------------------------------------------------------------ #
@@ -5393,7 +5598,7 @@ def menu_remnawave_node() -> None:
     if "warp" in selected and not egress_present["warp"]:
         warp_license = ask_warp_license()
 
-    psiphon_params: tuple[str, str, bool] | None = None
+    psiphon_params: tuple[str, str, bool, int] | None = None
     if "psiphon" in selected and not egress_present["psiphon"]:
         psiphon_params = ask_psiphon_params()
         if psiphon_params is None:
@@ -6526,9 +6731,9 @@ def test_google_locale() -> None:
     routes: list[tuple[str, int | None]] = [("напрямую с ноды", None)]
     if _detect_warp():
         routes.append((f"через WARP ({WARP_SOCKS_PORT})", WARP_SOCKS_PORT))
-    if _detect_psiphon():
-        routes.append((f"через Psiphon ({PSIPHON_SOCKS_PORT})",
-                       PSIPHON_SOCKS_PORT))
+    for t in psiphon_tunnels_running():
+        name = "Psiphon" if t.n == 1 else f"Psiphon {t.n}"
+        routes.append((f"через {name} ({t.port})", t.port))
 
     table = Table(box=box.ROUNDED, border_style="cyan", padding=(0, 1))
     table.add_column("Маршрут")
@@ -6814,11 +7019,10 @@ def locale_ok(locale: str) -> bool:
 def egress_status_lines() -> list[str]:
     """Строки о состоянии выходов для шапки. Пусто, если ни один не поднят."""
     lines = []
-    for name, port, running in (
-            ("WARP", WARP_SOCKS_PORT, _detect_warp()),
-            ("Psiphon", PSIPHON_SOCKS_PORT, _detect_psiphon())):
-        if not running:
-            continue
+    exits = [("WARP", WARP_SOCKS_PORT)] if _detect_warp() else []
+    exits += [("Psiphon" if t.n == 1 else f"Psiphon {t.n}", t.port)
+              for t in psiphon_tunnels_running()]
+    for name, port in exits:
         locale = google_locale(port)
         if not locale:
             verdict = "[yellow]Google не ответил[/yellow]"
