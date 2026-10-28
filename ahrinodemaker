@@ -302,6 +302,26 @@ def reattach_tty() -> bool:
 ENV = {**os.environ, "DEBIAN_FRONTEND": "noninteractive"}
 
 
+def _lock_holders(locks: list[str]) -> str:
+    """Чем именно занят пакетный менеджер. Пусто — выяснить не удалось.
+
+    fuser печатает pid-ы, а имя процесса лежит в /proc/<pid>/comm. Без этого
+    в выводе остаётся только «занят», и непонятно, ждать или вмешиваться.
+    """
+    names: dict[str, None] = {}
+    for lock in locks:
+        out = probe(["fuser", lock]).stdout
+        for token in out.replace(":", " ").split():
+            if not token.isdigit():
+                continue
+            try:
+                with open(f"/proc/{token}/comm", encoding="utf-8") as f:
+                    names[f.read().strip()] = None
+            except OSError:
+                continue
+    return ", ".join(names)
+
+
 def wait_for_apt_lock(timeout: int = 300) -> None:
     """Ждёт освобождения блокировки dpkg/apt — её часто держит
     unattended-upgrades сразу после загрузки сервера. Опрос идёт через fuser
@@ -323,11 +343,24 @@ def wait_for_apt_lock(timeout: int = 300) -> None:
             for lk in locks
         )
         if not busy:
+            if announced:
+                console.print(f"[green]✓ Блокировка освободилась через "
+                              f"{waited}с[/green]")
             return
         if not announced:
-            console.print("[yellow]Пакетный менеджер занят (вероятно, "
-                          "unattended-upgrades) — жду освобождения блокировки…[/yellow]")
+            holders = _lock_holders(locks)
+            who = f"занят ({holders})" if holders else "занят"
+            console.print(f"[yellow]Пакетный менеджер {who} — жду освобождения "
+                          f"блокировки, до {timeout}с.[/yellow]")
+            console.print("[dim]Это нормально на только что созданном сервере: "
+                          "unattended-upgrades ставит обновления сам. По "
+                          "истечении срока скрипт продолжит, передав apt свой "
+                          "DPkg::Lock::Timeout.[/dim]")
             announced = True
+        elif waited and waited % 30 == 0:
+            # Без отсчёта пятиминутное ожидание выглядит как зависание.
+            console.print(f"[dim]  …всё ещё занят, прошло {waited}с из "
+                          f"{timeout}[/dim]")
         time.sleep(3)
         waited += 3
     console.print(f"[yellow]Блокировка apt всё ещё занята после {timeout}с — "
@@ -821,6 +854,7 @@ SSH_AUTHORIZED_KEYS = f"{SSH_DIR}/authorized_keys"
 DEFAULT_SSH_KEYS = (
     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIH0s3wFt1S3XYICE0s+1WGWMzIze72hZiZeVne8+Pv+J zk_main",
     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDYB3ruoAmYtkYzcR+CD2nUWvml0ankCF74ws+0p1+Ik zk_rezerv",
+    "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQCuuqUY9FC0aCO7SiVOWgLxJjP/CQzqFcXZPRJugoW0oADnwelhmSxYVVhK3ch4+ua0AOI6TwH0lOR3JxM7gpSe7MvlH0+XwHu2O0rU3FuMHgbeWK+qh94N5/rQW5FwRdGHgd1PQD3z5cPlf6CUZ1EDsvB9b6ERuAPKr1w+uwZsvmab/CsVcJUx+Voalt8Uxn9Kvdtin/3B3IaB83FZLlISjkWdJa0/f7td1Iemaf41ea6et6a+0F2PPo8bmVynZ9uO3hxt7hDDX5Xi/JpqryxVuWQWZpkRG1JWzr0iTFxiDkYvlYq4P+jwwVfrsR8L4kB0u3f4/yqu1286ud3syHym1CdlIYpANgSnlWjp8gLV/dZgpX9PapIogAkiXOEfvYN0g/11mtVUveO5UUTh2bu5HzOMH08MVNqbXElDddW6bIYRTBCp9K74d9D10J5TFL8ffyGhF4WFqO4WrO/svQ2WlDqNNsrsIK9lZPFN5mzNp1yDfLvesUE3tIudtLp6myc+2D1hr+eX6UHf65bJ46un7QCroDqRADyu7VI50zfyNTZeA+W4q23/WVS6v5FZc+ld0azCW87DbRUI08bJzRri/RgIiKf6gvGmacxMEXhOGzSbS6/1eIu1yfhVTlRG6wAN7yuxI+rSPbz3jA58l2DnyK67ziVE9sD5J3TxTsaYcw== zk_rsa",
 )
 
 # Типы, которые считаем ключами. Нужны, чтобы отличить тип от опций: строка
