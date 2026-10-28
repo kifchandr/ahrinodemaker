@@ -905,6 +905,38 @@ def write_authorized_keys(lines: list[str]) -> None:
     write_file(SSH_AUTHORIZED_KEYS, content + "\n" if content else "", mode=0o600)
 
 
+def _ssh_connection() -> tuple[str, str]:
+    """Адрес и порт клиента текущей сессии. Пустые строки — не определили.
+
+    sudo по умолчанию вычищает окружение, а скрипт запускают через sudo, так
+    что SSH_CONNECTION у нас обычно нет. Зато она есть у того sshd, из
+    которого выросла оболочка, и мы под root, поэтому можем прочитать
+    окружение предков прямо из /proc.
+    """
+    value = os.environ.get("SSH_CONNECTION", "")
+    pid = os.getpid()
+    # Ограничиваем длину подъёма: между нами и sshd стоят sudo и оболочка, но
+    # на зацикленном или подменённом /proc лучше просто сдаться.
+    for _ in range(12):
+        if value or pid <= 1:
+            break
+        try:
+            with open(f"/proc/{pid}/environ", "rb") as f:
+                environ = f.read().split(bytes([0]))
+            with open(f"/proc/{pid}/stat", "rb") as f:
+                # Имя процесса в скобках может содержать что угодно, включая
+                # пробелы, поэтому отсчитываем поля после последней скобки.
+                pid = int(f.read().rsplit(b")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            break
+        for item in environ:
+            if item.startswith(b"SSH_CONNECTION="):
+                value = item.split(b"=", 1)[1].decode("utf-8", "replace")
+                break
+    parts = value.split()
+    return (parts[0], parts[1]) if len(parts) >= 2 else ("", "")
+
+
 def current_session_fingerprint() -> str:
     """Отпечаток ключа, которым открыта текущая сессия. Пусто — не определили.
 
@@ -913,10 +945,9 @@ def current_session_fingerprint() -> str:
     порт клиента, а они же лежат в SSH_CONNECTION — пара адрес+порт уникальна,
     поэтому сопоставление точное.
     """
-    connection = os.environ.get("SSH_CONNECTION", "").split()
-    if len(connection) < 2:
+    client_ip, client_port = _ssh_connection()
+    if not client_ip:
         return ""
-    client_ip, client_port = connection[0], connection[1]
     for entry in ssh_login_entries():
         if entry["ip"] == client_ip and entry["port"] == client_port:
             return entry["fingerprint"]
@@ -1087,10 +1118,22 @@ def add_ssh_keys(keys) -> tuple[int, int, int]:
 
 
 # Настройку пишем отдельным файлом, а не правкой sshd_config: так видно, чья
-# она, и снимается она сменой одной строки, не задевая остального конфига.
-# sshd берёт первое встреченное значение, а Include sshd_config.d стоит в
-# начале конфига, поэтому drop-in перебивает и то, что написано ниже руками.
-SSHD_PASSWORD_PATH = "/etc/ssh/sshd_config.d/99-ahrinode-password.conf"
+# она, и снимается она сменой одного слова.
+#
+# Префикс 00 важен. sshd берёт ПЕРВОЕ встреченное значение, а Include
+# подставляет файлы каталога по алфавиту, поэтому «99-» проигрывало бы любому
+# файлу с меньшим номером — на облачных образах там лежит 50-cloud-init.conf
+# с «PasswordAuthentication yes».
+SSHD_PASSWORD_PATH = "/etc/ssh/sshd_config.d/00-ahrinode-password.conf"
+SSHD_PASSWORD_LEGACY = "/etc/ssh/sshd_config.d/99-ahrinode-password.conf"
+SSHD_CONFIG = "/etc/ssh/sshd_config"
+SSHD_CONFIG_DIR = "/etc/ssh/sshd_config.d"
+
+# Директивы, которые спорят с нашей. ChallengeResponseAuthentication — старое
+# имя KbdInteractiveAuthentication, на старых конфигах встречается до сих пор.
+SSHD_PASSWORD_DIRECTIVES = ("passwordauthentication",
+                            "kbdinteractiveauthentication",
+                            "challengeresponseauthentication")
 
 
 def password_auth_enabled() -> bool | None:
@@ -1102,33 +1145,119 @@ def password_auth_enabled() -> bool | None:
     return None
 
 
+def _sshd_password_dropin(enabled: bool) -> str:
+    word = "yes" if enabled else "no"
+    return ("# Поставлено ahrinodemaker.\n"
+            f"PasswordAuthentication {word}\n"
+            # На Ubuntu пароль пролезает и через клавиатурно-интерактивный
+            # метод поверх PAM, поэтому одного PasswordAuthentication мало.
+            f"KbdInteractiveAuthentication {word}\n")
+
+
+def _sshd_conflicting_files() -> list[str]:
+    """Файлы, где настройка пароля задана помимо нашего drop-in."""
+    candidates = [SSHD_CONFIG]
+    try:
+        candidates += sorted(os.path.join(SSHD_CONFIG_DIR, name)
+                             for name in os.listdir(SSHD_CONFIG_DIR)
+                             if name.endswith(".conf"))
+    except OSError:
+        pass
+    found = []
+    for path in candidates:
+        if path == SSHD_PASSWORD_PATH:
+            continue
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                lines = f.read().splitlines()
+        except OSError:
+            continue
+        if any(line.strip().split(None, 1)[0].lower() in SSHD_PASSWORD_DIRECTIVES
+               for line in lines if line.strip() and not line.startswith("#")):
+            found.append(path)
+    return found
+
+
+def _file_mode(path: str, default: int = 0o644) -> int:
+    """Текущие права файла. Нужны, чтобы перезапись их не расширяла:
+    у 50-cloud-init.conf они 600, и делать его читаемым всем незачем."""
+    try:
+        return os.stat(path).st_mode & 0o777
+    except OSError:
+        return default
+
+
+def _sshd_comment_out(path: str) -> int:
+    """Закомментировать спорные директивы в файле. → сколько строк тронуто."""
+    with open(path, encoding="utf-8", errors="replace") as f:
+        lines = f.read().splitlines()
+    out = []
+    touched = 0
+    for line in lines:
+        bare = line.strip()
+        if (bare and not bare.startswith("#")
+                and bare.split(None, 1)[0].lower() in SSHD_PASSWORD_DIRECTIVES):
+            out.append("# Отключено ahrinodemaker: настройка задана в "
+                       + os.path.basename(SSHD_PASSWORD_PATH))
+            out.append("# " + line)
+            touched += 1
+        else:
+            out.append(line)
+    if touched:
+        write_file(path, "\n".join(out) + "\n", mode=_file_mode(path))
+    return touched
+
+
 def set_password_auth(enabled: bool) -> bool | None:
     """Открывает или закрывает вход по паролю. → что ответил sshd после.
 
-    Возвращаем не «записали», а настоящее состояние: старые sshd не читают
-    sshd_config.d, и тогда файл лежит, а пароль остаётся как был. Верить тут
-    можно только самому sshd.
+    Возвращаем не «записали», а настоящее состояние: мало ли, что sshd читает
+    и в каком порядке. Верить тут можно только ему самому.
     """
-    word = "yes" if enabled else "no"
-    previous = None
-    if os.path.exists(SSHD_PASSWORD_PATH):
-        with open(SSHD_PASSWORD_PATH, encoding="utf-8") as f:
-            previous = f.read()
-    write_file(SSHD_PASSWORD_PATH,
-               "# Поставлено ahrinodemaker.\n"
-               f"PasswordAuthentication {word}\n"
-               # На Ubuntu пароль пролезает и через клавиатурно-интерактивный
-               # метод поверх PAM, поэтому одного PasswordAuthentication мало.
-               f"KbdInteractiveAuthentication {word}\n")
+    snapshot = {}
+    for path in (SSHD_PASSWORD_PATH, SSHD_PASSWORD_LEGACY):
+        if os.path.exists(path):
+            with open(path, encoding="utf-8", errors="replace") as f:
+                snapshot[path] = f.read()
+
+    def restore() -> None:
+        for path, content in snapshot.items():
+            write_file(path, content, backup=False)
+        for path in (SSHD_PASSWORD_PATH, SSHD_PASSWORD_LEGACY):
+            if path not in snapshot and os.path.exists(path):
+                os.remove(path)
+
+    # Файл под старым именем 99- проигрывал по алфавиту и только путает.
+    if os.path.exists(SSHD_PASSWORD_LEGACY):
+        os.remove(SSHD_PASSWORD_LEGACY)
+    write_file(SSHD_PASSWORD_PATH, _sshd_password_dropin(enabled))
+
+    state = _sshd_apply(restore)
+    if state is enabled:
+        return state
+
+    # Значит, нашу настройку кто-то перекрывает: либо Include вообще нет в
+    # sshd_config, либо в самом конфиге директива стоит раньше. Убираем
+    # спорные строки и, если каталог не читается, дописываем настройку прямо
+    # в sshd_config.
+    for path in _sshd_conflicting_files():
+        _sshd_comment_out(path)
+    with open(SSHD_CONFIG, encoding="utf-8", errors="replace") as f:
+        config = f.read()
+    if "sshd_config.d" not in config:
+        write_file(SSHD_CONFIG,
+                   config.rstrip("\n") + "\n\n" + _sshd_password_dropin(enabled))
+    return _sshd_apply(restore)
+
+
+def _sshd_apply(restore) -> bool | None:
+    """Проверить конфиг, перезагрузить службу, спросить состояние у sshd."""
     test = probe(["sshd", "-t"])
     if test.returncode != 0:
-        # Откатываемся до того, как перезагружать службу: сломанный конфиг
-        # оставит sshd без возможности запуститься заново.
-        if previous is None:
-            os.remove(SSHD_PASSWORD_PATH)
-        else:
-            write_file(SSHD_PASSWORD_PATH, previous)
-        raise RuntimeError("sshd отверг конфигурацию, файл возвращён как был:\n"
+        # Откатываемся до перезагрузки службы: сломанный конфиг оставит sshd
+        # без возможности запуститься заново.
+        restore()
+        raise RuntimeError("sshd отверг конфигурацию, файлы возвращены как были:\n"
                            + (test.stderr or test.stdout).strip())
     # Служба называется то ssh, то sshd — зависит от дистрибутива. Вторую
     # пробуем только если первой нет, иначе в вывод летит ошибка про
@@ -1172,10 +1301,10 @@ def block_ssh_keys() -> None:
         console.print("[green]✓ Вход по паролю запрещён — остались только "
                       "ключи[/green]")
     else:
-        console.print("[yellow]Файл записан, но sshd всё ещё пускает по "
-                      f"паролю: похоже, он не читает {SSHD_PASSWORD_PATH}. "
-                      "Добавьте «PasswordAuthentication no» в "
-                      "/etc/ssh/sshd_config вручную.[/yellow]")
+        console.print("[yellow]Вход по паролю закрыть не удалось: sshd по-прежнему "
+                      f"пускает по паролю даже после правки {SSHD_PASSWORD_PATH} "
+                      f"и {SSHD_CONFIG}. Посмотрите «sshd -T | grep "
+                      "passwordauth» и Match-блоки конфига.[/yellow]")
 
 
 def detect_ssh_ports() -> list[int]:
@@ -7450,9 +7579,9 @@ def _ssh_keys_toggle_password() -> None:
         console.print("[green]✓ Вход по паролю "
                       + ("разрешён" if want else "запрещён") + "[/green]")
     else:
-        console.print("[yellow]Файл записан, но sshd остался при своём: "
-                      f"похоже, он не читает {SSHD_PASSWORD_PATH}. Правьте "
-                      "/etc/ssh/sshd_config вручную.[/yellow]")
+        console.print("[yellow]sshd остался при своём даже после правки "
+                      f"{SSHD_PASSWORD_PATH} и {SSHD_CONFIG}: посмотрите "
+                      "«sshd -T | grep passwordauth» и Match-блоки.[/yellow]")
 
 
 def menu_ssh_keys() -> None:
