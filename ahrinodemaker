@@ -26,6 +26,8 @@ import subprocess
 import concurrent.futures
 import importlib
 import tempfile
+import base64
+import binascii
 from typing import NamedTuple
 
 # ------------------------------------------------------------------ #
@@ -803,6 +805,262 @@ def parse_ssh_ports(sshd_config: str, socket_listen: str, sockets: str) -> list[
         if m:
             add(m.group(1))
     return ports
+# ------------------------------------------------------------------ #
+# SSH-ключи: доступ к ноде
+# ------------------------------------------------------------------ #
+# Пароль на свежей ноде обычно приходит от хостера письмом и живёт в нём
+# вечно. Ключи — замена не ему, а необходимости его помнить: при наличии
+# своих ключей на всех нодах доступ одинаковый, а пароль можно закрыть.
+#
+# Блок включён по умолчанию, потому что на новой ноде это первое, что нужно
+# сделать, и забыть об этом дороже, чем лишний раз увидеть галочку.
+SSH_DIR = "/root/.ssh"
+SSH_AUTHORIZED_KEYS = f"{SSH_DIR}/authorized_keys"
+
+# Ключи, которые блок проставляет по умолчанию.
+DEFAULT_SSH_KEYS = (
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIH0s3wFt1S3XYICE0s+1WGWMzIze72hZiZeVne8+Pv+J zk_main",
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDYB3ruoAmYtkYzcR+CD2nUWvml0ankCF74ws+0p1+Ik zk_rezerv",
+)
+
+# Типы, которые считаем ключами. Нужны, чтобы отличить тип от опций: строка
+# authorized_keys может начинаться с «restrict,from="1.2.3.4"» и только потом
+# идёт сам ключ.
+SSH_KEY_TYPES = (
+    "ssh-ed25519", "ssh-rsa", "ssh-dss",
+    "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521",
+    "sk-ssh-ed25519@openssh.com", "sk-ecdsa-sha2-nistp256@openssh.com",
+)
+
+
+def ssh_key_parts(line: str) -> tuple[str, str, str, str] | None:
+    """Разбор строки authorized_keys → (опции, тип, тело, комментарий).
+
+    None — строка не содержит ключа (пустая, комментарий, мусор). Тело в
+    base64 служит идентичностью ключа: комментарий у одного и того же ключа
+    на разных серверах разный, а тело — нет.
+    """
+    line = line.strip()
+    if not line or line.startswith("#"):
+        return None
+    fields = line.split()
+    for index, field in enumerate(fields):
+        if field not in SSH_KEY_TYPES:
+            continue
+        if index + 1 >= len(fields):
+            return None
+        options = " ".join(fields[:index])
+        body = fields[index + 1]
+        comment = " ".join(fields[index + 2:])
+        if not ssh_key_fingerprint(field, body):
+            return None
+        return options, field, body, comment
+    return None
+
+
+def ssh_key_fingerprint(key_type: str, body: str) -> str:
+    """Отпечаток SHA256 в том же виде, в каком его печатает ssh-keygen -l.
+
+    Считаем сами, а не вызовом ssh-keygen: он требует файл на диске, а ключей
+    в списке десяток. Заодно это проверка — тело должно быть корректным
+    base64, внутри которого первым полем записан тот же тип ключа. Битая
+    строка отпечатка не даст, и дальше она просто не считается ключом.
+    """
+    try:
+        raw = base64.b64decode(body, validate=True)
+    except (ValueError, binascii.Error):
+        return ""
+    # Формат ключа: 4 байта длины + имя типа + дальше параметры.
+    if len(raw) < 4:
+        return ""
+    length = int.from_bytes(raw[:4], "big")
+    if length <= 0 or len(raw) < 4 + length:
+        return ""
+    if raw[4:4 + length].decode("utf-8", "replace") != key_type:
+        return ""
+    digest = hashlib.sha256(raw).digest()
+    return "SHA256:" + base64.b64encode(digest).decode("ascii").rstrip("=")
+
+
+def read_authorized_keys() -> list[str]:
+    """Строки файла как есть. Отсутствие файла — пустой список, не ошибка."""
+    try:
+        with open(SSH_AUTHORIZED_KEYS, encoding="utf-8", errors="replace") as f:
+            return f.read().splitlines()
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        raise RuntimeError(f"не удалось прочитать {SSH_AUTHORIZED_KEYS}: {exc}") from exc
+
+
+def write_authorized_keys(lines: list[str]) -> None:
+    """Запись с правами, которые требует sshd.
+
+    При слишком свободных правах на каталог или файл sshd молча игнорирует
+    ключи и пускает только по паролю — выглядит это как «ключ не работает».
+    """
+    os.makedirs(SSH_DIR, exist_ok=True)
+    os.chmod(SSH_DIR, 0o700)
+    content = "\n".join(line.rstrip() for line in lines).strip("\n")
+    write_file(SSH_AUTHORIZED_KEYS, content + "\n" if content else "", mode=0o600)
+
+
+def current_session_fingerprint() -> str:
+    """Отпечаток ключа, которым открыта текущая сессия. Пусто — не определили.
+
+    sshd мог бы сказать это сам через SSH_AUTH_INFO_0, но переменная есть не
+    везде. Зато в журнале у каждой удачной аутентификации записаны адрес и
+    порт клиента, а они же лежат в SSH_CONNECTION — пара адрес+порт уникальна,
+    поэтому сопоставление точное.
+    """
+    connection = os.environ.get("SSH_CONNECTION", "").split()
+    if len(connection) < 2:
+        return ""
+    client_ip, client_port = connection[0], connection[1]
+    for entry in ssh_login_entries():
+        if entry["ip"] == client_ip and entry["port"] == client_port:
+            return entry["fingerprint"]
+    return ""
+
+
+def ssh_login_entries() -> list[dict[str, str]]:
+    """Удачные входы по ключу из журнала: отпечаток, адрес, порт, время.
+
+    Журнал читаем по всем загрузкам: иначе после перезагрузки статистика
+    обнуляется и выглядит так, будто ключом не пользовались.
+    """
+    out = probe(["journalctl", "-u", "ssh", "-u", "sshd", "--no-pager",
+                 "-o", "short-iso", "-b", "all"]).stdout
+    if not out.strip():
+        # Старые системы и образы без systemd-журнала пишут в файл.
+        try:
+            with open("/var/log/auth.log", encoding="utf-8", errors="replace") as f:
+                out = f.read()
+        except OSError:
+            return []
+    entries = []
+    pattern = re.compile(r"Accepted publickey for (\S+) from (\S+) port (\d+)"
+                         r".*?(SHA256:[A-Za-z0-9+/]+)")
+    for line in out.splitlines():
+        m = pattern.search(line)
+        if m:
+            entries.append({"when": _log_timestamp(line), "user": m.group(1),
+                            "ip": m.group(2), "port": m.group(3),
+                            "fingerprint": m.group(4)})
+    return entries
+
+
+def _log_timestamp(line: str) -> str:
+    """Время из строки журнала.
+
+    Форматов два: short-iso у journalctl («2026-10-28T12:49:03+0300») и
+    syslog у /var/log/auth.log («Oct 28 12:49:03»). Угадывать по содержимому
+    дешевле, чем тащить разбор дат ради одной колонки в таблице.
+    """
+    head = line.split()
+    if not head:
+        return ""
+    if "T" in head[0] and "-" in head[0]:
+        return head[0].replace("T", " ")[:16]
+    return " ".join(head[:3])
+
+
+def ssh_key_rows() -> list[dict[str, str]]:
+    """Ключи из authorized_keys с отпечатком и пометками."""
+    rows = []
+    seen: dict[str, int] = {}
+    for number, line in enumerate(read_authorized_keys()):
+        parts = ssh_key_parts(line)
+        if parts is None:
+            continue
+        options, key_type, body, comment = parts
+        fingerprint = ssh_key_fingerprint(key_type, body)
+        rows.append({
+            "line": number,
+            "raw": line.strip(),
+            "options": options,
+            "type": key_type,
+            "body": body,
+            "comment": comment or "(без комментария)",
+            "fingerprint": fingerprint,
+            "duplicate": "yes" if fingerprint in seen else "",
+        })
+        seen.setdefault(fingerprint, number)
+    return rows
+
+
+def add_ssh_keys(keys) -> tuple[int, int, int]:
+    """Добавляет ключи, которых ещё нет. → (добавлено, уже было, дублей убрано).
+
+    Сравнение по телу ключа, а не по строке целиком: один и тот же ключ,
+    записанный с другим комментарием, — это тот же доступ, и второй копии ему
+    не нужно.
+    """
+    existing = read_authorized_keys()
+    bodies = {parts[2] for parts in
+              (ssh_key_parts(line) for line in existing) if parts}
+
+    # Дубликаты внутри файла схлопываем заодно: они накапливаются сами, когда
+    # ключ добавляют повторно, и превращают список в нечитаемый.
+    cleaned: list[str] = []
+    kept: set[str] = set()
+    removed = 0
+    for line in existing:
+        parts = ssh_key_parts(line)
+        if parts is None:
+            cleaned.append(line)
+            continue
+        if parts[2] in kept:
+            removed += 1
+            continue
+        kept.add(parts[2])
+        cleaned.append(line)
+
+    added = 0
+    present = 0
+    for key in keys:
+        parts = ssh_key_parts(key)
+        if parts is None:
+            raise RuntimeError(f"это не похоже на SSH-ключ: {key[:40]}…")
+        if parts[2] in bodies:
+            present += 1
+            continue
+        cleaned.append(key.strip())
+        bodies.add(parts[2])
+        added += 1
+
+    if added or removed:
+        write_authorized_keys(cleaned)
+    return added, present, removed
+
+
+def password_auth_enabled() -> bool | None:
+    """Пускает ли sshd по паролю. None — не смогли выяснить."""
+    out = probe(["sshd", "-T"]).stdout
+    for line in out.splitlines():
+        if line.strip().lower().startswith("passwordauthentication"):
+            return line.strip().split()[-1].lower() == "yes"
+    return None
+
+
+def block_ssh_keys() -> None:
+    step("SSH-ключи: доступ к ноде")
+    added, present, removed = add_ssh_keys(DEFAULT_SSH_KEYS)
+    if added:
+        console.print(f"[green]✓ Добавлено ключей: {added}[/green]")
+    if present:
+        console.print(f"[dim]Уже были на месте: {present}[/dim]")
+    if removed:
+        console.print(f"[dim]Убрано повторов того же ключа: {removed}[/dim]")
+    if not added and not removed:
+        console.print("[green]✓ Все ключи уже на месте[/green]")
+    console.print(f"[dim]Всего ключей в {SSH_AUTHORIZED_KEYS}: "
+                  f"{len(ssh_key_rows())}[/dim]")
+    if password_auth_enabled():
+        console.print("[yellow]Вход по паролю всё ещё разрешён — ключи его не "
+                      "отменяют. Закрыть пароль можно в Tools → «Управление "
+                      "SSH-ключами», там же видно, каким ключом вы сейчас "
+                      "подключены.[/yellow]")
 
 
 def detect_ssh_ports() -> list[int]:
@@ -5204,6 +5462,7 @@ BLOCKS = [
     # docker-compose.yml, который появляется только после установки.
     ("node_install", "Установка Remnawave Node (docker + compose + запуск)", block_node_install),
     ("packages", "Установка пакетов (fail2ban, ufw, unattended-upgrades, cron)", block_packages),
+    ("ssh_keys", "SSH-ключи: добавить ключи доступа в authorized_keys", block_ssh_keys),
     ("time_cron", f"Часовой пояс {TIMEZONE} + cron (перезагрузка по расписанию)", block_time_cron),
     ("fail2ban", "Настройка Fail2Ban", block_fail2ban),
     ("ufw", "Настройка UFW (firewall)", block_ufw),
@@ -5309,6 +5568,13 @@ def _detect_grpc() -> bool:
     return os.path.isfile(GRPC_REFERENCE)
 
 
+def _detect_ssh_keys() -> bool:
+    """Оба ключа по умолчанию уже в файле."""
+    bodies = {row["body"] for row in ssh_key_rows()}
+    return all((ssh_key_parts(key) or (None, None, ""))[2] in bodies
+               for key in DEFAULT_SSH_KEYS)
+
+
 def _detect_selfsteal() -> bool:
     return os.path.isfile(SELFSTEAL_NGINX) and os.path.isfile(SELFSTEAL_REFERENCE)
 
@@ -5342,6 +5608,7 @@ DETECTORS = {
     "hysteria":       _detect_hysteria,
     "grpc":           _detect_grpc,
     "selfsteal":      _detect_selfsteal,
+    "ssh_keys":       _detect_ssh_keys,
     "warp":           _detect_warp,
     "psiphon":        _detect_psiphon,
     "torrent":        _detect_torrent,
@@ -6783,12 +7050,256 @@ def menu_tests() -> None:
             console.print(f"[red]✗ Тест не выполнен: {exc}[/red]")
 
 
+
+
+# ------------------------------------------------------------------ #
+# Tools: управление SSH-ключами
+# ------------------------------------------------------------------ #
+SSHD_NOPASSWORD_PATH = "/etc/ssh/sshd_config.d/99-ahrinode-nopassword.conf"
+
+
+def ssh_login_stats() -> dict[str, dict]:
+    """Сводка входов по отпечатку: сколько раз, когда последний, с каких адресов."""
+    stats: dict[str, dict] = {}
+    for entry in ssh_login_entries():
+        row = stats.setdefault(entry["fingerprint"],
+                               {"count": 0, "last": "", "ips": set()})
+        row["count"] += 1
+        row["ips"].add(entry["ip"])
+        # Журнал идёт по возрастанию времени, поэтому последняя встреченная
+        # строка и есть последний вход.
+        row["last"] = entry["when"]
+    return stats
+
+
+def _print_ssh_keys_table() -> None:
+    rows = ssh_key_rows()
+    current = current_session_fingerprint()
+    stats = ssh_login_stats()
+
+    console.print()
+    if not rows:
+        console.print(f"[yellow]В {SSH_AUTHORIZED_KEYS} нет ни одного ключа."
+                      "[/yellow]")
+    else:
+        table = Table(title="SSH-ключи", box=box.ROUNDED, border_style="cyan",
+                      title_style="bold cyan", padding=(0, 1))
+        table.add_column("#", justify="right")
+        table.add_column("Комментарий")
+        table.add_column("Тип")
+        table.add_column("Отпечаток")
+        table.add_column("Входов", justify="right")
+        table.add_column("Последний")
+        table.add_column("Пометки")
+        for index, row in enumerate(rows, 1):
+            stat = stats.get(row["fingerprint"], {})
+            marks = []
+            if row["fingerprint"] == current:
+                marks.append("[green]текущая сессия[/green]")
+            if row["duplicate"]:
+                marks.append("[yellow]повтор[/yellow]")
+            if row["options"]:
+                marks.append("[dim]с опциями[/dim]")
+            if not stat.get("count"):
+                marks.append("[dim]не входили[/dim]")
+            table.add_row(
+                str(index),
+                row["comment"],
+                row["type"].replace("ssh-", ""),
+                row["fingerprint"].split(":", 1)[-1][:24] + "…",
+                str(stat.get("count", 0)),
+                stat.get("last", "—"),
+                " · ".join(marks) or "—",
+            )
+        console.print(table)
+
+    # Входы ключом, которого в файле уже нет: доступ был и, возможно, его
+    # отозвали — но знать об этом полезнее, чем не знать.
+    known = {row["fingerprint"] for row in rows}
+    orphans = {fp: data for fp, data in stats.items() if fp not in known}
+    if orphans:
+        console.print(f"[dim]Входы ключами, которых в файле больше нет: "
+                      f"{len(orphans)} (последний — "
+                      f"{max(d['last'] for d in orphans.values())})[/dim]")
+
+    password = password_auth_enabled()
+    if password:
+        console.print("[yellow]Вход по паролю разрешён: ключи добавляют "
+                      "доступ, но ничего не закрывают.[/yellow]")
+    elif password is False:
+        console.print("[green]Вход по паролю запрещён — только ключи.[/green]")
+
+
+def _ssh_keys_add() -> None:
+    raw = questionary.text(
+        "Вставьте публичный ключ целиком (ssh-ed25519 AAAA… comment).\n"
+        "  Enter — отмена.\n"
+        "  Ключ:",
+        default="", style=CUSTOM_STYLE).ask()
+    if not raw or not raw.strip():
+        return
+    try:
+        added, present, removed = add_ssh_keys([raw.strip()])
+    except RuntimeError as exc:
+        console.print(f"[red]{exc}[/red]")
+        return
+    if added:
+        console.print("[green]✓ Ключ добавлен[/green]")
+    elif present:
+        console.print("[yellow]Такой ключ уже есть — файл не тронут.[/yellow]")
+    if removed:
+        console.print(f"[dim]Заодно убрано повторов: {removed}[/dim]")
+
+
+def _ssh_keys_remove() -> None:
+    rows = ssh_key_rows()
+    if not rows:
+        console.print("[yellow]Удалять нечего.[/yellow]")
+        return
+    current = current_session_fingerprint()
+    choices = []
+    for index, row in enumerate(rows, 1):
+        label = f"{index}. {row['comment']} — {row['fingerprint'][:20]}…"
+        if row["fingerprint"] == current:
+            label += "  ← этим ключом вы подключены сейчас"
+        choices.append(questionary.Choice(label, value=index - 1))
+    choices.append(questionary.Choice("← Отмена", value=None))
+    picked = questionary.select("Какой ключ удалить?", choices=choices,
+                                style=CUSTOM_STYLE).ask()
+    if picked is None:
+        return
+
+    victim = rows[picked]
+    # Удалить ключ своей же сессии — это выйти и не вернуться, если другого
+    # доступа нет. Поэтому спрашиваем отдельно и с ответом «нет» по умолчанию.
+    if victim["fingerprint"] == current:
+        if not questionary.confirm(
+                "Это ключ текущей сессии. Соединение не оборвётся, но зайти "
+                "заново этим ключом вы уже не сможете. Удалять?",
+                default=False, style=CUSTOM_STYLE).ask():
+            return
+    if len(rows) == 1 and password_auth_enabled() is False:
+        console.print("[red]Это последний ключ, а вход по паролю запрещён — "
+                      "после удаления доступа к серверу не останется совсем. "
+                      "Сначала добавьте другой ключ.[/red]")
+        return
+
+    keep = [line for line in read_authorized_keys()
+            if (ssh_key_parts(line) or (None, None, None))[2] != victim["body"]]
+    write_authorized_keys(keep)
+    console.print(f"[green]✓ Ключ «{victim['comment']}» удалён[/green]")
+
+
+def _ssh_keys_logins() -> None:
+    entries = ssh_login_entries()
+    if not entries:
+        console.print("[yellow]В журнале нет удачных входов по ключу. "
+                      "Возможно, журнал вытеснен — проверьте "
+                      "`journalctl --disk-usage`.[/yellow]")
+        return
+    names = {row["fingerprint"]: row["comment"] for row in ssh_key_rows()}
+    table = Table(title="Входы по ключам", box=box.ROUNDED,
+                  border_style="cyan", title_style="bold cyan", padding=(0, 1))
+    table.add_column("Ключ")
+    table.add_column("Входов", justify="right")
+    table.add_column("Адресов", justify="right")
+    table.add_column("Последний")
+    table.add_column("Откуда (последние)")
+    for fingerprint, data in sorted(ssh_login_stats().items(),
+                                    key=lambda item: -item[1]["count"]):
+        ips = sorted(data["ips"])
+        table.add_row(
+            names.get(fingerprint, f"[dim]нет в файле[/dim] {fingerprint[:16]}…"),
+            str(data["count"]),
+            str(len(ips)),
+            data["last"] or "—",
+            ", ".join(ips[:3]) + (" …" if len(ips) > 3 else ""),
+        )
+    console.print()
+    console.print(table)
+    console.print(f"[dim]Всего записей в журнале: {len(entries)}[/dim]")
+
+
+def _ssh_keys_disable_password() -> None:
+    if password_auth_enabled() is False:
+        console.print("[green]Вход по паролю уже запрещён.[/green]")
+        return
+    rows = ssh_key_rows()
+    if not rows:
+        console.print("[red]Ни одного ключа в файле — закрыть пароль значит "
+                      "потерять доступ. Сначала добавьте ключ.[/red]")
+        return
+    current = current_session_fingerprint()
+    if not current:
+        console.print("[yellow]Не удалось подтвердить, что текущая сессия "
+                      "открыта ключом: журнал не дал совпадения по адресу "
+                      "и порту.[/yellow]")
+    if not questionary.confirm(
+            f"Запретить вход по паролю? Ключей в файле: {len(rows)}. "
+            "Если ни один из них не ваш, доступ будет потерян.",
+            default=False, style=CUSTOM_STYLE).ask():
+        return
+
+    write_file(SSHD_NOPASSWORD_PATH,
+               "# Поставлено ahrinodemaker.\n"
+               "PasswordAuthentication no\n"
+               # На Ubuntu пароль пролезает и через клавиатурно-интерактивный
+               # метод поверх PAM, поэтому одного PasswordAuthentication мало.
+               "KbdInteractiveAuthentication no\n")
+    test = probe(["sshd", "-t"])
+    if test.returncode != 0:
+        os.remove(SSHD_NOPASSWORD_PATH)
+        console.print("[red]sshd отверг конфигурацию, файл убран:\n"
+                      + (test.stderr or test.stdout).strip() + "[/red]")
+        return
+    run(["systemctl", "reload", "ssh"], check=False)
+    run(["systemctl", "reload", "sshd"], check=False)
+
+    # Старые sshd не подключают sshd_config.d — тогда файл лежит, а пароль
+    # по-прежнему открыт. Верим не записи, а тому, что говорит сам sshd.
+    if password_auth_enabled() is False:
+        console.print("[green]✓ Вход по паролю запрещён[/green]")
+    else:
+        console.print("[yellow]Файл записан, но sshd всё ещё пускает по "
+                      f"паролю: похоже, он не читает {SSHD_NOPASSWORD_PATH}. "
+                      "Добавьте «PasswordAuthentication no» в "
+                      "/etc/ssh/sshd_config вручную.[/yellow]")
+
+
+def menu_ssh_keys() -> None:
+    while True:
+        _print_ssh_keys_table()
+        choice = questionary.select(
+            "Управление SSH-ключами:",
+            choices=[
+                questionary.Choice("Добавить ключ", value="add"),
+                questionary.Choice("Удалить ключ", value="remove"),
+                questionary.Choice("Входы по ключам (подробно)", value="logins"),
+                questionary.Choice("Запретить вход по паролю", value="nopassword"),
+                questionary.Choice("← Назад", value="back"),
+            ],
+            style=CUSTOM_STYLE,
+        ).ask()
+        if choice in (None, "back"):
+            return
+        try:
+            if choice == "add":
+                _ssh_keys_add()
+            elif choice == "remove":
+                _ssh_keys_remove()
+            elif choice == "logins":
+                _ssh_keys_logins()
+            elif choice == "nopassword":
+                _ssh_keys_disable_password()
+        except (subprocess.CalledProcessError, OSError, RuntimeError) as exc:
+            console.print(f"[red]✗ {exc}[/red]")
 def menu_tools() -> None:
     while True:
         console.print()
         choices = [
             questionary.Choice("Remnawave Backup & Restore (distillium)",
                                value="backup_restore"),
+            questionary.Choice("Управление SSH-ключами", value="ssh_keys"),
             questionary.Choice("SOCKS5-прокси Dante", value="dante"),
             questionary.Choice("Проверить обновления сторонних скриптов",
                                value="vendor_updates"),
@@ -6801,7 +7312,9 @@ def menu_tools() -> None:
         ).ask()
         if choice in (None, "back"):
             return
-        if choice == "backup_restore":
+        if choice == "ssh_keys":
+            menu_ssh_keys()
+        elif choice == "backup_restore":
             menu_backup_restore()
         elif choice == "dante":
             menu_dante()
