@@ -923,30 +923,82 @@ def current_session_fingerprint() -> str:
     return ""
 
 
-def ssh_login_entries() -> list[dict[str, str]]:
-    """Удачные входы по ключу из журнала: отпечаток, адрес, порт, время.
+_SSH_JOURNAL: str | None = None
+
+SSH_ACCEPTED_RE = re.compile(
+    r"Accepted publickey for (\S+) from (\S+) port (\d+)"
+    r".*?(SHA256:[A-Za-z0-9+/]+)")
+
+# «Failed <метод> for [invalid user] <имя> from <адрес> port <порт>».
+# Метод бывает publickey, password, none, keyboard-interactive/pam.
+SSH_FAILED_RE = re.compile(
+    r"Failed (\S+) for (invalid user )?(\S+) from (\S+) port (\d+)")
+
+
+def _ssh_journal(refresh: bool = False) -> str:
+    """Текст журнала sshd. Читается один раз на заход в меню.
 
     Журнал читаем по всем загрузкам: иначе после перезагрузки статистика
-    обнуляется и выглядит так, будто ключом не пользовались.
+    обнуляется и выглядит так, будто ключом не пользовались. На ноде, которая
+    живёт месяцами, это десятки тысяч строк, а разбирать их нужно трижды — на
+    удачные входы, на неудачные и на определение текущей сессии, — поэтому
+    держим прочитанное в памяти до явного сброса.
     """
+    global _SSH_JOURNAL
+    if _SSH_JOURNAL is not None and not refresh:
+        return _SSH_JOURNAL
     out = probe(["journalctl", "-u", "ssh", "-u", "sshd", "--no-pager",
                  "-o", "short-iso", "-b", "all"]).stdout
     if not out.strip():
         # Старые системы и образы без systemd-журнала пишут в файл.
-        try:
-            with open("/var/log/auth.log", encoding="utf-8", errors="replace") as f:
-                out = f.read()
-        except OSError:
-            return []
+        out = ""
+        for path in ("/var/log/auth.log", "/var/log/secure"):
+            try:
+                with open(path, encoding="utf-8", errors="replace") as f:
+                    out = f.read()
+                break
+            except OSError:
+                continue
+    _SSH_JOURNAL = out
+    return out
+
+
+def ssh_login_entries() -> list[dict[str, str]]:
+    """Удачные входы по ключу из журнала: отпечаток, адрес, порт, время."""
     entries = []
-    pattern = re.compile(r"Accepted publickey for (\S+) from (\S+) port (\d+)"
-                         r".*?(SHA256:[A-Za-z0-9+/]+)")
-    for line in out.splitlines():
-        m = pattern.search(line)
+    for line in _ssh_journal().splitlines():
+        m = SSH_ACCEPTED_RE.search(line)
         if m:
             entries.append({"when": _log_timestamp(line), "user": m.group(1),
                             "ip": m.group(2), "port": m.group(3),
                             "fingerprint": m.group(4)})
+    return entries
+
+
+def ssh_failed_entries() -> list[dict[str, str]]:
+    """Неудачные попытки аутентификации из журнала.
+
+    Считаем только строки «Failed …». Несуществующий пользователь попадает в
+    журнал дважды — отдельной строкой «Invalid user» и затем внутри «Failed
+    password for invalid user», — и если брать обе, число попыток удвоится.
+
+    Важно, что «Failed publickey» сама по себе не означает чужого: клиент
+    предлагает ключи по очереди, и каждый отвергнутый до подходящего попадает
+    в журнал. Отличает чужие попытки имя пользователя и адрес, а не метод.
+    """
+    entries = []
+    for line in _ssh_journal().splitlines():
+        m = SSH_FAILED_RE.search(line)
+        if not m:
+            continue
+        method, invalid, user, ip, port = m.groups()
+        fingerprint = ""
+        fp = re.search(r"SHA256:[A-Za-z0-9+/]+", line)
+        if fp:
+            fingerprint = fp.group(0)
+        entries.append({"when": _log_timestamp(line), "method": method,
+                        "user": user, "invalid": "yes" if invalid else "",
+                        "ip": ip, "port": port, "fingerprint": fingerprint})
     return entries
 
 
@@ -1034,6 +1086,13 @@ def add_ssh_keys(keys) -> tuple[int, int, int]:
     return added, present, removed
 
 
+# Настройку пишем отдельным файлом, а не правкой sshd_config: так видно, чья
+# она, и снимается она сменой одной строки, не задевая остального конфига.
+# sshd берёт первое встреченное значение, а Include sshd_config.d стоит в
+# начале конфига, поэтому drop-in перебивает и то, что написано ниже руками.
+SSHD_PASSWORD_PATH = "/etc/ssh/sshd_config.d/99-ahrinode-password.conf"
+
+
 def password_auth_enabled() -> bool | None:
     """Пускает ли sshd по паролю. None — не смогли выяснить."""
     out = probe(["sshd", "-T"]).stdout
@@ -1041,6 +1100,42 @@ def password_auth_enabled() -> bool | None:
         if line.strip().lower().startswith("passwordauthentication"):
             return line.strip().split()[-1].lower() == "yes"
     return None
+
+
+def set_password_auth(enabled: bool) -> bool | None:
+    """Открывает или закрывает вход по паролю. → что ответил sshd после.
+
+    Возвращаем не «записали», а настоящее состояние: старые sshd не читают
+    sshd_config.d, и тогда файл лежит, а пароль остаётся как был. Верить тут
+    можно только самому sshd.
+    """
+    word = "yes" if enabled else "no"
+    previous = None
+    if os.path.exists(SSHD_PASSWORD_PATH):
+        with open(SSHD_PASSWORD_PATH, encoding="utf-8") as f:
+            previous = f.read()
+    write_file(SSHD_PASSWORD_PATH,
+               "# Поставлено ahrinodemaker.\n"
+               f"PasswordAuthentication {word}\n"
+               # На Ubuntu пароль пролезает и через клавиатурно-интерактивный
+               # метод поверх PAM, поэтому одного PasswordAuthentication мало.
+               f"KbdInteractiveAuthentication {word}\n")
+    test = probe(["sshd", "-t"])
+    if test.returncode != 0:
+        # Откатываемся до того, как перезагружать службу: сломанный конфиг
+        # оставит sshd без возможности запуститься заново.
+        if previous is None:
+            os.remove(SSHD_PASSWORD_PATH)
+        else:
+            write_file(SSHD_PASSWORD_PATH, previous)
+        raise RuntimeError("sshd отверг конфигурацию, файл возвращён как был:\n"
+                           + (test.stderr or test.stdout).strip())
+    # Служба называется то ssh, то sshd — зависит от дистрибутива. Вторую
+    # пробуем только если первой нет, иначе в вывод летит ошибка про
+    # несуществующий юнит.
+    if probe(["systemctl", "reload", "ssh"]).returncode != 0:
+        probe(["systemctl", "reload", "sshd"])
+    return password_auth_enabled()
 
 
 def block_ssh_keys() -> None:
@@ -1054,13 +1149,33 @@ def block_ssh_keys() -> None:
         console.print(f"[dim]Убрано повторов того же ключа: {removed}[/dim]")
     if not added and not removed:
         console.print("[green]✓ Все ключи уже на месте[/green]")
-    console.print(f"[dim]Всего ключей в {SSH_AUTHORIZED_KEYS}: "
-                  f"{len(ssh_key_rows())}[/dim]")
-    if password_auth_enabled():
-        console.print("[yellow]Вход по паролю всё ещё разрешён — ключи его не "
-                      "отменяют. Закрыть пароль можно в Tools → «Управление "
-                      "SSH-ключами», там же видно, каким ключом вы сейчас "
-                      "подключены.[/yellow]")
+    total = len(ssh_key_rows())
+    console.print(f"[dim]Всего ключей в {SSH_AUTHORIZED_KEYS}: {total}[/dim]")
+
+    # Пароль закрываем только после того, как ключи действительно лежат в
+    # файле: иначе остаётся нода, в которую не войти ни ключом, ни паролем.
+    if added + present == 0 or total == 0:
+        console.print("[yellow]Ключей в файле нет — вход по паролю оставлен "
+                      "открытым, иначе доступ к ноде был бы потерян.[/yellow]")
+        return
+    if password_auth_enabled() is False:
+        console.print("[green]✓ Вход по паролю уже запрещён[/green]")
+        return
+    try:
+        state = set_password_auth(False)
+    except (subprocess.CalledProcessError, OSError, RuntimeError) as exc:
+        console.print(f"[yellow]Не удалось закрыть вход по паролю: {exc}\n"
+                      "Ключи при этом на месте, пароль остался как был."
+                      "[/yellow]")
+        return
+    if state is False:
+        console.print("[green]✓ Вход по паролю запрещён — остались только "
+                      "ключи[/green]")
+    else:
+        console.print("[yellow]Файл записан, но sshd всё ещё пускает по "
+                      f"паролю: похоже, он не читает {SSHD_PASSWORD_PATH}. "
+                      "Добавьте «PasswordAuthentication no» в "
+                      "/etc/ssh/sshd_config вручную.[/yellow]")
 
 
 def detect_ssh_ports() -> list[int]:
@@ -5462,7 +5577,7 @@ BLOCKS = [
     # docker-compose.yml, который появляется только после установки.
     ("node_install", "Установка Remnawave Node (docker + compose + запуск)", block_node_install),
     ("packages", "Установка пакетов (fail2ban, ufw, unattended-upgrades, cron)", block_packages),
-    ("ssh_keys", "SSH-ключи: добавить ключи доступа в authorized_keys", block_ssh_keys),
+    ("ssh_keys", "SSH-ключи: доступ по ключам, вход по паролю закрыть", block_ssh_keys),
     ("time_cron", f"Часовой пояс {TIMEZONE} + cron (перезагрузка по расписанию)", block_time_cron),
     ("fail2ban", "Настройка Fail2Ban", block_fail2ban),
     ("ufw", "Настройка UFW (firewall)", block_ufw),
@@ -5569,10 +5684,15 @@ def _detect_grpc() -> bool:
 
 
 def _detect_ssh_keys() -> bool:
-    """Оба ключа по умолчанию уже в файле."""
+    """Оба ключа в файле и вход по паролю закрыт.
+
+    Пароль входит в условие, потому что блок закрывает и его: иначе блок
+    отметился бы сделанным на ноде, которая всё ещё пускает по паролю.
+    """
     bodies = {row["body"] for row in ssh_key_rows()}
-    return all((ssh_key_parts(key) or (None, None, ""))[2] in bodies
-               for key in DEFAULT_SSH_KEYS)
+    keys_ready = all((ssh_key_parts(key) or (None, None, ""))[2] in bodies
+                     for key in DEFAULT_SSH_KEYS)
+    return keys_ready and password_auth_enabled() is False
 
 
 def _detect_selfsteal() -> bool:
@@ -7055,9 +7175,6 @@ def menu_tests() -> None:
 # ------------------------------------------------------------------ #
 # Tools: управление SSH-ключами
 # ------------------------------------------------------------------ #
-SSHD_NOPASSWORD_PATH = "/etc/ssh/sshd_config.d/99-ahrinode-nopassword.conf"
-
-
 def ssh_login_stats() -> dict[str, dict]:
     """Сводка входов по отпечатку: сколько раз, когда последний, с каких адресов."""
     stats: dict[str, dict] = {}
@@ -7121,6 +7238,14 @@ def _print_ssh_keys_table() -> None:
         console.print(f"[dim]Входы ключами, которых в файле больше нет: "
                       f"{len(orphans)} (последний — "
                       f"{max(d['last'] for d in orphans.values())})[/dim]")
+
+    failed = ssh_failed_entries()
+    if failed:
+        sources = len({entry["ip"] for entry in failed})
+        console.print(f"[dim]Неудачных попыток входа: {len(failed)} "
+                      f"с {sources} адрес(ов), последняя — "
+                      f"{failed[-1]['when']}. Подробности — в отдельном "
+                      "пункте меню.[/dim]")
 
     password = password_auth_enabled()
     if password:
@@ -7220,62 +7345,137 @@ def _ssh_keys_logins() -> None:
     console.print(f"[dim]Всего записей в журнале: {len(entries)}[/dim]")
 
 
-def _ssh_keys_disable_password() -> None:
-    if password_auth_enabled() is False:
-        console.print("[green]Вход по паролю уже запрещён.[/green]")
-        return
-    rows = ssh_key_rows()
-    if not rows:
-        console.print("[red]Ни одного ключа в файле — закрыть пароль значит "
-                      "потерять доступ. Сначала добавьте ключ.[/red]")
-        return
-    current = current_session_fingerprint()
-    if not current:
-        console.print("[yellow]Не удалось подтвердить, что текущая сессия "
-                      "открыта ключом: журнал не дал совпадения по адресу "
-                      "и порту.[/yellow]")
-    if not questionary.confirm(
-            f"Запретить вход по паролю? Ключей в файле: {len(rows)}. "
-            "Если ни один из них не ваш, доступ будет потерян.",
-            default=False, style=CUSTOM_STYLE).ask():
-        return
+def ssh_failed_stats() -> dict[str, dict]:
+    """Сводка неудачных попыток по адресу: сколько, когда, какие имена."""
+    stats: dict[str, dict] = {}
+    for entry in ssh_failed_entries():
+        row = stats.setdefault(entry["ip"], {"count": 0, "last": "",
+                                             "users": set(), "methods": set(),
+                                             "invalid": 0})
+        row["count"] += 1
+        row["users"].add(entry["user"])
+        row["methods"].add(entry["method"])
+        if entry["invalid"]:
+            row["invalid"] += 1
+        # Журнал идёт по возрастанию времени, последняя строка и есть последняя.
+        row["last"] = entry["when"]
+    return stats
 
-    write_file(SSHD_NOPASSWORD_PATH,
-               "# Поставлено ahrinodemaker.\n"
-               "PasswordAuthentication no\n"
-               # На Ubuntu пароль пролезает и через клавиатурно-интерактивный
-               # метод поверх PAM, поэтому одного PasswordAuthentication мало.
-               "KbdInteractiveAuthentication no\n")
-    test = probe(["sshd", "-t"])
-    if test.returncode != 0:
-        os.remove(SSHD_NOPASSWORD_PATH)
-        console.print("[red]sshd отверг конфигурацию, файл убран:\n"
-                      + (test.stderr or test.stdout).strip() + "[/red]")
-        return
-    run(["systemctl", "reload", "ssh"], check=False)
-    run(["systemctl", "reload", "sshd"], check=False)
 
-    # Старые sshd не подключают sshd_config.d — тогда файл лежит, а пароль
-    # по-прежнему открыт. Верим не записи, а тому, что говорит сам sshd.
-    if password_auth_enabled() is False:
-        console.print("[green]✓ Вход по паролю запрещён[/green]")
+def _ssh_keys_failed() -> None:
+    entries = ssh_failed_entries()
+    if not entries:
+        console.print("[green]Неудачных попыток входа в журнале нет.[/green]")
+        return
+    stats = ssh_failed_stats()
+    table = Table(title="Неудачные попытки входа", box=box.ROUNDED,
+                  border_style="cyan", title_style="bold cyan", padding=(0, 1))
+    table.add_column("Адрес")
+    table.add_column("Попыток", justify="right")
+    table.add_column("Методы")
+    table.add_column("Имена", justify="right")
+    table.add_column("Кого пробовали")
+    table.add_column("Последняя")
+    top = sorted(stats.items(), key=lambda item: -item[1]["count"])
+    for ip, data in top[:15]:
+        users = sorted(data["users"])
+        table.add_row(
+            ip,
+            str(data["count"]),
+            ", ".join(sorted(data["methods"])),
+            str(len(users)),
+            ", ".join(users[:4]) + (" …" if len(users) > 4 else ""),
+            data["last"] or "—",
+        )
+    console.print()
+    console.print(table)
+    if len(top) > 15:
+        console.print(f"[dim]Показаны 15 самых активных адресов из "
+                      f"{len(top)}.[/dim]")
+    invalid = sum(data["invalid"] for data in stats.values())
+    if invalid:
+        console.print(f"[dim]Из них {invalid} — попытки войти пользователем, "
+                      "которого на сервере нет: это перебор, а не ваши "
+                      "опечатки.[/dim]")
+    mine = {entry["ip"] for entry in ssh_login_entries()}
+    strangers = [ip for ip in stats if ip not in mine]
+    if strangers:
+        console.print(f"[dim]Адресов, с которых ни разу не входили успешно: "
+                      f"{len(strangers)}.[/dim]")
+    if password_auth_enabled():
+        console.print("[yellow]Вход по паролю открыт — каждая такая попытка "
+                      "имеет шанс. С закрытым паролем перебор бесполезен."
+                      "[/yellow]")
     else:
-        console.print("[yellow]Файл записан, но sshd всё ещё пускает по "
-                      f"паролю: похоже, он не читает {SSHD_NOPASSWORD_PATH}. "
-                      "Добавьте «PasswordAuthentication no» в "
+        console.print("[green]Вход по паролю закрыт — подобрать его этими "
+                      "попытками нельзя.[/green]")
+    console.print("[dim]«Failed publickey» бывает и своей: клиент предлагает "
+                  "ключи по очереди, и каждый отвергнутый до подходящего "
+                  "попадает в журнал. Смотреть стоит на имя и адрес.[/dim]")
+
+
+def _ssh_keys_toggle_password() -> None:
+    state = password_auth_enabled()
+    if state is None:
+        console.print("[red]Не удалось узнать у sshd, открыт ли вход по "
+                      "паролю. Ничего не меняю.[/red]")
+        return
+
+    if state:
+        rows = ssh_key_rows()
+        if not rows:
+            console.print("[red]Ни одного ключа в файле — закрыть пароль "
+                          "значит потерять доступ. Сначала добавьте ключ."
+                          "[/red]")
+            return
+        if not current_session_fingerprint():
+            console.print("[yellow]Не удалось подтвердить, что текущая сессия "
+                          "открыта ключом: журнал не дал совпадения по адресу "
+                          "и порту.[/yellow]")
+        if not questionary.confirm(
+                f"Запретить вход по паролю? Ключей в файле: {len(rows)}. "
+                "Если ни один из них не ваш, доступ будет потерян.",
+                default=False, style=CUSTOM_STYLE).ask():
+            return
+    else:
+        if not questionary.confirm(
+                "Снова разрешить вход по паролю? Это открывает ноду для "
+                "перебора, который виден в «Неудачные попытки входа».",
+                default=False, style=CUSTOM_STYLE).ask():
+            return
+
+    want = not state
+    result = set_password_auth(want)
+    if result is want:
+        console.print("[green]✓ Вход по паролю "
+                      + ("разрешён" if want else "запрещён") + "[/green]")
+    else:
+        console.print("[yellow]Файл записан, но sshd остался при своём: "
+                      f"похоже, он не читает {SSHD_PASSWORD_PATH}. Правьте "
                       "/etc/ssh/sshd_config вручную.[/yellow]")
 
 
 def menu_ssh_keys() -> None:
     while True:
+        # Журнал перечитываем на каждом заходе: за время, пока меню открыто,
+        # в нём появляются и новые входы, и новые попытки перебора.
+        _ssh_journal(refresh=True)
         _print_ssh_keys_table()
+        password = password_auth_enabled()
+        if password is None:
+            password_label = "Вход по паролю: состояние неизвестно"
+        elif password:
+            password_label = "Вход по паролю: включён → запретить"
+        else:
+            password_label = "Вход по паролю: запрещён → разрешить"
         choice = questionary.select(
             "Управление SSH-ключами:",
             choices=[
                 questionary.Choice("Добавить ключ", value="add"),
                 questionary.Choice("Удалить ключ", value="remove"),
                 questionary.Choice("Входы по ключам (подробно)", value="logins"),
-                questionary.Choice("Запретить вход по паролю", value="nopassword"),
+                questionary.Choice("Неудачные попытки входа", value="failed"),
+                questionary.Choice(password_label, value="password"),
                 questionary.Choice("← Назад", value="back"),
             ],
             style=CUSTOM_STYLE,
@@ -7289,8 +7489,10 @@ def menu_ssh_keys() -> None:
                 _ssh_keys_remove()
             elif choice == "logins":
                 _ssh_keys_logins()
-            elif choice == "nopassword":
-                _ssh_keys_disable_password()
+            elif choice == "failed":
+                _ssh_keys_failed()
+            elif choice == "password":
+                _ssh_keys_toggle_password()
         except (subprocess.CalledProcessError, OSError, RuntimeError) as exc:
             console.print(f"[red]✗ {exc}[/red]")
 def menu_tools() -> None:
