@@ -28,6 +28,7 @@ import importlib
 import tempfile
 import base64
 import binascii
+import atexit
 from typing import NamedTuple
 
 # ------------------------------------------------------------------ #
@@ -302,16 +303,98 @@ def reattach_tty() -> bool:
 ENV = {**os.environ, "DEBIAN_FRONTEND": "noninteractive"}
 
 
-def _lock_holders(locks: list[str]) -> str:
+# ------------------------------------------------------------------ #
+# apt: ожидание, повторные попытки, вменяемая ошибка
+# ------------------------------------------------------------------ #
+# На только что созданном сервере первые минуты apt занят не нами: cloud-init
+# дотягивает пакеты, а unattended-upgrades сразу берётся за обновления. Любая
+# наша команда apt в это время падает с кодом 100, и это обрывало сразу
+# несколько блоков подряд — обновление системы, установку пакетов, Docker и
+# tblocker, причём все четыре с одинаково бесполезным «returned non-zero exit
+# status 100».
+APT_LOCKS = (
+    "/var/lib/dpkg/lock-frontend",
+    "/var/lib/dpkg/lock",
+    "/var/lib/apt/lists/lock",
+    "/var/cache/apt/archives/lock",
+)
+
+# Юниты обновления, по которым видно «началось и ещё идёт». Одной проверки
+# файлов мало: она отвечает только на вопрос «занято сию секунду», а между
+# нашим опросом и запуском apt обновление успевает взять lock обратно.
+#
+# Здесь только oneshot-юниты, активные ровно во время работы. Сам
+# unattended-upgrades.service в этот список не годится: он Type=simple и на
+# Ubuntu активен постоянно, так что ожидание по нему не кончилось бы никогда.
+# Его работу видно по файловым блокировкам — процесс называется
+# unattended-upgr и попадает в список держателей.
+APT_UNITS = ("apt-daily.service", "apt-daily-upgrade.service")
+
+# Таймеры, из-за которых обновление начинается само посреди нашей работы.
+APT_TIMERS = ("apt-daily.timer", "apt-daily-upgrade.timer")
+
+# По этим словам в выводе отличаем «не смог взять блокировку» (повторим) от
+# настоящей ошибки вроде отсутствующего пакета (повторять бессмысленно).
+APT_LOCK_MARKERS = (
+    "could not get lock",
+    "unable to acquire the dpkg frontend lock",
+    "unable to lock the administration directory",
+    "waiting for cache lock",
+    "temporarily unavailable",
+)
+APT_INTERRUPTED_MARKERS = ("dpkg was interrupted",)
+
+APT_ATTEMPTS = 3
+_apt_timers_held: list[str] = []
+
+
+class AptError(subprocess.CalledProcessError):
+    """CalledProcessError, несущий в тексте последние строки вывода.
+
+    Сводка в конце прогона печатает только str(исключения), а «returned
+    non-zero exit status 100» не объясняет ничего: причина была на экране, но
+    к этому моменту уехала вверх на сотни строк. Тип оставляем прежним, чтобы
+    блоки, которые ловят CalledProcessError, продолжали работать.
+    """
+
+    def __str__(self) -> str:
+        base = super().__str__()
+        lines = [line for line in (self.output or "").splitlines() if line.strip()]
+        if not lines:
+            return base
+        return base + chr(10) + chr(10).join("  " + line for line in lines[-6:])
+
+
+def _apt_units_busy() -> list[str]:
+    """Юниты обновления, работающие прямо сейчас."""
+    return [unit for unit in APT_UNITS
+            if probe(["systemctl", "is-active", "--quiet", unit]).returncode == 0]
+
+
+def _apt_locks_busy() -> bool:
+    """Держит ли кто-нибудь файловые блокировки apt.
+
+    Без fuser (пакет psmisc) ответить нечем — тогда считаем, что свободно, и
+    полагаемся на DPkg::Lock::Timeout внутри самого apt.
+    """
+    if shutil.which("fuser") is None:
+        return False
+    return any(os.path.exists(lock)
+               and probe(["fuser", lock]).returncode == 0
+               for lock in APT_LOCKS)
+
+
+def _lock_holders() -> str:
     """Чем именно занят пакетный менеджер. Пусто — выяснить не удалось.
 
-    fuser печатает pid-ы, а имя процесса лежит в /proc/<pid>/comm. Без этого
-    в выводе остаётся только «занят», и непонятно, ждать или вмешиваться.
+    fuser печатает pid-ы, а имя процесса лежит в /proc/<pid>/comm. Без этого в
+    выводе остаётся только «занято», и непонятно, ждать или вмешиваться.
     """
+    if shutil.which("fuser") is None:
+        return ""
     names: dict[str, None] = {}
-    for lock in locks:
-        out = probe(["fuser", lock]).stdout
-        for token in out.replace(":", " ").split():
+    for lock in APT_LOCKS:
+        for token in probe(["fuser", lock]).stdout.replace(":", " ").split():
             if not token.isdigit():
                 continue
             try:
@@ -322,67 +405,153 @@ def _lock_holders(locks: list[str]) -> str:
     return ", ".join(names)
 
 
-def wait_for_apt_lock(timeout: int = 300) -> None:
-    """Ждёт освобождения блокировки dpkg/apt — её часто держит
-    unattended-upgrades сразу после загрузки сервера. Опрос идёт через fuser
-    (пакет psmisc); если его нет — молча выходим и полагаемся на
-    DPkg::Lock::Timeout внутри самого apt."""
-    if shutil.which("fuser") is None:
+def hold_apt_timers() -> None:
+    """Останавливает таймеры автообновления на время прогона.
+
+    Иначе unattended-upgrades начинается посреди установки, и ждать приходится
+    уже нам. Таймеры именно останавливаем, а не отключаем: после перезагрузки
+    они вернутся сами, а по выходу из скрипта мы их поднимаем.
+    """
+    if _apt_timers_held:
         return
-    locks = [
-        "/var/lib/dpkg/lock-frontend",
-        "/var/lib/dpkg/lock",
-        "/var/lib/apt/lists/lock",
-        "/var/cache/apt/archives/lock",
-    ]
+    for timer in APT_TIMERS:
+        if probe(["systemctl", "is-active", "--quiet", timer]).returncode == 0:
+            probe(["systemctl", "stop", timer])
+            _apt_timers_held.append(timer)
+    if _apt_timers_held:
+        # Через atexit, а не в конце прогона: так таймеры вернутся и после
+        # Ctrl+C, и после исключения, а не только при удачном завершении.
+        atexit.register(release_apt_timers)
+        console.print("[dim]Таймеры автообновления остановлены до конца "
+                      "прогона: " + ", ".join(_apt_timers_held) + "[/dim]")
+
+
+def release_apt_timers() -> None:
+    """Возвращает таймеры автообновления, остановленные на время прогона."""
+    while _apt_timers_held:
+        probe(["systemctl", "start", _apt_timers_held.pop()])
+
+
+def wait_for_apt_lock(timeout: int = 1800) -> None:
+    """Ждёт, пока apt освободится: и файловые блокировки, и юниты обновления.
+
+    Полчаса — не запас на всякий случай: первый unattended-upgrades на свежем
+    сервере честно идёт десять-двадцать минут, а прежние пять минут истекали
+    ровно посередине, после чего apt падал с кодом 100.
+    """
+    hold_apt_timers()
     waited, announced = 0, False
     while waited < timeout:
-        busy = any(
-            os.path.exists(lk) and
-            subprocess.run(["fuser", lk], capture_output=True).returncode == 0
-            for lk in locks
-        )
-        if not busy:
+        units = _apt_units_busy()
+        if not units and not _apt_locks_busy():
             if announced:
-                console.print(f"[green]✓ Блокировка освободилась через "
-                              f"{waited}с[/green]")
+                console.print(f"[green]✓ apt освободился через {waited}с[/green]")
             return
         if not announced:
-            holders = _lock_holders(locks)
-            who = f"занят ({holders})" if holders else "занят"
-            console.print(f"[yellow]Пакетный менеджер {who} — жду освобождения "
-                          f"блокировки, до {timeout}с.[/yellow]")
-            console.print("[dim]Это нормально на только что созданном сервере: "
-                          "unattended-upgrades ставит обновления сам. По "
-                          "истечении срока скрипт продолжит, передав apt свой "
-                          "DPkg::Lock::Timeout.[/dim]")
+            who = ", ".join(units) or _lock_holders() or "другой процесс"
+            console.print(f"[yellow]apt занят ({who}) — ждём освобождения, "
+                          f"до {timeout}с.[/yellow]")
+            console.print("[dim]На только что созданном сервере это обычное "
+                          "дело: система ставит обновления сама. Прерывать "
+                          "не нужно — закончит и уступит.[/dim]")
             announced = True
-        elif waited and waited % 30 == 0:
-            # Без отсчёта пятиминутное ожидание выглядит как зависание.
-            console.print(f"[dim]  …всё ещё занят, прошло {waited}с из "
-                          f"{timeout}[/dim]")
+        elif waited and waited % 60 == 0:
+            console.print(f"[dim]  …всё ещё занят, прошло {waited}с "
+                          f"из {timeout}[/dim]")
         time.sleep(3)
         waited += 3
-    console.print(f"[yellow]Блокировка apt всё ещё занята после {timeout}с — "
-                  "пробую продолжить.[/yellow]")
+    console.print(f"[yellow]apt занят и через {timeout}с — пробую "
+                  "продолжить.[/yellow]")
+
+
+def _stream(cmd, *, shell: bool = False,
+            input_text: str | None = None) -> tuple[int, str]:
+    """Запускает команду, показывая вывод на ходу и запоминая последние строки.
+
+    Нужно и то и другое: на длинном apt upgrade важно видеть прогресс, а при
+    падении — иметь текст ошибки под рукой, чтобы положить его в исключение.
+    """
+    proc = subprocess.Popen(
+        cmd, shell=shell, env=ENV, text=True, encoding="utf-8",
+        errors="replace",
+        stdin=subprocess.PIPE if input_text is not None else None,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    if input_text is not None:
+        try:
+            proc.stdin.write(input_text)
+            proc.stdin.close()
+        except OSError:
+            pass
+    tail: list[str] = []
+    for line in proc.stdout:
+        line = line.rstrip()
+        # markup=False: в выводе apt попадаются квадратные скобки, и rich
+        # принял бы их за разметку.
+        console.print(line, markup=False, highlight=False)
+        tail.append(line)
+        if len(tail) > 60:
+            del tail[0]
+    proc.wait()
+    return proc.returncode, chr(10).join(tail)
 
 
 def run(cmd, *, shell: bool = False, check: bool = True, capture: bool = False,
-        input_text: str | None = None):
-    # apt/apt-get падают с "Could not get lock", если блокировку dpkg держит
-    # unattended-upgrades. Дожидаемся её освобождения и дополнительно просим
-    # apt подождать сам (безопасно и на старых версиях — опция просто игнорится).
-    if isinstance(cmd, list) and cmd and cmd[0] in ("apt-get", "apt"):
-        wait_for_apt_lock()
+        input_text: str | None = None, apt_aware: bool | None = None):
+    """Запуск команды. Для apt — с ожиданием блокировки и повторами.
+
+    apt_aware=True нужен для чужих установщиков, которые дёргают apt внутри:
+    по имени команды этого не видно, а блокировка им мешает ровно так же.
+    """
+    is_apt_cmd = (isinstance(cmd, list) and bool(cmd)
+                  and cmd[0] in ("apt-get", "apt"))
+    if is_apt_cmd:
+        # Просим apt подождать и сам: опция безопасна и на старых версиях —
+        # они её просто игнорируют.
         cmd = [cmd[0], "-o", "DPkg::Lock::Timeout=300", *cmd[1:]]
+    handled = is_apt_cmd if apt_aware is None else apt_aware
     pretty = cmd if isinstance(cmd, str) else shlex.join(cmd)
-    console.print(f"[dim]$ {pretty}[/dim]")
-    return subprocess.run(
-        cmd, shell=shell, check=check, env=ENV, text=True,
-        encoding="utf-8", errors="replace",
-        input=input_text,
-        capture_output=capture,
-    )
+
+    if not handled:
+        console.print(f"[dim]$ {pretty}[/dim]")
+        return subprocess.run(
+            cmd, shell=shell, check=check, env=ENV, text=True,
+            encoding="utf-8", errors="replace",
+            input=input_text, capture_output=capture)
+
+    result = None
+    for attempt in range(1, APT_ATTEMPTS + 1):
+        wait_for_apt_lock()
+        console.print(f"[dim]$ {pretty}[/dim]")
+        if capture:
+            result = subprocess.run(
+                cmd, shell=shell, check=False, env=ENV, text=True,
+                encoding="utf-8", errors="replace",
+                input=input_text, capture_output=True)
+            output = (result.stdout or "") + (result.stderr or "")
+        else:
+            code, output = _stream(cmd, shell=shell, input_text=input_text)
+            result = subprocess.CompletedProcess(cmd, code, output, "")
+        if result.returncode == 0:
+            return result
+
+        lowered = output.lower()
+        if any(mark in lowered for mark in APT_INTERRUPTED_MARKERS):
+            console.print("[yellow]dpkg остался в незавершённом состоянии — "
+                          "довожу его до конца и пробую снова.[/yellow]")
+            _stream(["dpkg", "--configure", "-a"])
+            continue
+        if (any(mark in lowered for mark in APT_LOCK_MARKERS)
+                and attempt < APT_ATTEMPTS):
+            console.print(f"[yellow]apt не смог взять блокировку (попытка "
+                          f"{attempt} из {APT_ATTEMPTS}) — жду и повторяю."
+                          "[/yellow]")
+            continue
+        break
+
+    if check and result.returncode != 0:
+        raise AptError(result.returncode, cmd, output=result.stdout,
+                       stderr=result.stderr)
+    return result
 
 
 def probe(cmd: list[str]) -> subprocess.CompletedProcess:
@@ -2043,7 +2212,7 @@ def _ensure_docker() -> None:
     with tempfile.TemporaryDirectory(prefix="get-docker-") as tmpdir:
         script = os.path.join(tmpdir, "get-docker.sh")
         _download("https://get.docker.com", script, timeout=60)
-        run(["sh", script])
+        run(["sh", script], apt_aware=True)
 
     run(["systemctl", "enable", "--now", "docker"], check=False)
     if not shutil.which("docker"):
@@ -5409,10 +5578,21 @@ def _install_tblocker_package() -> None:
 
     try:
         run(["apt-get", "install", "-y", "tblocker"])
-    except subprocess.CalledProcessError:
+    except subprocess.CalledProcessError as exc:
         # «Unable to locate package» не объясняет, что пошло не так: репозиторий
         # мог не подключиться, отдать индекс другой архитектуры или другой suite.
         policy = probe(["apt-cache", "policy", "tblocker"]).stdout.strip()
+        candidate = ""
+        for line in policy.splitlines():
+            if line.strip().lower().startswith("candidate:"):
+                candidate = line.split(":", 1)[1].strip()
+        if candidate and candidate != "(none)":
+            # Кандидат есть — значит пакет в репозитории нашёлся, и упала сама
+            # установка. Списывать это на «не найден» означало бы отправить
+            # искать поломку в репозитории, которого она не касается.
+            raise RuntimeError(
+                f"tblocker в репозитории есть (кандидат {candidate}), но apt "
+                f"не смог его поставить: {exc}") from exc
         raise RuntimeError(
             "пакет tblocker не найден в репозитории.\n"
             f"  источник: {REPO_BASE}/ stable main (arch={arch})\n"
