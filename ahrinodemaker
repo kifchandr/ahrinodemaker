@@ -4937,6 +4937,11 @@ def psiphon_compose(egress_region: str, device_region: str,
 # до обращения к самому Gemini и одинаково работает для браузера и приложения.
 BAD_LANGS = "ru|be"
 
+# Регион учитываем только по чёрному списку — это страны, где Gemini
+# недоступен. Выход, который Google считает, например, иранским (локаль
+# en-IR), — брак, даже если флаг ARR9x на странице Gemini пока false.
+BAD_REGIONS = "RU|BY|IR|CN|HK|MO|KP|CU|SY"
+
 PSIPHON_WATCHDOG_BODY = """#!/usr/bin/env bash
 # Следит за доступностью Gemini через Psiphon и подбирает страну.
 # Создано AhriNode tool.
@@ -4949,6 +4954,8 @@ HOST=__HOST__
 LOG=__LOG__
 COUNTRIES=__COUNTRIES__
 BAD_LANGS=__BAD_LANGS__
+# Страны, где Gemini недоступен: локаль с таким регионом (en-IR и т. п.) — брак
+BAD_REGIONS=__BAD_REGIONS__
 COMPOSE="$DIR/docker-compose.yml"
 # База клиента Psiphon: списки серверов и сервер, к которому он подключался
 # в прошлый раз
@@ -5053,10 +5060,20 @@ check_google() {
     LAST_LOCALE="не найдена"
     return 4
   fi
-  # Судим по языку, а не по региону: en-GB и en_US одинаково годятся, а ru в
+  # Судим прежде всего по языку: en-GB и en_US одинаково годятся, а ru в
   # любом написании — ru, ru-RU, ru_RU — означает, что Gemini не пустит
   lang=$(cut -d- -f1 <<<"$LAST_LOCALE" | cut -d_ -f1 | tr 'A-Z' 'a-z')
   grep -qE "^($BAD_LANGS)$" <<<"$lang" && return 1
+  # Регион — только по чёрному списку. en-IR значит, что Google считает адрес
+  # иранским: Gemini такому выходу закрыт, хотя флаг ARR9x бывает и false.
+  # Переменная своя и локальная: голое region затёрло бы переменную цикла в
+  # rotate(). Без обратных ссылок sed — по той же причине, что в current_region
+  local loc_region
+  loc_region=$(printf '%s' "$LAST_LOCALE" | tr '_' '-' | awk -F- 'NF==2 && length($2)==2 {print toupper($2)}')
+  if [ -n "$loc_region" ] && grep -qE "^($BAD_REGIONS)$" <<<"$loc_region"; then
+    LAST_LOCALE="$LAST_LOCALE (регион $loc_region)"
+    return 1
+  fi
 
   # Язык страницы может быть нормальным, а страна выхода — неподходящей для
   # Gemini: например, австрийский адрес Psiphon Google счёл иранским (en-IR),
@@ -5323,7 +5340,8 @@ def _setup_psiphon_watchdog(current: str,
             .replace("__HOST__", shlex.quote(host))
             .replace("__LOG__", shlex.quote(t.log))
             .replace("__COUNTRIES__", shlex.quote(t.countries))
-            .replace("__BAD_LANGS__", shlex.quote(BAD_LANGS)))
+            .replace("__BAD_LANGS__", shlex.quote(BAD_LANGS))
+            .replace("__BAD_REGIONS__", shlex.quote(BAD_REGIONS)))
     write_file(t.watchdog, body, mode=0o755)
 
     write_file(f"/etc/systemd/system/{t.service}", psiphon_watchdog_service(t))
@@ -8367,9 +8385,13 @@ def google_locale(socks_port: int | None, timeout: int = 5) -> str:
 
 
 def locale_ok(locale: str) -> bool:
-    """Судим по языку, а не по региону: en-GB и en_US одинаково годятся."""
-    lang = re.split(r"[-_]", locale)[0].lower()
-    return lang not in BAD_LANGS.split("|")
+    """Судим по языку: en-GB и en_US одинаково годятся. Регион — только по
+    чёрному списку BAD_REGIONS: en-IR значит, что Gemini для выхода закрыт."""
+    parts = re.split(r"[-_]", locale)
+    if parts[0].lower() in BAD_LANGS.split("|"):
+        return False
+    return not (len(parts) == 2 and len(parts[1]) == 2
+                and parts[1].upper() in BAD_REGIONS.split("|"))
 
 
 def egress_status_lines() -> list[str]:
