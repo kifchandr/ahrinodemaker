@@ -93,13 +93,6 @@ NODE_ALT_PORT = "3000"
 REPO_RAW_BASE = "https://raw.githubusercontent.com/kifchandr/ahrinodemaker/main"
 
 VENDOR = {
-    "trafficguard": {
-        "file":     "install-trafficguard.sh",
-        "title":    "TrafficGuard-auto (DonMatteoVPN)",
-        "sha256":   "c2569405a7bd02e546c468ffc0a7b1e1eacda7f7f0e55076184917c8f6212606",
-        "upstream": ("https://raw.githubusercontent.com/DonMatteoVPN/"
-                     "TrafficGuard-auto/refs/heads/main/install-trafficguard.sh"),
-    },
     "backup_restore": {
         "file":     "backup-restore.sh",
         "title":    "Remnawave Backup & Restore (distillium)",
@@ -6220,93 +6213,6 @@ def block_time_cron(reboot_schedule: str = "daily") -> None:
     block_cron(reboot_schedule)
 
 
-# ------------------------------------------------------------------ #
-# TrafficGuard-auto (защита от сканеров/ботов, github.com/DonMatteoVPN)
-# Устанавливается из зафиксированной копии vendor/ — см. словарь VENDOR.
-# ------------------------------------------------------------------ #
-
-
-def _trafficguard_preflight() -> str | None:
-    """Проверяет условия, при которых установщик TrafficGuard аварийно
-    останавливается сам. Возвращает текст проблемы или None."""
-    # Установщик (check_firewall_safety) делает exit 1, если ufw присутствует,
-    # выключен И среди правил нет ничего про SSH. Ловим это заранее, чтобы
-    # выдать понятную причину вместо «команда завершилась с кодом 1».
-    if shutil.which("ufw"):
-        status = probe(["ufw", "status"])
-        if status.returncode == 0 and "Status: active" not in status.stdout:
-            rules = probe(["ufw", "show", "added"]).stdout
-            if not any(tok in rules for tok in ("22", "SSH", "OpenSSH")):
-                return ("UFW выключен и не содержит правил для SSH — установщик "
-                        "TrafficGuard откажется работать. Выполните `ufw allow ssh` "
-                        "или включите блок «Настройка UFW».")
-    return None
-
-
-def block_trafficguard() -> None:
-    step("TrafficGuard-auto: защита от сканеров и ботов")
-    # curl нужен для загрузки установщика (пакеты установщик доставит сам)
-    # curl нужен для загрузки установщика (пакеты установщик доставит сам)
-    ensure_tools("curl")
-
-    problem = _trafficguard_preflight()
-    if problem:
-        console.print(f"[yellow]Пропускаю TrafficGuard: {problem}[/yellow]")
-        return
-
-    # Установщик ставит пакеты через apt — дождёмся блокировки dpkg
-    wait_for_apt_lock()
-
-    # ВАЖНО: оригинальный установщик в самом конце запускает ИНТЕРАКТИВНОЕ меню
-    # (`/opt/trafficguard-manager.sh monitor`, оно же `rknpidor`) и читает ввод
-    # из /dev/tty — это намертво заблокировало бы наш скрипт. Вырезаем ровно эту
-    # строку. Раньше это делалось конвейером `curl | sed | bash`: если апстрим
-    # переименует строку, sed молча ничего не удалит и мы зависнем на меню.
-    # Поэтому берём проверенную копию, патчим и ПРОВЕРЯЕМ, что патч применён.
-    with tempfile.TemporaryDirectory(prefix="trafficguard-") as tmpdir:
-        raw = fetch_vendored("trafficguard", tmpdir)
-
-        with open(raw, encoding="utf-8", errors="replace") as f:
-            original = f.read()
-
-        launch_re = re.compile(r"(?m)^.*trafficguard-manager\.sh\s+monitor.*$\n?")
-        # В теле установщика есть heredoc с меню, где строка `monitor) show_menu`
-        # не совпадает с шаблоном, — вырезаем только реальные вызовы менеджера.
-        patched, removed = launch_re.subn("", original)
-        if removed == 0:
-            console.print(
-                "[yellow]Пропускаю TrafficGuard: в установщике не найден запуск "
-                "интерактивного меню, который нужно вырезать. Похоже, апстрим "
-                "изменился — обновите скрипт, прежде чем ставить автоматически.[/yellow]")
-            return
-
-        patch_path = os.path.join(tmpdir, "install-patched.sh")
-        with open(patch_path, "w", encoding="utf-8") as f:
-            f.write(patched)
-
-        console.print(f"[dim]Установщик пропатчен (удалено строк с меню: {removed})[/dim]")
-        # stdin из /dev/null: любой невырезанный `read` завершится сразу,
-        # а не подвесит установку в ожидании ввода.
-        with open(os.devnull) as devnull:
-            proc = subprocess.run(["bash", patch_path], env=ENV, text=True,
-                                  stdin=devnull)
-
-    # Установщик возвращает ненулевой код и при безобидных мелочах (например,
-    # `systemctl restart antiscan-aggregate.timer` на ещё не созданном юните),
-    # поэтому решаем по факту: появился ли бинарник traffic-guard.
-    installed = os.path.exists("/usr/local/bin/traffic-guard")
-    if not installed:
-        raise RuntimeError(
-            f"установщик TrafficGuard завершился с кодом {proc.returncode}, "
-            "бинарник /usr/local/bin/traffic-guard не появился")
-    if proc.returncode != 0:
-        console.print(f"[yellow]Установщик вернул код {proc.returncode}, но "
-                      "traffic-guard установлен — проверьте вывод выше.[/yellow]")
-
-    console.print("[green]✓ TrafficGuard-auto установлен. "
-                  "Меню мониторинга: [bold]rknpidor[/bold][/green]")
-
-
 # ================================================================== #
 # Описание блоков (ключ, подпись, функция)
 # ================================================================== #
@@ -6332,7 +6238,6 @@ BLOCKS = [
     ("warp", "WARP: чистый egress для нейросетей (Gemini, ChatGPT) и стримингов", block_warp),
     ("psiphon", "Psiphon: альтернативный egress, если WARP не помог", block_psiphon),
     ("torrent", "Блокировка торрентов (tblocker + egress-фильтр + конфиг панели)", block_torrent),
-    ("trafficguard", "TrafficGuard-auto: защита от сканеров и ботов (rknpidor)", block_trafficguard),
 ]
 
 # Блоки, которые реально устанавливают пакеты через apt. Предварительное
@@ -6345,7 +6250,7 @@ BLOCKS = [
 # ставит Docker, — раньше их здесь не было, и при выборе только этих блоков
 # система не обновлялась, хотя пакеты ставились.
 INSTALLS_PACKAGES = {"packages", "node_install", "fail2ban", "ufw",
-                     "time_cron", "torrent", "trafficguard"}
+                     "time_cron", "torrent"}
 
 # Блоки, которые по умолчанию идут БЕЗ галочки, даже если ещё не настроены.
 # Hysteria2 — дополнительный транспорт: он нужен не всем, требует сертификата
@@ -6455,11 +6360,6 @@ def _detect_torrent() -> bool:
     return _pkg_installed("tblocker") and os.path.isfile("/opt/tblocker/config.yaml")
 
 
-def _detect_trafficguard() -> bool:
-    return (os.path.exists("/usr/local/bin/traffic-guard")
-            or os.path.isfile("/opt/trafficguard-manager.sh"))
-
-
 DETECTORS = {
     "packages":       _detect_packages,
     "fail2ban":       _detect_fail2ban,
@@ -6474,7 +6374,6 @@ DETECTORS = {
     "warp":           _detect_warp,
     "psiphon":        _detect_psiphon,
     "torrent":        _detect_torrent,
-    "trafficguard":   _detect_trafficguard,
 }
 
 

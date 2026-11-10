@@ -142,7 +142,6 @@ curl -fsSL https://raw.githubusercontent.com/kifchandr/ahrinodemaker/main/ahrino
 | WARP | поднимает контейнер `caomingjun/warp` с SOCKS5 на `127.0.0.1:40000`, дожидается туннеля и генерирует outbound + правило маршрутизации для панели. Нужен, когда сервис режет IP дата-центров: Gemini, ChatGPT, Spotify. **По умолчанию выключен** |
 | Psiphon | альтернатива WARP: контейнер `swarupsengupta2007/psiphon` с SOCKS5 на `127.0.0.1:41080`, страна выхода на выбор — 31 страна плюс ввод произвольного кода. Пригодится, если адреса WARP у сервиса на плохом счету. При смене страны прежний `psiphon.config` удаляется — иначе переменные окружения не применятся. Можно включить сторож, который каждые 15 минут проверяет Gemini и сам подбирает страну. Туннелей можно поднять до четырёх — пользователи ноды делятся между ними по адресу (см. «Несколько туннелей Psiphon»). **По умолчанию выключен** |
 | Блокировка торрентов | `tblocker` + резервный egress-фильтр на nftables (порты 6881–6889, 51413) + справка по настройке панели |
-| TrafficGuard-auto | установка [TrafficGuard-auto](https://github.com/DonMatteoVPN/TrafficGuard-auto) — защита от сканеров и ботов, меню `rknpidor` |
 
 Пункт **Hysteria2** идёт без галочки: это дополнительный транспорт, он требует
 TLS-сертификата и ручного включения inbound'а в панели Remnawave. Если
@@ -760,7 +759,6 @@ sha256 зашиты в сам `ahrinodemaker`. Перед запуском ко�
 
 | Скрипт | Проект |
 |---|---|
-| `vendor/install-trafficguard.sh` | [DonMatteoVPN/TrafficGuard-auto](https://github.com/DonMatteoVPN/TrafficGuard-auto) |
 | `vendor/backup-restore.sh` | [distillium/remnawave-backup-restore](https://github.com/distillium/remnawave-backup-restore) |
 | `vendor/ipregion.sh` | [Davoyan/ipregion](https://github.com/Davoyan/ipregion) — он же раздаётся с `ipregion.xyz` |
 | `vendor/iperf3-ru-speedtest.sh` | [itdoginfo/russian-iperf3-servers](https://github.com/itdoginfo/russian-iperf3-servers) |
@@ -785,8 +783,6 @@ sha256 зашиты в сам `ahrinodemaker`. Перед запуском ко�
 
 Вендоринг покрывает верхний уровень, но не всю цепочку:
 
-- `install-trafficguard.sh` — обёртка: при установке сама тянет
-  `dotX12/traffic-guard` и списки блокировок `shadow-netlab/traffic-guard-lists`;
 - `backup-restore.sh` умеет **обновлять сам себя** из апстрима — после этого на
   сервере окажется версия автора, а не зафиксированная здесь;
 - `tblocker` ставится пакетом из apt-репозитория `repo.remna.dev` с проверкой
