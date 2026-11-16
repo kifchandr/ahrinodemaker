@@ -26,6 +26,7 @@ import subprocess
 import concurrent.futures
 import importlib
 import tempfile
+import contextlib
 import base64
 import binascii
 import atexit
@@ -511,6 +512,18 @@ def run(cmd, *, shell: bool = False, check: bool = True, capture: bool = False,
             encoding="utf-8", errors="replace",
             input=input_text, capture_output=capture)
 
+    # Порядок загрузки в прошивке — как был: любая установка может принести
+    # новый grub, а он ставит Ubuntu первым (см. BOOTORDER_SCRIPT)
+    with keep_boot_order():
+        result = _run_apt_attempts(cmd, pretty, shell, capture, input_text)
+    if check and result.returncode != 0:
+        raise AptError(result.returncode, cmd, output=result.stdout,
+                       stderr=result.stderr)
+    return result
+
+
+def _run_apt_attempts(cmd, pretty, shell, capture, input_text):
+    """Повторы команды apt: ждём блокировку, достраиваем dpkg, пробуем снова."""
     result = None
     for attempt in range(1, APT_ATTEMPTS + 1):
         wait_for_apt_lock()
@@ -531,11 +544,7 @@ def run(cmd, *, shell: bool = False, check: bool = True, capture: bool = False,
         if any(mark in lowered for mark in APT_INTERRUPTED_MARKERS):
             console.print("[yellow]dpkg остался в незавершённом состоянии — "
                           "довожу его до конца и пробую снова.[/yellow]")
-            # Достройка может дойти до grub, а он переставит порядок загрузки
-            # в прошивке — запоминаем его и возвращаем
-            boot_before = efi_boot_state()
             _stream(["dpkg", "--configure", "-a"])
-            restore_boot_order(boot_before)
             continue
         if (any(mark in lowered for mark in APT_LOCK_MARKERS)
                 and attempt < APT_ATTEMPTS):
@@ -547,11 +556,272 @@ def run(cmd, *, shell: bool = False, check: bool = True, capture: bool = False,
                 and attempt < APT_ATTEMPTS and repair_dpkg()):
             continue
         break
-
-    if check and result.returncode != 0:
-        raise AptError(result.returncode, cmd, output=result.stdout,
-                       stderr=result.stderr)
     return result
+
+
+# ------------------------------------------------------------------ #
+# Порядок загрузки в прошивке: обновления пакетов его не переставляют
+# ------------------------------------------------------------------ #
+# grub-install при каждой настройке подписанного grub записывает Ubuntu в
+# прошивку первым — без --no-nvram и не глядя на grub2/update_nvram. У
+# хостеров первой часто стоит загрузка по сети: через неё работают rescue и
+# переустановка, и после такой перестановки они молча перестают работать. На
+# обеих нодах, где это проверяли, первой стоял PXE. Обновления grub приносит
+# unattended-upgrades сам, утром и без человека рядом, поэтому возвращать
+# порядок должен хук apt, а не человек.
+#
+# Логика живёт в одном месте — в инструменте ниже. Его же скрипт запускает
+# вокруг своих команд apt: на свежем сервере обновление системы может принести
+# новый grub раньше, чем блок успеет поставить хук.
+BOOTORDER_TOOL = "/usr/local/sbin/ahrinode-bootorder"
+BOOTORDER_APT_CONF = "/etc/apt/apt.conf.d/80ahrinode-bootorder"
+
+BOOTORDER_SCRIPT = r'''#!/usr/bin/env python3
+"""Не даёт установке пакетов переставлять порядок загрузки в прошивке.
+
+Создано AhriNode tool. Вызывается из apt до и после каждого запуска dpkg:
+    ahrinode-bootorder save [файл]     — запомнить BootOrder
+    ahrinode-bootorder restore [файл]  — вернуть, если пакеты его поменяли
+    ahrinode-bootorder status          — текущий порядок, JSON
+
+grub-install при каждом обновлении grub ставит Ubuntu первым. У хостеров
+первой часто стоит загрузка по сети, через неё работают rescue и
+переустановка, и после такого обновления они перестают работать.
+
+apt этот инструмент не уронит ни при каких условиях: ошибки идут в журнал
+(journalctl -t ahrinode-bootorder), код возврата всегда 0.
+"""
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import syslog
+
+# /run очищается при перезагрузке: снимок нужен только на один запуск apt
+DEFAULT_STATE = "/run/ahrinode-bootorder.json"
+
+
+def log(message, level=syslog.LOG_NOTICE):
+    syslog.openlog("ahrinode-bootorder")
+    syslog.syslog(level, message)
+    print(f"ahrinode-bootorder: {message}")
+
+
+def entry_key(text):
+    """Чем грузится запись: GUID раздела и файл загрузчика, без регистра.
+
+    По этому ключу узнаём ту же запись, если grub-install пересоздал её под
+    другим номером. Регистр не важен: раздел FAT, и \\EFI\\UBUNTU\\SHIMX64.EFI —
+    тот же файл, что \\EFI\\ubuntu\\shimx64.efi.
+    """
+    guid = re.search(r"GPT,([0-9A-Fa-f-]{36})", text)
+    loader = re.search(r"File\(([^)]*)\)", text)
+    if guid and loader:
+        return f"{guid.group(1).lower()}:{loader.group(1).lower()}"
+    return text.strip().lower()
+
+
+def boot_state():
+    """(BootOrder, {номер: ключ}). None — не EFI или нет efibootmgr."""
+    if not os.path.isdir("/sys/firmware/efi") or not shutil.which("efibootmgr"):
+        return None
+    r = subprocess.run(["efibootmgr", "-v"], capture_output=True, text=True)
+    if r.returncode != 0:
+        return None
+    order, entries = [], {}
+    for line in r.stdout.splitlines():
+        if line.startswith("BootOrder:"):
+            order = [n.strip().upper() for n in line.split(":", 1)[1].split(",")
+                     if n.strip()]
+            continue
+        m = re.match(r"Boot([0-9A-Fa-f]{4})\*?\s+(.*)$", line)
+        if m:
+            entries[m.group(1).upper()] = entry_key(m.group(2))
+    return order, entries
+
+
+def order_to_restore(before, after):
+    """Порядок, каким он был, с поправкой на записи, пересозданные под другим
+    номером. None — возвращать нечего."""
+    old_order, old_entries = before
+    new_order, new_entries = after
+    if new_order == old_order:
+        return None
+    desired = []
+    for num in old_order:
+        key = old_entries.get(num)
+        if num in new_entries and new_entries[num] == key:
+            desired.append(num)
+            continue
+        twin = next((n for n in new_order
+                     if n not in desired and n not in old_entries
+                     and new_entries.get(n) == key), None)
+        if twin:
+            desired.append(twin)
+    # Записи, которых раньше не было, — в конец: их не теряем, но и вперёд
+    # прежних не пускаем
+    desired += [n for n in new_order if n not in desired]
+    return None if desired == new_order else desired
+
+
+def save(path):
+    state = boot_state()
+    if state is None:
+        return
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"order": state[0], "entries": state[1]}, f)
+
+
+def restore(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            saved = json.load(f)
+    except (OSError, ValueError):
+        return
+    # Снимок одноразовый: устаревший порядок нельзя вернуть по ошибке позже
+    os.remove(path)
+    after = boot_state()
+    if after is None:
+        return
+    want = order_to_restore((saved["order"], saved["entries"]), after)
+    if not want:
+        return
+    r = subprocess.run(["efibootmgr", "-o", ",".join(want)],
+                       capture_output=True, text=True)
+    if r.returncode == 0:
+        log(f"установка пакетов переставила порядок загрузки "
+            f"({','.join(after[0])}) — вернул прежний: {','.join(want)}")
+    else:
+        log(f"установка пакетов переставила порядок загрузки "
+            f"({','.join(after[0])}), а вернуть прежний ({','.join(want)}) не "
+            f"удалось: {(r.stderr or r.stdout).strip()}", syslog.LOG_WARNING)
+
+
+def status():
+    state = boot_state()
+    if state is None:
+        print("null")
+        return
+    order, entries = state
+    first = entries.get(order[0], "") if order else ""
+    # Сетевая загрузка — запись с MAC( в пути устройства: PXE и HTTP boot
+    print(json.dumps({"order": order, "entries": entries,
+                      "network_first": "mac(" in first}))
+
+
+def main():
+    command = sys.argv[1] if len(sys.argv) > 1 else ""
+    path = sys.argv[2] if len(sys.argv) > 2 else DEFAULT_STATE
+    try:
+        if command == "save":
+            save(path)
+        elif command == "restore":
+            restore(path)
+        elif command == "status":
+            status()
+    except Exception as exc:     # хук не должен ронять apt ни при каких условиях
+        log(f"ошибка: {exc}", syslog.LOG_WARNING)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+'''
+
+# Проверка на исполняемость — на случай, если инструмент удалят, а настройку
+# оставят: тогда apt должен работать дальше, а не падать на каждом запуске.
+BOOTORDER_APT_HOOKS = (
+    "// Создано AhriNode tool: установка пакетов не переставляет порядок\n"
+    f"// загрузки в прошивке. Подробности — в {BOOTORDER_TOOL}.\n"
+    f'DPkg::Pre-Invoke {{ "[ ! -x {BOOTORDER_TOOL} ] || {BOOTORDER_TOOL} save"; }};\n'
+    f'DPkg::Post-Invoke {{ "[ ! -x {BOOTORDER_TOOL} ] || {BOOTORDER_TOOL} restore"; }};\n'
+)
+
+
+def _bootorder(*args: str) -> str:
+    """Запускает встроенную копию инструмента — не установленную: она нужна и
+    там, где хук ещё не ставили, и не должна зависеть от его версии."""
+    with tempfile.TemporaryDirectory(prefix="bootorder-") as tmp:
+        tool = os.path.join(tmp, "ahrinode-bootorder")
+        with open(tool, "w", encoding="utf-8") as f:
+            f.write(BOOTORDER_SCRIPT)
+        r = subprocess.run([sys.executable, tool, *args],
+                           capture_output=True, text=True)
+    return r.stdout
+
+
+@contextlib.contextmanager
+def keep_boot_order():
+    """После блока порядок загрузки в прошивке тот же, что до него."""
+    with tempfile.TemporaryDirectory(prefix="bootorder-state-") as tmp:
+        # Свой файл снимка, не тот, что у хука: apt удаляет его после каждого
+        # запуска dpkg, и снимок скрипта пропал бы посреди повторов
+        state = os.path.join(tmp, "state.json")
+        _bootorder("save", state)
+        try:
+            yield
+        finally:
+            for line in _bootorder("restore", state).splitlines():
+                console.print(f"[dim]{line}[/dim]")
+
+
+def bootorder_status() -> dict | None:
+    """Порядок загрузки и стоит ли первой сеть. None — не EFI."""
+    try:
+        status = json.loads(_bootorder("status") or "null")
+    except ValueError:
+        return None
+    return status if isinstance(status, dict) else None
+
+
+def bootorder_hook_installed() -> bool:
+    try:
+        with open(BOOTORDER_TOOL, encoding="utf-8") as f:
+            tool = f.read()
+        with open(BOOTORDER_APT_CONF, encoding="utf-8") as f:
+            conf = f.read()
+    except OSError:
+        return False
+    return tool == BOOTORDER_SCRIPT and conf == BOOTORDER_APT_HOOKS
+
+
+def bootorder_hook_relevant() -> bool:
+    """Пункт в меню нужен, если первой стоит сеть или хук уже стоит."""
+    if os.path.exists(BOOTORDER_TOOL) or os.path.exists(BOOTORDER_APT_CONF):
+        return True
+    status = bootorder_status()
+    return bool(status and status.get("network_first"))
+
+
+def block_bootorder() -> None:
+    step("Порядок загрузки: обновления не переставляют Ubuntu первым")
+    status = bootorder_status()
+    if status is None:
+        console.print("[dim]Сервер грузится не через EFI или нет efibootmgr — "
+                      "порядка загрузки в прошивке нет, хук не нужен.[/dim]")
+        return
+    write_file(BOOTORDER_TOOL, BOOTORDER_SCRIPT, backup=False, mode=0o755)
+    # Без копии: apt читает из apt.conf.d все файлы, и копия рядом
+    # подключила бы хук второй раз
+    write_file(BOOTORDER_APT_CONF, BOOTORDER_APT_HOOKS, backup=False)
+    # Сломанный файл в apt.conf.d остановил бы apt целиком, и обновления на
+    # сервере встали бы — проверяем сразу и при ошибке убираем
+    check = probe(["apt-config", "dump"])
+    if check.returncode != 0:
+        os.remove(BOOTORDER_APT_CONF)
+        raise RuntimeError("apt не принял настройку хука, файл убран: "
+                           + (check.stderr or check.stdout).strip())
+    order = ",".join(status.get("order") or [])
+    console.print(f"[green]✓ Хук apt установлен: порядок загрузки {order} "
+                  "сохранится при любых обновлениях пакетов, в том числе "
+                  "автоматических[/green]")
+    if not status.get("network_first"):
+        console.print("[dim]Сейчас первой стоит не загрузка по сети — хук "
+                      "просто сохранит текущий порядок.[/dim]")
+    console.print(f"[dim]Что делал хук — journalctl -t ahrinode-bootorder. "
+                  f"Снять: удалить {BOOTORDER_APT_CONF} и {BOOTORDER_TOOL}.[/dim]")
 
 
 # ------------------------------------------------------------------ #
@@ -659,88 +929,6 @@ def grub_efi_devices_plan() -> tuple[list[str], list[str]] | None:
     return devices, keep
 
 
-def _boot_entry_key(text: str) -> str:
-    """Чем грузится запись: GUID раздела и файл загрузчика, без регистра.
-    По этому ключу узнаём ту же запись, если grub-install пересоздал её под
-    другим номером."""
-    guid = re.search(r"GPT,([0-9A-Fa-f-]{36})", text)
-    loader = re.search(r"File\(([^)]*)\)", text)
-    if guid and loader:
-        return f"{guid.group(1).lower()}:{loader.group(1).lower()}"
-    return text.strip().lower()
-
-
-def efi_boot_state() -> tuple[list[str], dict[str, str]] | None:
-    """BootOrder и ключ каждой записи. None — не EFI или нет efibootmgr."""
-    if not os.path.isdir("/sys/firmware/efi") or not shutil.which("efibootmgr"):
-        return None
-    r = probe(["efibootmgr", "-v"])
-    if r.returncode != 0:
-        return None
-    order: list[str] = []
-    entries: dict[str, str] = {}
-    for line in r.stdout.splitlines():
-        if line.startswith("BootOrder:"):
-            order = [n.strip().upper() for n in line.split(":", 1)[1].split(",")
-                     if n.strip()]
-            continue
-        m = re.match(r"Boot([0-9A-Fa-f]{4})\*?\s+(.*)$", line)
-        if m:
-            entries[m.group(1).upper()] = _boot_entry_key(m.group(2))
-    return order, entries
-
-
-def boot_order_to_restore(before, after) -> list[str] | None:
-    """Порядок загрузки, каким он был до grub-install, с поправкой на записи,
-    пересозданные под другим номером. None — возвращать нечего.
-
-    grub-install при каждой настройке пакета записывает свой загрузчик в
-    прошивку первым. На выделенных серверах первой у хостера часто стоит
-    загрузка по сети: через неё работают rescue и переустановка, и такая
-    перестановка их бы сломала. Поэтому порядок, который был, возвращаем.
-    """
-    old_order, old_entries = before
-    new_order, new_entries = after
-    if new_order == old_order:
-        return None
-    desired: list[str] = []
-    for num in old_order:
-        key = old_entries.get(num)
-        if num in new_entries and new_entries[num] == key:
-            desired.append(num)
-            continue
-        twin = next((n for n in new_order
-                     if n not in desired and n not in old_entries
-                     and new_entries.get(n) == key), None)
-        if twin:
-            desired.append(twin)
-    # Новые записи, которых раньше не было, — в конец: их не теряем, но и
-    # вперёд прежних не пускаем
-    desired += [n for n in new_order if n not in desired]
-    return None if desired == new_order else desired
-
-
-def restore_boot_order(before) -> None:
-    after = efi_boot_state()
-    if not before or not after:
-        return
-    desired = boot_order_to_restore(before, after)
-    if not desired:
-        return
-    r = probe(["efibootmgr", "-o", ",".join(desired)])
-    if r.returncode == 0:
-        console.print(f"[dim]grub переставил порядок загрузки в прошивке "
-                      f"({','.join(after[0])}) — вернул прежний: "
-                      f"{','.join(desired)}[/dim]")
-    else:
-        console.print(f"[yellow]grub переставил порядок загрузки в прошивке "
-                      f"({','.join(after[0])}), а вернуть прежний "
-                      f"({','.join(before[0])}) не удалось: "
-                      f"{(r.stderr or r.stdout).strip()}. Проверьте efibootmgr: "
-                      "если первой стоит не та запись, перестанут работать "
-                      "rescue и переустановка у хостера.[/yellow]")
-
-
 def fix_grub_efi_devices() -> bool:
     """Меняет пропавший диск в настройке grub на EFI-раздел этого сервера.
     → True, если настройку поменяли."""
@@ -780,10 +968,9 @@ def repair_dpkg() -> bool:
         return False    # dpkg цел — apt упал на чём-то другом
     console.print(f"[yellow]dpkg не достроил пакеты: {', '.join(stuck)}. Пока "
                   "так, apt не поставит ничего — пробую достроить.[/yellow]")
-    boot_before = efi_boot_state()
+    # Порядок загрузки бережёт run(): достраиваем мы всегда изнутри него
     fix_grub_efi_devices()
     _stream(["dpkg", "--configure", "-a"])
-    restore_boot_order(boot_before)
     left = dpkg_unfinished()
     if left:
         _dpkg_repair_failed = True
@@ -6887,6 +7074,7 @@ BLOCKS = [
     ("packages", "Установка пакетов (fail2ban, ufw, unattended-upgrades, cron)", block_packages),
     ("ssh_keys", "SSH-ключи: доступ по ключам, вход по паролю закрыть", block_ssh_keys),
     ("kernel", "Ядро: проверка версии и установка исправлений безопасности", block_kernel),
+    ("bootorder", "Порядок загрузки (EFI): обновления не ставят Ubuntu первым", block_bootorder),
     ("time_cron", f"Часовой пояс {TIMEZONE} + cron (перезагрузка по расписанию)", block_time_cron),
     ("fail2ban", "Настройка Fail2Ban", block_fail2ban),
     ("ufw", "Настройка UFW (firewall)", block_ufw),
@@ -7031,6 +7219,14 @@ def _detect_kernel() -> bool:
             and not _new_kernel_images(kernel_upgrade_plan(state)))
 
 
+def _detect_bootorder() -> bool:
+    """Хук стоит и актуален — или не нужен: первой в прошивке стоит не сеть."""
+    if bootorder_hook_installed():
+        return True
+    status = bootorder_status()
+    return not (status and status.get("network_first"))
+
+
 DETECTORS = {
     "packages":       _detect_packages,
     "fail2ban":       _detect_fail2ban,
@@ -7043,6 +7239,7 @@ DETECTORS = {
     "selfsteal":      _detect_selfsteal,
     "ssh_keys":       _detect_ssh_keys,
     "kernel":         _detect_kernel,
+    "bootorder":      _detect_bootorder,
     "warp":           _detect_warp,
     "psiphon":        _detect_psiphon,
     "torrent":        _detect_torrent,
@@ -7252,6 +7449,10 @@ def menu_remnawave_node() -> None:
             if not node_missing:
                 choices.append(questionary.Choice(label, value=key, checked=False))
                 shown_keys.append(key)
+            continue
+        # Хук порядка загрузки нужен там, где первой в прошивке стоит сеть;
+        # на остальных серверах пункт был бы только шумом
+        if key == "bootorder" and not bootorder_hook_relevant():
             continue
         is_applied = applied.get(key, False)
         # Пометки различаются не только текстом, но и цветом: они означают
