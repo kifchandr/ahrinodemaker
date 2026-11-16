@@ -6222,6 +6222,12 @@ def block_network(ipv6: str = "keep") -> None:
 def block_system_upgrade() -> None:
     step("Обновление системы (apt update && apt upgrade)")
     apt_update()
+    # Ядро этот шаг не обновляет: новое ядро — это новые пакеты
+    # (linux-image-6.8.0-150-generic вместо …-149-…), а apt-get upgrade новых
+    # не ставит. Этим занят блок «Ядро», адресно. --with-new-pkgs сюда не
+    # добавлен намеренно: он потянул бы и чужие переходы на новые пакеты — на
+    # живой ноде это были netplan и расщеплённый linux-firmware, — а сеть на
+    # удалённом сервере между делом не меняют.
     run(["apt-get", "upgrade", "-y"])
     console.print("[green]✓ Система обновлена[/green]")
 
@@ -6229,6 +6235,394 @@ def block_system_upgrade() -> None:
 def block_time_cron(reboot_schedule: str = "daily") -> None:
     block_timezone()
     block_cron(reboot_schedule)
+
+
+# ------------------------------------------------------------------ #
+# Ядро: версия, исправления безопасности, перезагрузка
+# ------------------------------------------------------------------ #
+# Исправления ядра доходят до нод и без этого блока: unattended-upgrades
+# ставит их из -security, а ночная перезагрузка по cron включает. Но медленно.
+# С CVE-2026-98432 на живой ноде вышло так: от бюллетеня Ubuntu до работы на
+# исправленном ядре прошло четверо суток, причём почти сутки ядро уже лежало
+# на диске — unattended-upgrades поставил его в 06:37, после перезагрузки в
+# 03:00, и оно ждало следующей ночи. Блок сжимает это до одного прогона:
+# ставит свежее ядро сразу и предлагает перезагрузиться в него.
+
+# CVE, по которым отчитываемся поимённо. Само обновление от списка не зависит
+# — ставится просто самое новое ядро из репозитория, — а список отвечает на
+# вопрос «закрыта ли вот эта дыра». Статус берётся у трекера Ubuntu в момент
+# проверки, так что записи не устаревают: исправленная CVE просто начнёт
+# показываться закрытой. Новую можно проверить и не правя список — через Tools.
+KERNEL_WATCH_CVES = (
+    "CVE-2026-98432",   # TCP/IPv4, use-after-free: удалённое выполнение кода, CVSS 9.8
+    "CVE-2026-99288",   # NoisyTCP: удалённое падение ядра без авторизации
+)
+UBUNTU_CVE_URL = "https://ubuntu.com/security/cves/{}.json"
+
+# Статусы трекера Ubuntu, при которых исправления для релиза ещё нет
+CVE_WAITING = {
+    "needed": "нужно исправление",
+    "needs-triage": "ещё не разобрана",
+    "pending": "исправление готовится",
+    "deferred": "отложена",
+}
+CVE_PRIORITY = {
+    "critical": "критическая", "high": "высокая", "medium": "средняя",
+    "low": "низкая", "negligible": "незначительная",
+}
+
+# Пакет с номером версии в имени — конкретное ядро: linux-image-6.8.0-149-generic,
+# linux-headers-6.1.0-27-amd64. Без номера — метапакет вроде linux-generic или
+# linux-image-amd64: он всегда тянет последнее ядро своей ветки, и обновлять
+# нужно именно его.
+_KERNEL_VERSIONED = re.compile(r"\d+\.\d+(?:\.\d+)?-\d+")
+# Метапакет ядра узнаём по зависимостям: он требует образ, заголовки или
+# модули. По одному имени нельзя — без номера версии ходят и linux-firmware,
+# и linux-libc-dev, а прошивки на виртуальном сервере не нужны и весят сотни
+# мегабайт.
+_KERNEL_DEPENDS = re.compile(r"\blinux-(?:image|headers|modules)-")
+
+# Блок поставил ядро, которое заработает только после перезагрузки. Прогон
+# предложит её в самом конце, а не посреди остальных блоков.
+_kernel_reboot_wanted = False
+
+
+class KernelState(NamedTuple):
+    running: str          # uname -r
+    version: str          # версия работающей сборки; пусто — неизвестна
+    source: str           # исходный пакет для трекера: linux, linux-hwe-7.0, linux-aws…
+    newest: str           # самое новое установленное ядро — его загрузит GRUB
+    newest_version: str
+    stale: bool           # пакет этого же ядра переставлен новее, а в памяти старая сборка
+    packages: list[str]   # метапакеты, через которые ядро обновляется
+    held: list[str]       # из них заморожены через apt-mark hold
+    container: str        # тип контейнера, если ядро принадлежит хосту, иначе пусто
+
+    @property
+    def reboot_pending(self) -> bool:
+        return self.stale or self.newest != self.running
+
+
+def os_release() -> dict[str, str]:
+    """/etc/os-release как словарь."""
+    data: dict[str, str] = {}
+    try:
+        with open("/etc/os-release", encoding="utf-8") as f:
+            for line in f:
+                key, sep, value = line.strip().partition("=")
+                if sep:
+                    data[key] = value.strip().strip('"')
+    except OSError:
+        pass
+    return data
+
+
+def _dpkg_cmp(a: str, op: str, b: str) -> bool:
+    """Сравнение версий по правилам dpkg: 6.8.0-149.149 и 6.8.0-1069.74
+    строкой не сравнить."""
+    return bool(a and b) and probe(
+        ["dpkg", "--compare-versions", a, op, b]).returncode == 0
+
+
+def _running_build_matches(installed: str) -> bool | None:
+    """Совпадает ли сборка ядра в памяти с установленным пакетом того же имени.
+
+    Обычно новое ядро — это новое имя пакета, но бывает, что пакет с прежним
+    именем пересобирают: имя ядра не меняется, а код в памяти уже устарел. По
+    dpkg этого не видно, зато номер сборки есть в uname -v. None — понять
+    нельзя (своё ядро, незнакомый формат).
+    """
+    build = os.uname().version
+    debian = re.search(r"Debian (\S+)", build)      # «… Debian 6.1.115-1 (…)»
+    if debian:
+        return debian.group(1) == installed
+    number = re.match(r"#(\d+)", build)             # Ubuntu: «#149-Ubuntu SMP …»
+    upload = re.search(r"-\d+\.(\d+)", installed)   # 6.8.0-149.149 → 149
+    if number and upload:
+        return number.group(1) == upload.group(1)
+    return None
+
+
+def kernel_state() -> KernelState:
+    """Что с ядром сейчас — только по локальным данным, без сети."""
+    running = os.uname().release
+    virt = probe(["systemd-detect-virt", "--container"])
+    container = virt.stdout.strip() if virt.returncode == 0 else ""
+    if container == "none":
+        container = ""
+
+    installed = source = ""
+    # Модули собраны прямо из исходника ядра, а подписанный образ — из
+    # отдельного linux-signed*. Трекер ведёт статус по исходнику ядра, поэтому
+    # сначала спрашиваем модули, а у образа правим имя.
+    for pkg in (f"linux-modules-{running}", f"linux-image-{running}",
+                f"linux-image-unsigned-{running}"):
+        r = probe(["dpkg-query", "-W",
+                   "-f=${db:Status-Status}|${Version}|${source:Package}", pkg])
+        status, _, rest = r.stdout.partition("|")
+        if r.returncode == 0 and status == "installed":
+            installed, _, source = rest.partition("|")
+            source = source.replace("linux-signed", "linux", 1)
+            break
+    stale = bool(installed) and _running_build_matches(installed) is False
+
+    newest, newest_version = running, installed
+    packages: list[str] = []
+    # Разделитель — табуляция: в Depends встречается «|» (альтернативы)
+    listing = probe(["dpkg-query", "-W",
+                     "-f=${db:Status-Status}\t${Package}\t${Version}\t${Depends}\n",
+                     "linux-*"])
+    for line in listing.stdout.splitlines():
+        status, pkg, ver, depends = (line.split("\t") + ["", "", ""])[:4]
+        if status != "installed":
+            continue
+        if not _KERNEL_VERSIONED.search(pkg):
+            if _KERNEL_DEPENDS.search(depends):
+                packages.append(pkg)
+            continue
+        for prefix in ("linux-image-unsigned-", "linux-image-"):
+            if pkg.startswith(prefix):
+                if not newest_version or _dpkg_cmp(ver, "gt", newest_version):
+                    newest, newest_version = pkg[len(prefix):], ver
+                break
+
+    holds = set(probe(["apt-mark", "showhold"]).stdout.split())
+    held = [p for p in packages if p in holds]
+    return KernelState(running, "" if stale else installed, source, newest,
+                       newest_version, stale,
+                       [p for p in packages if p not in holds], held, container)
+
+
+def kernel_upgrade_plan(state: KernelState) -> list[tuple[str, str]]:
+    """Что поставит обновление ядра — по уже скачанным спискам пакетов:
+    [(пакет, версия)]. Симуляция ничего не меняет и не ждёт блокировку apt."""
+    if not state.packages:
+        return []
+    r = probe(["apt-get", "-s", "-o", "Debug::NoLocking=1", "install",
+               "--only-upgrade", "--no-remove", *state.packages])
+    plan = []
+    for line in r.stdout.splitlines():
+        # «Inst linux-generic [6.8.0-149.149] (6.8.0-150.150 Ubuntu:24.04/…)» —
+        # строки симуляции apt не переводит, их можно разбирать при любой локали
+        if line.startswith("Inst "):
+            parts = line.split()
+            new = next((p[1:] for p in parts[2:] if p.startswith("(")), "")
+            plan.append((parts[1], new))
+    return plan
+
+
+def _new_kernel_images(plan: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    return [(pkg, ver) for pkg, ver in plan
+            if pkg.startswith("linux-image-") and _KERNEL_VERSIONED.search(pkg)]
+
+
+def install_kernel_update(state: KernelState) -> KernelState:
+    """Ставит новое ядро через метапакеты. → состояние после установки."""
+    # --no-remove: обновление ядра ничего удалять не должно. Если apt решит
+    # иначе, пусть лучше откажется, чем молча снесёт пакет.
+    run(["apt-get", "install", "--only-upgrade", "--no-remove", "-y",
+         *state.packages])
+    return kernel_state()
+
+
+def kernel_cve_verdict(cve: str, state: KernelState,
+                       codename: str) -> tuple[str, str]:
+    """(цвет, строка) — закрыта ли CVE в работающем ядре, по трекеру Ubuntu."""
+    with tempfile.TemporaryDirectory(prefix="cve-") as tmp:
+        path = os.path.join(tmp, "cve.json")
+        try:
+            _download(UBUNTU_CVE_URL.format(cve), path, timeout=20)
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+        except RuntimeError as exc:
+            if "404" in str(exc):
+                return "yellow", f"{cve}: трекер Ubuntu такой CVE не знает"
+            return "yellow", f"{cve}: трекер Ubuntu недоступен — проверить не удалось"
+        except (OSError, ValueError):
+            return "yellow", f"{cve}: трекер Ubuntu ответил не JSON — проверить не удалось"
+
+    priority = CVE_PRIORITY.get(str(data.get("priority")), data.get("priority"))
+    score = data.get("cvss3")
+    title = cve + (f" ({priority}" + (f", CVSS {score}" if score else "") + ")"
+                   if priority else "")
+    if not state.source:
+        return "dim", f"{title}: ядро стоит не из пакета — сверять не с чем"
+
+    status = fixed = ""
+    for package in data.get("packages") or []:
+        if package.get("name") != state.source:
+            continue
+        for item in package.get("statuses") or []:
+            if item.get("release_codename") == codename:
+                status = item.get("status") or ""
+                fixed = (item.get("description") or "").strip()
+    what = f"{state.source} в {codename}"
+
+    if status == "released" and fixed:
+        if _dpkg_cmp(state.version, "ge", fixed):
+            return "green", (f"{title}: закрыта — исправлено в {fixed}, "
+                             f"работает {state.version}")
+        if _dpkg_cmp(state.newest_version, "ge", fixed):
+            return "yellow", (f"{title}: закроется после перезагрузки — "
+                              f"исправленное ядро {state.newest_version} уже "
+                              "установлено")
+        return "red", (f"{title}: НЕ закрыта — исправлено в {fixed}, а работает "
+                       f"{state.version or 'неизвестная сборка'}")
+    if status == "not-affected":
+        return "green", f"{title}: это ядро не затронуто"
+    if status in CVE_WAITING:
+        note = f", готовится {fixed}" if status == "pending" and fixed else ""
+        return "yellow", (f"{title}: исправления для {what} пока нет "
+                          f"({CVE_WAITING[status]}{note})")
+    if status == "ignored":
+        return "red", (f"{title}: для {what} исправлять не будут — релиз вне "
+                       "стандартной поддержки")
+    return "dim", f"{title}: трекер не ведёт {what}"
+
+
+def print_kernel_report(state: KernelState, images: list[tuple[str, str]],
+                        cves) -> None:
+    release = os_release()
+    console.print(f"[bold]Система:[/bold] "
+                  f"{release.get('PRETTY_NAME') or 'неизвестна'}")
+    console.print(f"[bold]Работает ядро:[/bold] {state.running}"
+                  + (f" ({state.version})" if state.version else ""))
+    if state.stale:
+        console.print(f"[yellow]Пакет этого ядра обновлён до "
+                      f"{state.newest_version}, а в памяти прежняя сборка — "
+                      "нужна перезагрузка.[/yellow]")
+    elif state.newest != state.running:
+        console.print(f"[yellow]Установлено новее: {state.newest} "
+                      f"({state.newest_version}) — заработает после "
+                      "перезагрузки.[/yellow]")
+    if state.held:
+        console.print(f"[yellow]Обновление ядра заморожено: apt-mark hold "
+                      f"{' '.join(state.held)}. Снимите заморозку "
+                      f"(apt-mark unhold …), иначе исправления не встанут."
+                      "[/yellow]")
+    if images:
+        console.print("[cyan]В репозитории новее: "
+                      + ", ".join(f"{pkg} ({ver})" for pkg, ver in images)
+                      + "[/cyan]")
+    elif not state.reboot_pending:
+        console.print("[green]✓ Новее ядра в репозитории нет[/green]")
+
+    if not cves:
+        return
+    console.print()
+    if release.get("ID") != "ubuntu":
+        console.print("[dim]Сверка с CVE есть только для Ubuntu: у Debian нет "
+                      "ответа по одной CVE, только выгрузка всей базы. "
+                      "Обновление ядра работает и здесь.[/dim]")
+        return
+    codename = release.get("VERSION_CODENAME", "")
+    for cve in cves:
+        color, line = kernel_cve_verdict(cve, state, codename)
+        console.print(f"[{color}]{line}[/{color}]")
+
+
+def offer_kernel_reboot(state: KernelState) -> None:
+    schedule = current_reboot_schedule()
+    when = (f"при плановой перезагрузке ({schedule})" if schedule != "не настроено"
+            else "только после перезагрузки — плановой на этом сервере нет")
+    console.print(f"[yellow]Ядро {state.newest} установлено, но заработает "
+                  f"{when}. До тех пор работает {state.running}.[/yellow]")
+    if questionary.confirm("Перезагрузить сервер сейчас?", default=False,
+                           style=CUSTOM_STYLE).ask():
+        console.print("[cyan]Перезагружаю — SSH-сессия сейчас оборвётся. Через "
+                      "минуту-две можно подключаться снова.[/cyan]")
+        run(["systemctl", "reboot"], check=False)
+
+
+def kernel_reboot_after_run() -> None:
+    """Конец прогона: если блок «Ядро» поставил ядро, предложить перезагрузку."""
+    global _kernel_reboot_wanted
+    if not _kernel_reboot_wanted:
+        return
+    _kernel_reboot_wanted = False
+    offer_kernel_reboot(kernel_state())
+
+
+def block_kernel() -> None:
+    global _kernel_reboot_wanted
+    step("Ядро: исправления безопасности")
+    state = kernel_state()
+    if state.container:
+        console.print(f"[yellow]Это контейнер ({state.container}): ядро "
+                      f"{state.running} принадлежит хосту, и обновить его может "
+                      "только хостер.[/yellow]")
+        return
+
+    apt_update()
+    images = _new_kernel_images(kernel_upgrade_plan(state))
+    if images:
+        console.print("[cyan]Ставлю новое ядро: "
+                      + ", ".join(f"{pkg} ({ver})" for pkg, ver in images)
+                      + "[/cyan]")
+        state = install_kernel_update(state)
+    print_kernel_report(state, [], KERNEL_WATCH_CVES)
+
+    if state.reboot_pending:
+        _kernel_reboot_wanted = True
+        console.print("[dim]Перезагрузку предложу в конце прогона, после "
+                      "остальных блоков.[/dim]")
+    else:
+        console.print("[green]✓ Работает самое новое ядро[/green]")
+
+
+def menu_kernel() -> None:
+    step("Ядро: версия, уязвимости, обновление")
+    state = kernel_state()
+    if state.container:
+        console.print(f"[yellow]Это контейнер ({state.container}): ядро "
+                      f"{state.running} принадлежит хосту, и обновить его может "
+                      "только хостер.[/yellow]")
+        return
+
+    apt_update()
+    images = _new_kernel_images(kernel_upgrade_plan(state))
+    print_kernel_report(state, images, KERNEL_WATCH_CVES)
+
+    if images and questionary.confirm("Установить новое ядро?", default=True,
+                                      style=CUSTOM_STYLE).ask():
+        state = install_kernel_update(state)
+        console.print(f"[green]✓ Установлено ядро {state.newest} "
+                      f"({state.newest_version})[/green]")
+
+    extra = questionary.text(
+        "Проверить ещё CVE — номера через пробел (Enter — пропустить):",
+        default="", style=CUSTOM_STYLE).ask()
+    wanted = [c.upper() for c in re.findall(r"(?i)CVE-\d{4}-\d{4,}", extra or "")]
+    if extra and extra.strip() and not wanted:
+        console.print("[yellow]Номер CVE выглядит как CVE-2026-98432.[/yellow]")
+    if wanted:
+        release = os_release()
+        if release.get("ID") != "ubuntu":
+            console.print("[dim]Сверка с CVE есть только для Ubuntu.[/dim]")
+        else:
+            for cve in wanted:
+                color, line = kernel_cve_verdict(
+                    cve, state, release.get("VERSION_CODENAME", ""))
+                console.print(f"[{color}]{line}[/{color}]")
+
+    # Перезагрузка — последней: после неё сессия оборвётся
+    if state.reboot_pending:
+        offer_kernel_reboot(state)
+
+
+def kernel_status_line() -> str:
+    """Строка для шапки: по локальным данным, без сети."""
+    state = kernel_state()
+    if state.container:
+        return f"[dim]Ядро {state.running} — хоста (контейнер {state.container})[/dim]"
+    if state.reboot_pending:
+        return (f"[yellow]Ядро {state.running}: установлено новее — нужна "
+                "перезагрузка (Tools → Ядро)[/yellow]")
+    images = _new_kernel_images(kernel_upgrade_plan(state))
+    if images:
+        return (f"[yellow]Ядро {state.running}: в репозитории новее "
+                f"({images[0][1]}) — Tools → Ядро[/yellow]")
+    return f"[dim]Ядро {state.running} — новее в репозитории нет[/dim]"
 
 
 # ================================================================== #
@@ -6244,6 +6638,7 @@ BLOCKS = [
     ("node_install", "Установка Remnawave Node (docker + compose + запуск)", block_node_install),
     ("packages", "Установка пакетов (fail2ban, ufw, unattended-upgrades, cron)", block_packages),
     ("ssh_keys", "SSH-ключи: доступ по ключам, вход по паролю закрыть", block_ssh_keys),
+    ("kernel", "Ядро: проверка версии и установка исправлений безопасности", block_kernel),
     ("time_cron", f"Часовой пояс {TIMEZONE} + cron (перезагрузка по расписанию)", block_time_cron),
     ("fail2ban", "Настройка Fail2Ban", block_fail2ban),
     ("ufw", "Настройка UFW (firewall)", block_ufw),
@@ -6268,7 +6663,7 @@ BLOCKS = [
 # ставит Docker, — раньше их здесь не было, и при выборе только этих блоков
 # система не обновлялась, хотя пакеты ставились.
 INSTALLS_PACKAGES = {"packages", "node_install", "fail2ban", "ufw",
-                     "time_cron", "torrent"}
+                     "time_cron", "torrent", "kernel"}
 
 # Блоки, которые по умолчанию идут БЕЗ галочки, даже если ещё не настроены.
 # Hysteria2 — дополнительный транспорт: он нужен не всем, требует сертификата
@@ -6378,6 +6773,16 @@ def _detect_torrent() -> bool:
     return _pkg_installed("tblocker") and os.path.isfile("/opt/tblocker/config.yaml")
 
 
+def _detect_kernel() -> bool:
+    """Делать нечего: работает самое новое ядро, и новее в списках пакетов нет.
+    В контейнере ядро принадлежит хосту — тоже нечего."""
+    state = kernel_state()
+    if state.container:
+        return True
+    return (not state.reboot_pending
+            and not _new_kernel_images(kernel_upgrade_plan(state)))
+
+
 DETECTORS = {
     "packages":       _detect_packages,
     "fail2ban":       _detect_fail2ban,
@@ -6389,6 +6794,7 @@ DETECTORS = {
     "grpc":           _detect_grpc,
     "selfsteal":      _detect_selfsteal,
     "ssh_keys":       _detect_ssh_keys,
+    "kernel":         _detect_kernel,
     "warp":           _detect_warp,
     "psiphon":        _detect_psiphon,
     "torrent":        _detect_torrent,
@@ -6806,6 +7212,7 @@ def menu_remnawave_node() -> None:
     else:
         console.print(Panel.fit("[bold green]=== Готово ===[/bold green]",
                                 border_style="green"))
+    kernel_reboot_after_run()
 
 
 # ================================================================== #
@@ -8161,6 +8568,8 @@ def menu_tools() -> None:
             questionary.Choice("Remnawave Backup & Restore (distillium)",
                                value="backup_restore"),
             questionary.Choice("Управление SSH-ключами", value="ssh_keys"),
+            questionary.Choice("Ядро: версия, уязвимости, обновление",
+                               value="kernel"),
             questionary.Choice("SOCKS5-прокси Dante", value="dante"),
             questionary.Choice("Проверить обновления сторонних скриптов",
                                value="vendor_updates"),
@@ -8175,6 +8584,11 @@ def menu_tools() -> None:
             return
         if choice == "ssh_keys":
             menu_ssh_keys()
+        elif choice == "kernel":
+            try:
+                menu_kernel()
+            except (subprocess.CalledProcessError, OSError, RuntimeError) as exc:
+                console.print(f"[red]✗ Ошибка: {exc}[/red]")
         elif choice == "backup_restore":
             menu_backup_restore()
         elif choice == "dante":
@@ -8448,6 +8862,9 @@ def main() -> None:
     # Gemini, — то, ради чего эти выходы и стоят.
     for line in egress_status_lines():
         console.print(line)
+    # Ядро — по локальным данным, без сети, поэтому в шапке оно есть всегда.
+    # Сверка с CVE сюда не идёт: это запрос к трекеру Ubuntu на каждый запуск.
+    console.print(kernel_status_line())
 
     # Команды ставим сами: спрашивать про это нечего, а без них скрипт после
     # запуска через curl не остаётся на сервере вовсе. Сбой не повод прерывать
