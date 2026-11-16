@@ -531,7 +531,11 @@ def run(cmd, *, shell: bool = False, check: bool = True, capture: bool = False,
         if any(mark in lowered for mark in APT_INTERRUPTED_MARKERS):
             console.print("[yellow]dpkg остался в незавершённом состоянии — "
                           "довожу его до конца и пробую снова.[/yellow]")
+            # Достройка может дойти до grub, а он переставит порядок загрузки
+            # в прошивке — запоминаем его и возвращаем
+            boot_before = efi_boot_state()
             _stream(["dpkg", "--configure", "-a"])
+            restore_boot_order(boot_before)
             continue
         if (any(mark in lowered for mark in APT_LOCK_MARKERS)
                 and attempt < APT_ATTEMPTS):
@@ -539,12 +543,256 @@ def run(cmd, *, shell: bool = False, check: bool = True, capture: bool = False,
                           f"{attempt} из {APT_ATTEMPTS}) — жду и повторяю."
                           "[/yellow]")
             continue
+        if (any(mark in lowered for mark in APT_DPKG_FAILED_MARKERS)
+                and attempt < APT_ATTEMPTS and repair_dpkg()):
+            continue
         break
 
     if check and result.returncode != 0:
         raise AptError(result.returncode, cmd, output=result.stdout,
                        stderr=result.stderr)
     return result
+
+
+# ------------------------------------------------------------------ #
+# dpkg застрял: достройка пакетов, починка установки grub
+# ------------------------------------------------------------------ #
+# Если у одного пакета не отработал скрипт настройки, dpkg считает систему
+# недостроенной, и каждая следующая команда apt пытается достроить его снова
+# и падает с той же ошибкой. На живой ноде так за один прогон легли пять
+# блоков — обновление системы, пакеты, Docker, tblocker, — хотя сломан был
+# один grub.
+DPKG_UNFINISHED = {"half-configured", "unpacked", "half-installed",
+                   "triggers-awaited", "triggers-pending"}
+# Строки, по которым видно, что apt упал на dpkg, а не на сети или имени
+# пакета. Вторая нужна для чужих установщиков: get-docker.sh гасит вывод apt,
+# и до нас доходит только последняя строка ошибки.
+APT_DPKG_FAILED_MARKERS = ("errors were encountered while processing",
+                           "sub-process /usr/bin/dpkg returned an error code")
+ESP_BACKUP_DIR = "/var/backups"
+# Достроить не вышло — повторять незачем: следующий блок упадёт так же, а
+# каждая попытка заново гоняет скрипты настройки
+_dpkg_repair_failed = False
+
+
+def dpkg_unfinished() -> list[str]:
+    """Пакеты, которые dpkg начал ставить и не достроил."""
+    out = probe(["dpkg-query", "-W",
+                 "-f=${db:Status-Status} ${Package}\n"]).stdout
+    stuck = []
+    for line in out.splitlines():
+        status, _, package = line.partition(" ")
+        if status in DPKG_UNFINISHED:
+            stuck.append(package)
+    return stuck
+
+
+# Вопросом debconf владеет не тот пакет, что падает: grub-efi/install_devices
+# заводит grub-efi-amd64, а читает его и падает grub-efi-amd64-signed, и на
+# других образах владелец может быть третьим. debconf-communicate обращается
+# к вопросу по имени, владелец ему не нужен.
+def _debconf_get(question: str) -> str | None:
+    """Значение вопроса debconf. None — вопроса нет или база занята apt."""
+    try:
+        r = subprocess.run(["debconf-communicate"], input=f"GET {question}\n",
+                           capture_output=True, text=True, env=ENV)
+    except OSError:
+        return None
+    code, _, value = r.stdout.strip().partition(" ")
+    return value if code == "0" else None
+
+
+def _debconf_set(question: str, value: str) -> bool:
+    """Записать ответ и пометить вопрос заданным — иначе debconf спросит снова."""
+    try:
+        r = subprocess.run(["debconf-communicate"],
+                           input=f"SET {question} {value}\nFSET {question} seen true\n",
+                           capture_output=True, text=True, env=ENV)
+    except OSError:
+        return False
+    codes = [line.split(" ", 1)[0] for line in r.stdout.strip().splitlines()]
+    return codes == ["0", "0"]
+
+
+def _device_by_id(device: str) -> str:
+    """Имя раздела в /dev/disk/by-id — то же, что выбрал бы сам grub: первое
+    по алфавиту из указывающих на этот раздел. Такого нет — имя устройства."""
+    real = os.path.realpath(device)
+    try:
+        names = sorted(os.listdir("/dev/disk/by-id"))
+    except OSError:
+        names = []
+    for name in names:
+        path = f"/dev/disk/by-id/{name}"
+        if os.path.realpath(path) == real:
+            return path
+    return device
+
+
+def grub_efi_devices_plan() -> tuple[list[str], list[str]] | None:
+    """(было, станет) для grub-efi/install_devices. None — чинить нечего.
+
+    Образы хостеров собирают на виртуальной машине, и в настройках grub
+    остаётся её диск — /dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_…. На любой
+    другой машине его нет, grub при каждой настройке пытается его смонтировать
+    и падает. Чиним только однозначный случай: сервер грузится через EFI, а в
+    /boot/efi смонтирован vfat — значит, это и есть EFI-раздел, с которого он
+    грузится. Его и ставим вместо пропавшего диска, ровно как сделал бы
+    dpkg-reconfigure. Существующие разделы из списка сохраняем: на серверах с
+    зеркалом EFI-разделов их несколько.
+    """
+    if not os.path.isdir("/sys/firmware/efi"):
+        return None     # BIOS: EFI-загрузчик для загрузки не нужен, не трогаем
+    current = _debconf_get("grub-efi/install_devices")
+    if current is None:
+        return None
+    devices = [d.strip() for d in current.split(",") if d.strip()]
+    if all(os.path.exists(d) for d in devices):
+        return None
+    esp = probe(["findmnt", "-no", "SOURCE", "/boot/efi"]).stdout.strip()
+    fstype = probe(["findmnt", "-no", "FSTYPE", "/boot/efi"]).stdout.strip()
+    if not esp or fstype != "vfat":
+        return None     # куда ставить, не знаем наверняка — лучше не гадать
+    keep = [d for d in devices if os.path.exists(d)]
+    if not any(os.path.realpath(d) == os.path.realpath(esp) for d in keep):
+        keep.append(_device_by_id(esp))
+    return devices, keep
+
+
+def _boot_entry_key(text: str) -> str:
+    """Чем грузится запись: GUID раздела и файл загрузчика, без регистра.
+    По этому ключу узнаём ту же запись, если grub-install пересоздал её под
+    другим номером."""
+    guid = re.search(r"GPT,([0-9A-Fa-f-]{36})", text)
+    loader = re.search(r"File\(([^)]*)\)", text)
+    if guid and loader:
+        return f"{guid.group(1).lower()}:{loader.group(1).lower()}"
+    return text.strip().lower()
+
+
+def efi_boot_state() -> tuple[list[str], dict[str, str]] | None:
+    """BootOrder и ключ каждой записи. None — не EFI или нет efibootmgr."""
+    if not os.path.isdir("/sys/firmware/efi") or not shutil.which("efibootmgr"):
+        return None
+    r = probe(["efibootmgr", "-v"])
+    if r.returncode != 0:
+        return None
+    order: list[str] = []
+    entries: dict[str, str] = {}
+    for line in r.stdout.splitlines():
+        if line.startswith("BootOrder:"):
+            order = [n.strip().upper() for n in line.split(":", 1)[1].split(",")
+                     if n.strip()]
+            continue
+        m = re.match(r"Boot([0-9A-Fa-f]{4})\*?\s+(.*)$", line)
+        if m:
+            entries[m.group(1).upper()] = _boot_entry_key(m.group(2))
+    return order, entries
+
+
+def boot_order_to_restore(before, after) -> list[str] | None:
+    """Порядок загрузки, каким он был до grub-install, с поправкой на записи,
+    пересозданные под другим номером. None — возвращать нечего.
+
+    grub-install при каждой настройке пакета записывает свой загрузчик в
+    прошивку первым. На выделенных серверах первой у хостера часто стоит
+    загрузка по сети: через неё работают rescue и переустановка, и такая
+    перестановка их бы сломала. Поэтому порядок, который был, возвращаем.
+    """
+    old_order, old_entries = before
+    new_order, new_entries = after
+    if new_order == old_order:
+        return None
+    desired: list[str] = []
+    for num in old_order:
+        key = old_entries.get(num)
+        if num in new_entries and new_entries[num] == key:
+            desired.append(num)
+            continue
+        twin = next((n for n in new_order
+                     if n not in desired and n not in old_entries
+                     and new_entries.get(n) == key), None)
+        if twin:
+            desired.append(twin)
+    # Новые записи, которых раньше не было, — в конец: их не теряем, но и
+    # вперёд прежних не пускаем
+    desired += [n for n in new_order if n not in desired]
+    return None if desired == new_order else desired
+
+
+def restore_boot_order(before) -> None:
+    after = efi_boot_state()
+    if not before or not after:
+        return
+    desired = boot_order_to_restore(before, after)
+    if not desired:
+        return
+    r = probe(["efibootmgr", "-o", ",".join(desired)])
+    if r.returncode == 0:
+        console.print(f"[dim]grub переставил порядок загрузки в прошивке "
+                      f"({','.join(after[0])}) — вернул прежний: "
+                      f"{','.join(desired)}[/dim]")
+    else:
+        console.print(f"[yellow]grub переставил порядок загрузки в прошивке "
+                      f"({','.join(after[0])}), а вернуть прежний "
+                      f"({','.join(before[0])}) не удалось: "
+                      f"{(r.stderr or r.stdout).strip()}. Проверьте efibootmgr: "
+                      "если первой стоит не та запись, перестанут работать "
+                      "rescue и переустановка у хостера.[/yellow]")
+
+
+def fix_grub_efi_devices() -> bool:
+    """Меняет пропавший диск в настройке grub на EFI-раздел этого сервера.
+    → True, если настройку поменяли."""
+    plan = grub_efi_devices_plan()
+    if not plan:
+        return False
+    old, new = plan
+    gone = [d for d in old if not os.path.exists(d)]
+    # Копия EFI-раздела до того, как grub его перезапишет: если новый
+    # загрузчик не поднимется, прежний можно вернуть из rescue
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    backup = f"{ESP_BACKUP_DIR}/ahrinode-esp-{stamp}.tar"
+    if probe(["tar", "-cf", backup, "-C", "/boot/efi", "."]).returncode != 0:
+        backup = ""
+    if not _debconf_set("grub-efi/install_devices", ", ".join(new)):
+        console.print("[yellow]Не удалось записать настройку grub в debconf — "
+                      "загрузчик не трогаю.[/yellow]")
+        return False
+    console.print(f"[yellow]grub ставил загрузчик на диск, которого на этом "
+                  f"сервере нет: {', '.join(gone)}. Это след образа хостера: "
+                  "его собирали на виртуальной машине. Указываю EFI-раздел, с "
+                  f"которого сервер грузится: {', '.join(new)}.[/yellow]")
+    if backup:
+        console.print(f"[dim]Копия EFI-раздела до переустановки загрузчика: "
+                      f"{backup}[/dim]")
+    return True
+
+
+def repair_dpkg() -> bool:
+    """Пробует достроить пакеты, на которых застрял dpkg. → True, если
+    достроены и упавшую команду apt есть смысл повторить."""
+    global _dpkg_repair_failed
+    if _dpkg_repair_failed:
+        return False
+    stuck = dpkg_unfinished()
+    if not stuck:
+        return False    # dpkg цел — apt упал на чём-то другом
+    console.print(f"[yellow]dpkg не достроил пакеты: {', '.join(stuck)}. Пока "
+                  "так, apt не поставит ничего — пробую достроить.[/yellow]")
+    boot_before = efi_boot_state()
+    fix_grub_efi_devices()
+    _stream(["dpkg", "--configure", "-a"])
+    restore_boot_order(boot_before)
+    left = dpkg_unfinished()
+    if left:
+        _dpkg_repair_failed = True
+        console.print(f"[red]Не достроены: {', '.join(left)}. Причина — в "
+                      "выводе dpkg выше. Пока это не исправлено, установка "
+                      "любых пакетов будет падать.[/red]")
+        return False
+    console.print("[green]✓ dpkg достроил пакеты — повторяю команду[/green]")
+    return True
 
 
 def probe(cmd: list[str]) -> subprocess.CompletedProcess:
