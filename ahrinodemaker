@@ -2265,6 +2265,62 @@ def block_timezone() -> None:
 
 REBOOT_CRON_MARKER = "# VPN Server Hardening: автоматическая перезагрузка"
 
+# Когда unattended-upgrades ставит обновления. По умолчанию Ubuntu делает это
+# в 06:00–07:00, то есть уже ПОСЛЕ ночной перезагрузки в 03:00: исправленное
+# ядро ложилось на диск утром и ждало следующей ночи, почти сутки. Сдвигаем
+# обновление на ночь прямо перед перезагрузкой: список пакетов в 01:30,
+# установка в 02:15 (+ до 10 минут разброса), и в 03:00 сервер загружается уже
+# в свежее ядро. Время указано с поясом, так что оно московское на любом
+# сервере, даже если block_timezone() не запускали.
+APT_TIMER_SCHEDULE = {
+    "apt-daily.timer": ("01:30", "Обновление списка пакетов ночью, "
+                                 "перед установкой и перезагрузкой (03:00 МСК)"),
+    "apt-daily-upgrade.timer": ("02:15", "Установка обновлений безопасности "
+                                         "за ~40 минут до ночной перезагрузки "
+                                         "(03:00 МСК)"),
+}
+
+
+def _apt_timer_override(timer: str) -> tuple[str, str]:
+    """Путь drop-in файла таймера и его содержимое."""
+    at, why = APT_TIMER_SCHEDULE[timer]
+    return (f"/etc/systemd/system/{timer}.d/override.conf",
+            f"# {why}\n"
+            "[Timer]\n"
+            "OnCalendar=\n"
+            f"OnCalendar=*-*-* {at} {TIMEZONE}\n"
+            "RandomizedDelaySec=10m\n")
+
+
+def block_apt_timers() -> None:
+    """Ставит автообновления перед ночной перезагрузкой (см. APT_TIMER_SCHEDULE)."""
+    for timer in APT_TIMER_SCHEDULE:
+        path, content = _apt_timer_override(timer)
+        write_file(path, content, backup=False)
+    run(["systemctl", "daemon-reload"])
+    # Таймеры, остановленные на время прогона, поднимет release_apt_timers() —
+    # уже с новым расписанием. Остальные перезапускаем сразу: так systemd
+    # пересчитывает следующий запуск, а не держит старый до перезагрузки.
+    for timer in APT_TIMER_SCHEDULE:
+        if (timer not in _apt_timers_held
+                and probe(["systemctl", "is-active", "--quiet", timer]).returncode == 0):
+            probe(["systemctl", "restart", timer])
+    console.print("[green]✓ Автообновления: список пакетов в 01:30, установка "
+                  "в 02:15 МСК — перед перезагрузкой[/green]")
+
+
+def _apt_timers_ok() -> bool:
+    """Стоит ли наше расписание автообновлений (оба drop-in файла как надо)."""
+    for timer in APT_TIMER_SCHEDULE:
+        path, content = _apt_timer_override(timer)
+        try:
+            with open(path, encoding="utf-8") as f:
+                if f.read() != content:
+                    return False
+        except OSError:
+            return False
+    return True
+
 
 def block_cron(schedule: str = "daily") -> None:
     # Расписание выбирается пользователем в начале. Часовой пояс ставится
@@ -2297,6 +2353,7 @@ def block_cron(schedule: str = "daily") -> None:
     _crontab_replace_block(REBOOT_CRON_MARKER, [reboot_line],
                            drop=lambda ln: reboot_re.match(ln) is not None)
     console.print(f"[green]✓ crontab обновлён — перезагрузка {human}[/green]")
+    block_apt_timers()
 
 
 # ------------------------------------------------------------------ #
@@ -7158,7 +7215,7 @@ def _detect_time_cron() -> bool:
     cr = probe(["crontab", "-l"])
     cron_ok = cr.returncode == 0 and re.search(
         r"(?m)^\s*0\s+3\s+\*\s+\*\s+[*1]\s+.*?/sbin/reboot\b", cr.stdout) is not None
-    return tz_ok and cron_ok
+    return tz_ok and cron_ok and _apt_timers_ok()
 
 
 def _detect_remnanode_logs() -> bool:
