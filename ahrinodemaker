@@ -6711,6 +6711,375 @@ def block_network(ipv6: str = "keep") -> None:
     block_rps()
 
 
+# ------------------------------------------------------------------ #
+# Ограничение скорости порта
+# ------------------------------------------------------------------ #
+# Часть хостеров сама урезает сервер на сутки, если порт долго загружен
+# полностью или скорость резко скачет (Space Hosting, Литва, 19.11.2026:
+# порт 1 Гбит/с). Свой потолок чуть ниже скорости порта не даёт в неё
+# упереться. CAKE держит исходящий трафик на интерфейсе и входящий через
+# ifb0, а внутри потолка делит скорость поровну между адресами: один клиент
+# с большой загрузкой не забирает весь канал.
+SHAPER_SCRIPT_PATH = "/usr/local/sbin/ahri-shaper"
+SHAPER_CONF_PATH = "/etc/default/ahri-shaper"
+SHAPER_UNIT = "ahri-shaper.service"
+SHAPER_UNIT_PATH = f"/etc/systemd/system/{SHAPER_UNIT}"
+# Страховка: если после включения лимита связь пропадёт, через столько
+# секунд он снимется сам — пока его не подтвердили
+SHAPER_ROLLBACK_UNIT = "ahri-shaper-rollback"
+SHAPER_ROLLBACK_SEC = 300
+SHAPER_MIN_MBIT = 10
+
+SHAPER_SCRIPT = r"""#!/bin/bash
+# Потолок скорости порта: CAKE на исходящем трафике интерфейса и на входящем
+# через ifb0. Внутри потолка скорость делится поровну между адресами.
+# Ставится скриптом ahrinodemaker (Tools → Ограничение скорости порта);
+# лимит — в /etc/default/ahri-shaper.
+set -u
+IFACE=""
+RATE=""
+[ -r /etc/default/ahri-shaper ] && . /etc/default/ahri-shaper
+
+# Интерфейс из конфига мог переименоваться после смены ядра — тогда ищем
+# маршрут по умолчанию; на загрузке он появляется не сразу.
+if [ -z "$IFACE" ] || [ ! -d "/sys/class/net/$IFACE" ]; then
+    i=0
+    while [ "$i" -lt 20 ]; do
+        IFACE=$(ip -o -4 route show default 2>/dev/null | awk '{print $5; exit}')
+        [ -n "$IFACE" ] && break
+        i=$((i + 1))
+        sleep 1
+    done
+fi
+
+stop() {
+    [ -n "$IFACE" ] && tc qdisc del dev "$IFACE" root 2>/dev/null
+    [ -n "$IFACE" ] && tc qdisc del dev "$IFACE" ingress 2>/dev/null
+    tc qdisc del dev ifb0 root 2>/dev/null
+    ip link set ifb0 down 2>/dev/null
+    ip link del ifb0 2>/dev/null
+    return 0
+}
+
+start() {
+    [ -n "$IFACE" ] || { echo "ahri-shaper: интерфейс не найден" >&2; exit 1; }
+    [ -n "$RATE" ] || { echo "ahri-shaper: в /etc/default/ahri-shaper нет RATE" >&2; exit 1; }
+    stop
+    modprobe sch_cake && modprobe ifb numifbs=0 || exit 1
+    # Исходящий: к клиентам и в интернет, поровну по адресу получателя
+    tc qdisc replace dev "$IFACE" root cake bandwidth "$RATE" besteffort dual-dsthost ethernet || exit 1
+    # Входящий: заворачиваем в ifb0 и ограничиваем там, поровну по адресу отправителя
+    ip link add ifb0 type ifb 2>/dev/null || true
+    ip link set ifb0 up || { stop; exit 1; }
+    tc qdisc add dev "$IFACE" handle ffff: ingress || { stop; exit 1; }
+    tc filter add dev "$IFACE" parent ffff: matchall action mirred egress redirect dev ifb0 || { stop; exit 1; }
+    tc qdisc replace dev ifb0 root cake bandwidth "$RATE" besteffort dual-srchost ingress ethernet || { stop; exit 1; }
+    echo "ahri-shaper: $IFACE ограничен до $RATE в обе стороны"
+}
+
+case "${1:-}" in
+    start) start ;;
+    stop) stop ;;
+    status) tc -s qdisc show dev "$IFACE"; tc -s qdisc show dev ifb0 2>/dev/null ;;
+    *) echo "usage: $0 start|stop|status" >&2; exit 2 ;;
+esac
+"""
+
+SHAPER_SERVICE = f"""[Unit]
+Description=Потолок скорости порта (CAKE в обе стороны), лимит в {SHAPER_CONF_PATH}
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart={SHAPER_SCRIPT_PATH} start
+ExecStop={SHAPER_SCRIPT_PATH} stop
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+
+def shaper_conf_text(iface: str, rate_mbit: int) -> str:
+    return ("# Потолок скорости порта (ahri-shaper.service), одинаковый в обе стороны.\n"
+            "# Менять через ahrinodemaker: Tools → Ограничение скорости порта,\n"
+            "# или здесь и затем: systemctl restart ahri-shaper\n"
+            f"IFACE={iface}\n"
+            f"RATE={rate_mbit}mbit\n")
+
+
+def _rate_to_mbit(text: str) -> int | None:
+    """Скорость в записи tc ('900mbit', '900Mbit', '1Gbit') — в Мбит/с."""
+    m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([kmg]?)bit\s*", text or "", re.IGNORECASE)
+    if not m:
+        return None
+    scale = {"k": 0.001, "m": 1, "g": 1000, "": 0.000001}[m.group(2).lower()]
+    return round(float(m.group(1)) * scale)
+
+
+def link_speed_mbit(iface: str) -> int | None:
+    """Скорость порта по данным драйвера. У виртуальных сетевых её часто нет."""
+    try:
+        with open(f"/sys/class/net/{iface}/speed", encoding="utf-8") as f:
+            value = int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def _read_shaper_conf() -> dict[str, str]:
+    conf: dict[str, str] = {}
+    try:
+        with open(SHAPER_CONF_PATH, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                m = re.match(r"\s*([A-Z_]+)=(\S*)", line)
+                if m:
+                    conf[m.group(1)] = m.group(2).strip("\"'")
+    except OSError:
+        pass
+    return conf
+
+
+class ShaperState(NamedTuple):
+    configured: bool      # конфиг и юнит на месте
+    enabled: bool         # включается при загрузке
+    iface: str
+    rate: int | None      # лимит из конфига, Мбит/с
+    live: int | None      # что реально стоит на интерфейсе сейчас, Мбит/с
+    link: int | None      # скорость самого порта, Мбит/с
+
+
+def shaper_state() -> ShaperState:
+    conf = _read_shaper_conf()
+    iface = conf.get("IFACE", "")
+    if not iface or not os.path.isdir(f"/sys/class/net/{iface}"):
+        iface = default_iface()
+    live = None
+    if iface:
+        out = probe(["tc", "qdisc", "show", "dev", iface]).stdout
+        m = re.search(r"qdisc cake \S+ root .*?bandwidth (\S+)", out)
+        if m:
+            live = _rate_to_mbit(m.group(1))
+    return ShaperState(
+        configured=os.path.isfile(SHAPER_CONF_PATH) and os.path.isfile(SHAPER_UNIT_PATH),
+        enabled=probe(["systemctl", "is-enabled", "--quiet", SHAPER_UNIT]).returncode == 0,
+        iface=iface,
+        rate=_rate_to_mbit(conf.get("RATE", "")),
+        live=live,
+        link=link_speed_mbit(iface) if iface else None,
+    )
+
+
+def _shaper_default_rate(state: ShaperState) -> int:
+    """Что предложить: текущий лимит, иначе 90 % порта, иначе 900."""
+    if state.live or state.rate:
+        return state.live or state.rate
+    return state.link * 9 // 10 if state.link else 900
+
+
+def shaper_status_line() -> str | None:
+    """Строка для шапки; None — ограничителя нет и не было."""
+    st = shaper_state()
+    if not st.configured and st.live is None:
+        return None
+    port = f", порт {st.link} Мбит/с" if st.link else ""
+    if st.live is not None:
+        return (f"[dim]Лимит скорости порта: {st.live} Мбит/с в каждую сторону "
+                f"({st.iface}{port})[/dim]")
+    return (f"[yellow]Лимит скорости порта {st.rate or '?'} Мбит/с настроен, но "
+            "не действует — Tools → Ограничение скорости порта[/yellow]")
+
+
+def ask_shaper_rate(state: ShaperState | None = None) -> int | None:
+    state = state or shaper_state()
+    hint = (f"порт {state.link} Мбит/с" if state.link
+            else "скорость порта не определилась")
+
+    def valid(text: str):
+        t = (text or "").strip()
+        if not t.isdigit():
+            return "Целое число в Мбит/с, например 900"
+        if int(t) < SHAPER_MIN_MBIT:
+            return f"Не меньше {SHAPER_MIN_MBIT} Мбит/с"
+        return True
+
+    answer = questionary.text(
+        f"Потолок скорости, Мбит/с в каждую сторону ({hint}):",
+        default=str(_shaper_default_rate(state)), validate=valid,
+        style=CUSTOM_STYLE).ask()
+    if answer is None:
+        return None
+    rate = int(answer.strip())
+    if state.link and rate >= state.link:
+        console.print(f"[yellow]Потолок {rate} не ниже скорости порта "
+                      f"{state.link} Мбит/с — порт по-прежнему можно загрузить "
+                      "полностью.[/yellow]")
+    return rate
+
+
+def _arm_shaper_rollback() -> None:
+    """Через SHAPER_ROLLBACK_SEC снимет лимит, если его не подтвердят."""
+    _disarm_shaper_rollback()
+    probe(["systemctl", "reset-failed", f"{SHAPER_ROLLBACK_UNIT}.service"])
+    r = probe(["systemd-run", "--quiet", f"--unit={SHAPER_ROLLBACK_UNIT}",
+               f"--on-active={SHAPER_ROLLBACK_SEC}",
+               "systemctl", "disable", "--now", SHAPER_UNIT])
+    if r.returncode != 0:
+        console.print("[yellow]Страховку поставить не удалось — если связь "
+                      f"пропадёт, снимите лимит с консоли хостера: systemctl "
+                      f"disable --now {SHAPER_UNIT}[/yellow]")
+
+
+def _disarm_shaper_rollback() -> None:
+    probe(["systemctl", "stop", f"{SHAPER_ROLLBACK_UNIT}.timer"])
+
+
+def remove_shaper() -> None:
+    _disarm_shaper_rollback()
+    # disable --now останавливает юнит, а ExecStop возвращает очереди
+    # интерфейса к системным; только потом удаляем файлы
+    run(["systemctl", "disable", "--now", SHAPER_UNIT], check=False)
+    for path in (SHAPER_UNIT_PATH, SHAPER_CONF_PATH, SHAPER_SCRIPT_PATH):
+        if os.path.exists(path):
+            os.unlink(path)
+    run(["systemctl", "daemon-reload"], check=False)
+    console.print("[green]✓ Лимит снят, очереди интерфейса — системные[/green]")
+
+
+def block_shaper(rate_mbit: int | None = None, *, guard: bool = True) -> None:
+    """Ставит или меняет потолок скорости порта.
+
+    guard: включить страховку и спросить, есть ли связь. Без TTY (вызов
+    импортом) — guard=False.
+    """
+    step("Ограничение скорости порта (CAKE в обе стороны)")
+    state = shaper_state()
+    iface = default_iface() or state.iface
+    if not iface:
+        raise RuntimeError("не нашёл интерфейс маршрута по умолчанию")
+    if rate_mbit is None:
+        rate_mbit = _shaper_default_rate(state)
+    for module in ("sch_cake", "ifb", "act_mirred"):
+        if probe(["modinfo", module]).returncode != 0:
+            raise RuntimeError(f"в ядре нет модуля {module} — ограничитель "
+                               "не поставить")
+    write_file(SHAPER_SCRIPT_PATH, SHAPER_SCRIPT, mode=0o755)
+    # Конфиг — две строки, и меняется при каждой смене лимита: копии не нужны
+    write_file(SHAPER_CONF_PATH, shaper_conf_text(iface, rate_mbit), backup=False)
+    write_file(SHAPER_UNIT_PATH, SHAPER_SERVICE)
+    run(["systemctl", "daemon-reload"], check=False)
+    if guard:
+        _arm_shaper_rollback()
+    run(["systemctl", "enable", SHAPER_UNIT], check=False)
+    # restart, а не start: при смене лимита юнит уже active (exited), и start
+    # ничего бы не сделал
+    if run(["systemctl", "restart", SHAPER_UNIT], check=False).returncode != 0:
+        _disarm_shaper_rollback()
+        raise RuntimeError(f"ограничитель не запустился — journalctl -u {SHAPER_UNIT}")
+    live = shaper_state().live
+    console.print(f"[green]✓ Лимит {live or rate_mbit} Мбит/с в каждую сторону "
+                  f"на {iface}[/green]")
+    if not guard:
+        return
+    keep = questionary.confirm(
+        f"Связь с сервером есть, оставить лимит? Без ответа через "
+        f"{SHAPER_ROLLBACK_SEC // 60} минут он снимется сам.",
+        default=True, style=CUSTOM_STYLE).ask()
+    if keep:
+        _disarm_shaper_rollback()
+        console.print("[green]✓ Лимит подтверждён[/green]")
+    else:
+        remove_shaper()
+
+
+def _cake_stats(dev: str) -> tuple[int, int, int] | None:
+    """(байт, пакетов, отброшено) с момента включения ограничителя."""
+    out = probe(["tc", "-s", "qdisc", "show", "dev", dev]).stdout
+    m = re.search(r"qdisc cake \S+ root[^\n]*\n\s*Sent (\d+) bytes (\d+) pkt "
+                  r"\(dropped (\d+)", out)
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else None
+
+
+def _iface_rate_now(iface: str, seconds: float = 2.0) -> tuple[int, int] | None:
+    """Текущая скорость (исходящая, входящая) в Мбит/с по счётчикам."""
+    base = f"/sys/class/net/{iface}/statistics"
+
+    def read() -> tuple[int, int]:
+        with open(f"{base}/tx_bytes") as tx, open(f"{base}/rx_bytes") as rx:
+            return int(tx.read()), int(rx.read())
+    try:
+        tx1, rx1 = read()
+        time.sleep(seconds)
+        tx2, rx2 = read()
+    except (OSError, ValueError):
+        return None
+    return (round((tx2 - tx1) * 8 / seconds / 1e6),
+            round((rx2 - rx1) * 8 / seconds / 1e6))
+
+
+def _print_shaper_state(st: ShaperState) -> None:
+    port = f"{st.link} Мбит/с" if st.link else "не определилась"
+    console.print(f"[bold]Интерфейс:[/bold] {st.iface or '?'}, скорость порта {port}")
+    if st.live is not None:
+        console.print(f"[bold]Лимит:[/bold] [green]{st.live} Мбит/с в каждую "
+                      "сторону[/green]"
+                      + ("" if st.enabled else " [yellow](не включится после "
+                                               "перезагрузки)[/yellow]"))
+        if st.rate and st.rate != st.live:
+            console.print(f"[yellow]В конфиге {st.rate} Мбит/с, а действует "
+                          f"{st.live} — примените лимит заново.[/yellow]")
+    elif st.configured:
+        console.print(f"[bold]Лимит:[/bold] [yellow]{st.rate or '?'} Мбит/с "
+                      "настроен, но не действует[/yellow] — journalctl -u "
+                      f"{SHAPER_UNIT}")
+    else:
+        console.print("[bold]Лимит:[/bold] нет — трафик упирается только в порт")
+    if st.iface:
+        now = _iface_rate_now(st.iface)
+        if now:
+            console.print(f"[bold]Сейчас:[/bold] исходящий {now[0]}, входящий "
+                          f"{now[1]} Мбит/с")
+    for dev, title in ((st.iface, "исходящий"), ("ifb0", "входящий")):
+        stats = _cake_stats(dev) if (st.live is not None and dev) else None
+        if stats:
+            sent, pkts, dropped = stats
+            share = f" ({dropped * 100 / pkts:.2f} %)" if pkts else ""
+            console.print(f"[dim]С включения, {title}: {_human_size(sent)}, "
+                          f"отброшено {dropped} пакетов{share}[/dim]")
+
+
+def menu_shaper() -> None:
+    step("Ограничение скорости порта")
+    console.print("[dim]Хостер может на сутки урезать сервер, если порт долго "
+                  "загружен полностью. Потолок чуть ниже скорости порта этого не "
+                  "допускает; внутри него скорость делится поровну между "
+                  "адресами. Много отброшенных пакетов — сервер часто упирается "
+                  "в потолок.[/dim]")
+    while True:
+        console.print()
+        st = shaper_state()
+        _print_shaper_state(st)
+        if st.configured:
+            choices = [questionary.Choice("Изменить лимит", value="set"),
+                       questionary.Choice("Снять ограничение", value="remove")]
+        else:
+            choices = [questionary.Choice("Включить ограничение", value="set")]
+        choices.append(questionary.Choice("← Назад", value="back"))
+        choice = questionary.select("Действие:", choices=choices,
+                                    style=CUSTOM_STYLE).ask()
+        if choice in (None, "back"):
+            return
+        if choice == "set":
+            rate = ask_shaper_rate(st)
+            if rate is not None:
+                block_shaper(rate)
+        elif choice == "remove":
+            if questionary.confirm("Снять ограничение скорости?", default=False,
+                                   style=CUSTOM_STYLE).ask():
+                remove_shaper()
+
+
 def block_system_upgrade() -> None:
     step("Обновление системы (apt update && apt upgrade)")
     apt_update()
@@ -7144,6 +7513,9 @@ BLOCKS = [
     ("warp", "WARP: чистый egress для нейросетей (Gemini, ChatGPT) и стримингов", block_warp),
     ("psiphon", "Psiphon: альтернативный egress, если WARP не помог", block_psiphon),
     ("torrent", "Блокировка торрентов (tblocker + egress-фильтр + конфиг панели)", block_torrent),
+    # Последним: после включения лимита блок спрашивает, есть ли связь, —
+    # вопрос в конце прогона, а не посреди него
+    ("shaper", "Ограничение скорости порта: не упираться в канал хостера", block_shaper),
 ]
 
 # Блоки, которые реально устанавливают пакеты через apt. Предварительное
@@ -7161,7 +7533,7 @@ INSTALLS_PACKAGES = {"packages", "node_install", "fail2ban", "ufw",
 # Блоки, которые по умолчанию идут БЕЗ галочки, даже если ещё не настроены.
 # Hysteria2 — дополнительный транспорт: он нужен не всем, требует сертификата
 # и ручной настройки inbound'а в панели, поэтому включается осознанно.
-DEFAULT_OFF = {"hysteria", "grpc", "selfsteal", "warp", "psiphon"}
+DEFAULT_OFF = {"hysteria", "grpc", "selfsteal", "warp", "psiphon", "shaper"}
 
 # Блоки, у которых при уже выполненной установке пункт меняет смысл на
 # противоположный: ставить нечего, а снять — единственное, что осталось.
@@ -7276,6 +7648,11 @@ def _detect_kernel() -> bool:
             and not _new_kernel_images(kernel_upgrade_plan(state)))
 
 
+def _detect_shaper() -> bool:
+    st = shaper_state()
+    return st.live is not None and st.enabled
+
+
 def _detect_bootorder() -> bool:
     """Хук стоит и актуален — или не нужен: первой в прошивке стоит не сеть."""
     if bootorder_hook_installed():
@@ -7300,6 +7677,7 @@ DETECTORS = {
     "warp":           _detect_warp,
     "psiphon":        _detect_psiphon,
     "torrent":        _detect_torrent,
+    "shaper":         _detect_shaper,
 }
 
 
@@ -7459,6 +7837,10 @@ def menu_remnawave_node() -> None:
     console.print(f"[bold]Свободно на диске:[/bold] {disk_free_info()}")
     console.print(f"[bold]Текущее расписание перезагрузки:[/bold] "
                   f"{current_reboot_schedule()}")
+    shaper_now = shaper_state()
+    console.print("[bold]Лимит скорости порта:[/bold] "
+                  + (f"{shaper_now.live} Мбит/с в каждую сторону"
+                     if shaper_now.live is not None else "нет"))
 
     # Раньше здесь опрашивался реестр образов, чтобы узнать, вышла ли новая
     # версия ноды. Это добавляло несколько секунд ожидания при каждом входе в
@@ -7576,6 +7958,12 @@ def menu_remnawave_node() -> None:
     if "network" in selected:
         ipv6_mode = ask_ipv6_mode()
 
+    shaper_rate: int | None = None
+    if "shaper" in selected:
+        shaper_rate = ask_shaper_rate()
+        if shaper_rate is None:
+            selected = [k for k in selected if k != "shaper"]
+
     # 5. Расписание перезагрузки — только если выбран блок cron
     reboot_schedule = "daily"
     if "time_cron" in selected:
@@ -7623,6 +8011,9 @@ def menu_remnawave_node() -> None:
         console.print("[bold]Обновление пакетов:[/bold] да (apt update && upgrade)")
     if "time_cron" in selected:
         console.print(f"[bold]Перезагрузка:[/bold] {schedule_human} (МСК)")
+    if "shaper" in selected:
+        console.print(f"[bold]Лимит скорости порта:[/bold] {shaper_rate} Мбит/с "
+                      "в каждую сторону")
     if "network" in selected:
         console.print("[bold]IPv6:[/bold] "
                       + dict(IPV6_MODES)[ipv6_mode].lower())
@@ -7704,6 +8095,8 @@ def menu_remnawave_node() -> None:
                 func(ipv6_mode)
             elif key == "time_cron":
                 func(reboot_schedule)
+            elif key == "shaper":
+                func(shaper_rate)
             else:
                 func()
         except BLOCK_ERRORS as exc:
@@ -9076,6 +9469,7 @@ def menu_tools() -> None:
             questionary.Choice("Управление SSH-ключами", value="ssh_keys"),
             questionary.Choice("Ядро: версия, уязвимости, обновление",
                                value="kernel"),
+            questionary.Choice("Ограничение скорости порта", value="shaper"),
             questionary.Choice("SOCKS5-прокси Dante", value="dante"),
             questionary.Choice("Проверить обновления сторонних скриптов",
                                value="vendor_updates"),
@@ -9093,6 +9487,11 @@ def menu_tools() -> None:
         elif choice == "kernel":
             try:
                 menu_kernel()
+            except (subprocess.CalledProcessError, OSError, RuntimeError) as exc:
+                console.print(f"[red]✗ Ошибка: {exc}[/red]")
+        elif choice == "shaper":
+            try:
+                menu_shaper()
             except (subprocess.CalledProcessError, OSError, RuntimeError) as exc:
                 console.print(f"[red]✗ Ошибка: {exc}[/red]")
         elif choice == "backup_restore":
@@ -9371,6 +9770,10 @@ def main() -> None:
     # Ядро — по локальным данным, без сети, поэтому в шапке оно есть всегда.
     # Сверка с CVE сюда не идёт: это запрос к трекеру Ubuntu на каждый запуск.
     console.print(kernel_status_line())
+    # Лимит порта — тоже локально: конфиг и tc, без сети
+    shaper_line = shaper_status_line()
+    if shaper_line:
+        console.print(shaper_line)
 
     # Команды ставим сами: спрашивать про это нечего, а без них скрипт после
     # запуска через curl не остаётся на сервере вовсе. Сбой не повод прерывать
